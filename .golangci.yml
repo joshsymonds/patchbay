@@ -495,6 +495,16 @@ linters:
         linters:
           - gosec
 
+      # Both packages render request-derived errors through
+      # internal/anthropic.ErrorBody, whose json.Marshal output gosec cannot
+      # recognize as a sanitizer across a package boundary (it only credits
+      # json.Marshal in the same package). The bodies are marshaled JSON served
+      # as application/json; there is no XSS surface.
+      - path: 'internal/(proxy|server)/'
+        text: 'G705'
+        linters:
+          - gosec
+
       # Relax linters for test files
       - path: _test\.go
         linters:
