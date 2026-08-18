@@ -15,11 +15,14 @@
 package registry
 
 import (
+	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 )
 
@@ -79,6 +82,35 @@ func (r *Registry) Err() error {
 	defer r.mu.RUnlock()
 
 	return r.err
+}
+
+// Aliases returns every foreign route the current registry file defines, sorted
+// by alias. The built-in default route is not one of them: it answers for
+// models no alias claims and has no name to list.
+//
+// Like Resolve, it answers from the file as it stands now, and it never fails —
+// a missing, unparsable or invalid file simply has no aliases to list, which
+// Err explains. The slice and the routes in it are the caller's own copy, so
+// nothing a caller does to them reaches the registry.
+func (r *Registry) Aliases() []Route {
+	r.refresh()
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	aliases := make([]Route, 0, len(r.routes))
+
+	for _, route := range r.routes {
+		// The struct copy still points at the registry's own extra_body bytes,
+		// which every later request on this alias merges from. Cloning them is
+		// what makes the isolation above true rather than nearly true.
+		route.ExtraBody = bytes.Clone(route.ExtraBody)
+		aliases = append(aliases, route)
+	}
+
+	slices.SortFunc(aliases, func(a, b Route) int { return cmp.Compare(a.Alias, b.Alias) })
+
+	return aliases
 }
 
 // refresh reloads the registry file when its stamp has moved since the last

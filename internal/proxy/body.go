@@ -59,6 +59,21 @@ func forwardBody(body []byte, route registry.Route) ([]byte, *gatewayError) {
 		}
 	}
 
+	// JSON null decodes into a nil map without an error, and writing a rewrite
+	// into a nil map panics. It is not an object, so it is refused as one.
+	//
+	// This is defense in depth: no request reaches it through ServeHTTP today,
+	// because a null body names no model, an empty alias is rejected at parse,
+	// and so a null body always resolves to the identity default route, which
+	// returns above without decoding anything. The guard is what keeps that from
+	// being a panic the first time some route does rewrite one.
+	if document == nil {
+		return nil, &gatewayError{
+			status: http.StatusBadRequest,
+			err:    fmt.Errorf("route %q rewrites the request, which is JSON null rather than an object", route.Alias),
+		}
+	}
+
 	if route.Model != "" {
 		rewritten, err := json.Marshal(route.Model)
 		if err != nil {

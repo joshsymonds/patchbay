@@ -292,6 +292,140 @@ func TestResolveAliasShadowsAClaudeModelID(t *testing.T) {
 	}
 }
 
+// aliasNames returns the Alias field of every route in order, so a listing's
+// order is compared without printing whole routes.
+func aliasNames(routes []registry.Route) []string {
+	names := make([]string, 0, len(routes))
+	for _, route := range routes {
+		names = append(names, route.Alias)
+	}
+
+	return names
+}
+
+func TestAliasesListsEveryRouteSortedByAlias(t *testing.T) {
+	t.Parallel()
+
+	reg := newRegistry(t, `{"routes":{`+solRoute+`,`+lunaRoute+`,`+deepseekRoute+`}}`)
+
+	got := reg.Aliases()
+	want := []string{"deepseek-flash-low", "luna-fast", "openrouter/sol"}
+
+	if !reflect.DeepEqual(aliasNames(got), want) {
+		t.Fatalf("Aliases() aliases = %v; want %v sorted by alias", aliasNames(got), want)
+	}
+
+	luna := registry.Route{
+		Alias:           "luna-fast",
+		BaseURL:         "https://openrouter.ai/api",
+		Model:           "openai/gpt-5.6-luna",
+		Auth:            registry.AuthInject,
+		APIKeyEnvFile:   "OPENROUTER_API_KEY_FILE",
+		ExtraBody:       []byte(`{"reasoning_effort":"low"}`),
+		MaxInputTokens:  262144,
+		MaxOutputTokens: 65536,
+	}
+
+	if !reflect.DeepEqual(got[1], luna) {
+		t.Fatalf("Aliases()[1] = %+v; want the whole route %+v", got[1], luna)
+	}
+}
+
+func TestAliasesReturnsAnIsolatedSlice(t *testing.T) {
+	t.Parallel()
+
+	reg := newRegistry(t, `{"routes":{`+lunaRoute+`}}`)
+
+	first := reg.Aliases()
+	first[0].Model = "tampered"
+	first[0].Alias = "tampered"
+
+	second := reg.Aliases()
+	if second[0].Model != "openai/gpt-5.6-luna" || second[0].Alias != "luna-fast" {
+		t.Fatalf("Aliases() after mutating an earlier result = %+v; want the registry untouched", second[0])
+	}
+
+	// A copied struct still points at the registry's own bytes. Writing through
+	// that slice would corrupt the extra_body every later request merges, which
+	// is exactly the isolation the doc comment promises.
+	const want = `{"reasoning_effort":"low"}`
+
+	extra := second[0].ExtraBody
+	if string(extra) != want {
+		t.Fatalf("Aliases() extra_body = %s; want %s", extra, want)
+	}
+
+	for i := range extra {
+		extra[i] = 'x'
+	}
+
+	if got := string(reg.Resolve("luna-fast").ExtraBody); got != want {
+		t.Fatalf("Resolve() extra_body after writing through an Aliases() result = %s; want %s", got, want)
+	}
+
+	if got := string(reg.Aliases()[0].ExtraBody); got != want {
+		t.Fatalf("Aliases() extra_body after writing through an earlier result = %s; want %s", got, want)
+	}
+}
+
+func TestAliasesReflectsAReload(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, path, `{"routes":{`+lunaRoute+`}}`)
+
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	chtimes(t, path, base)
+
+	reg := registry.New(path)
+	if got := aliasNames(reg.Aliases()); !reflect.DeepEqual(got, []string{"luna-fast"}) {
+		t.Fatalf("first Aliases() = %v; want [luna-fast]", got)
+	}
+
+	writeRegistry(t, path, `{"routes":{`+lunaRoute+`,`+solRoute+`}}`)
+	chtimes(t, path, base.Add(time.Hour))
+
+	if got := aliasNames(reg.Aliases()); !reflect.DeepEqual(got, []string{"luna-fast", "openrouter/sol"}) {
+		t.Fatalf("Aliases() after a reload = %v; want [luna-fast openrouter/sol]", got)
+	}
+}
+
+func TestAliasesIsEmptyWhenThereAreNoForeignRoutes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		body    string
+		write   bool
+		wantErr bool
+	}{
+		{name: "missing file", write: false},
+		{name: "empty routes object", body: `{"routes":{}}`, write: true},
+		{name: "unparsable file", body: `{"routes":{`, write: true, wantErr: true},
+		{name: "file failing validation", body: `{"routes":{"bad":{"auth":"nonsense"}}}`, write: true, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "registry.json")
+			if tc.write {
+				writeRegistry(t, path, tc.body)
+			}
+
+			reg := registry.New(path)
+			if got := reg.Aliases(); len(got) != 0 {
+				t.Fatalf("Aliases() = %+v; want an empty slice", got)
+			}
+
+			if err := reg.Err(); (err != nil) != tc.wantErr {
+				t.Fatalf("Err() = %v; wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestErrReportsRegistryHealth(t *testing.T) {
 	t.Parallel()
 

@@ -235,10 +235,14 @@ func anthropicClient(t *testing.T, stub *upstream) *http.Client {
 	return &http.Client{Transport: transport}
 }
 
-// stubRecorder collects the records the proxy appends.
+// stubRecorder collects the records the proxy appends. A recorder with started
+// and release channels announces when an append is in flight and holds it there
+// until the test lets go, which is how shutdown behavior gets pinned without a
+// clock.
 type stubRecorder struct {
 	records chan ledger.Record
 	err     error
+	started chan struct{}
 	release chan struct{}
 }
 
@@ -247,8 +251,22 @@ func newRecorder() *stubRecorder {
 	return &stubRecorder{records: make(chan ledger.Record, 8)}
 }
 
+// newBlockingRecorder returns a recorder whose Append announces itself on
+// started and then blocks until release is closed.
+func newBlockingRecorder() *stubRecorder {
+	return &stubRecorder{
+		records: make(chan ledger.Record, 8),
+		started: make(chan struct{}, 8),
+		release: make(chan struct{}),
+	}
+}
+
 // Append satisfies proxy.Recorder.
 func (s *stubRecorder) Append(rec ledger.Record) error {
+	if s.started != nil {
+		s.started <- struct{}{}
+	}
+
 	if s.release != nil {
 		<-s.release
 	}

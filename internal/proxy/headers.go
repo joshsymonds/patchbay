@@ -6,17 +6,13 @@ import (
 	"strings"
 )
 
-// Header names the pipeline handles itself rather than copying.
-// headerClientKey deliberately avoids spelling out "API key": a const named
-// that way trips gosec's hardcoded-credential heuristic (G101), the same way
-// the registry's key-file field name does.
+// Header names the pipeline handles itself rather than copying. The credential
+// and content-type names it shares with the rest of patchbay live in
+// internal/anthropic.
 const (
 	headerAcceptEncoding = "Accept-Encoding"
-	headerAuthorization  = "Authorization"
-	headerClientKey      = "X-Api-Key"
 	headerConnection     = "Connection"
 	headerContentLength  = "Content-Length"
-	headerContentType    = "Content-Type"
 	headerHost           = "Host"
 )
 

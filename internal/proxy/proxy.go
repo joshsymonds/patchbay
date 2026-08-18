@@ -11,6 +11,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,8 +19,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/joshsymonds/patchbay/internal/anthropic"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
@@ -82,6 +85,10 @@ type Proxy struct {
 	client   *http.Client
 	host     string
 	logger   *slog.Logger
+
+	// pending counts the record goroutines still in flight, so a host process
+	// can wait for them instead of closing the ledger out from under one.
+	pending sync.WaitGroup
 }
 
 // New returns a Proxy serving cfg.
@@ -158,7 +165,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	exch.upstreamMS = millis(time.Since(sent))
 	exch.status = resp.StatusCode
-	exch.contentType = resp.Header.Get(headerContentType)
+	exch.contentType = resp.Header.Get(anthropic.HeaderContentType)
 
 	capt := p.stream(w, resp)
 	exch.durationMS = millis(time.Since(start))
@@ -166,13 +173,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.record(exch, capt)
 }
 
+// Drain waits for the record goroutines still in flight, or until ctx expires,
+// whichever comes first.
+//
+// A record is written off the request path, so the last request can be answered
+// and the process torn down while its record is still being appended — and
+// closing the ledger under that write loses it silently, since a recorder
+// failure is designed to cost nothing but the record. A host process calls
+// Drain between the last request and closing the ledger. It is bounded because
+// a Recorder that never returns must cost the records, not the shutdown.
+func (p *Proxy) Drain(ctx context.Context) {
+	done := make(chan struct{})
+
+	go func() {
+		p.pending.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
 // abort answers a failure patchbay originated, in Anthropic's error shape, and
 // records it. An upstream's own error never comes through here: it is streamed
 // back untouched.
 func (p *Proxy) abort(w http.ResponseWriter, exch *exchange, gwErr *gatewayError) {
-	body := errorBody(gwErr)
+	body := anthropic.ErrorBody(gwErr)
 
-	w.Header().Set(headerContentType, "application/json")
+	w.Header().Set(anthropic.HeaderContentType, "application/json")
 	w.WriteHeader(gwErr.status)
 
 	if _, writeErr := w.Write(body); writeErr != nil {
@@ -235,11 +265,15 @@ func (p *Proxy) record(exch *exchange, capt *capture) {
 		return
 	}
 
+	p.pending.Add(1)
+
 	go p.appendRecord(exch, capt)
 }
 
 // appendRecord builds and appends one record, off the request path.
 func (p *Proxy) appendRecord(exch *exchange, capt *capture) {
+	defer p.pending.Done()
+
 	if capt != nil && capt.dropped {
 		p.logger.Warn("response capture dropped at the size ceiling",
 			slog.Int("limit_bytes", captureLimitBytes))
@@ -290,7 +324,15 @@ func readFailureStatus(err error) int {
 }
 
 // defaultClient is the upstream client used when the host process supplies
-// none: bounded connection setup, unbounded response time.
+// none: bounded connection setup, unbounded response time, and no redirect
+// following at all.
+//
+// Go's default redirect policy follows up to ten hops and, crossing to another
+// host, strips only Authorization, Www-Authenticate, Cookie and the Proxy-*
+// headers — an injected key or the caller's x-api-key would ride along to
+// whatever host the upstream named. A 3xx is also part of the answer the
+// pipeline owes the caller byte for byte, and following one would replace it
+// with something else's.
 func defaultClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
@@ -302,8 +344,14 @@ func defaultClient() *http.Client {
 			TLSHandshakeTimeout:   handshakeTimeout,
 			ExpectContinueTimeout: continueTimeout,
 		},
-		CheckRedirect: nil,
+		CheckRedirect: relayRedirect,
 		Jar:           nil,
 		Timeout:       0,
 	}
+}
+
+// relayRedirect stops the client at the first response, redirect or not, so the
+// caller gets the upstream's own answer.
+func relayRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }

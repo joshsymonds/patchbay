@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/joshsymonds/patchbay/internal/anthropic"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
@@ -22,15 +23,15 @@ func applyAuth(req *http.Request, route registry.Route) *gatewayError {
 		return nil
 	}
 
-	req.Header.Del(headerAuthorization)
-	req.Header.Del(headerClientKey)
+	req.Header.Del(anthropic.HeaderAuthorization)
+	req.Header.Del(anthropic.HeaderClientKey)
 
 	key, err := readAPIKey(route.APIKeyEnvFile)
 	if err != nil {
 		return &gatewayError{status: http.StatusInternalServerError, err: err}
 	}
 
-	req.Header.Set(headerAuthorization, "Bearer "+key)
+	req.Header.Set(anthropic.HeaderAuthorization, "Bearer "+key)
 
 	return nil
 }

@@ -1,0 +1,258 @@
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// envMap turns a fixed map into a lookup function, so a test resolves
+// configuration without touching the process environment.
+func envMap(values map[string]string) lookupEnvFunc {
+	return func(name string) (string, bool) {
+		value, ok := values[name]
+
+		return value, ok
+	}
+}
+
+// quietLogger returns a logger that writes nowhere.
+func quietLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
+
+func TestResolveConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		env  map[string]string
+		want config
+	}{
+		{
+			name: "xdg directories",
+			env: map[string]string{
+				"XDG_CONFIG_HOME": "/xdg/config",
+				"XDG_STATE_HOME":  "/xdg/state",
+				"HOME":            "/home/tester",
+			},
+			want: config{
+				listen:    "127.0.0.1:4100",
+				registry:  "/xdg/config/patchbay/routes.json",
+				ledgerDir: "/xdg/state/patchbay/ledger",
+			},
+		},
+		{
+			name: "home fallback when xdg is unset",
+			env:  map[string]string{"HOME": "/home/tester"},
+			want: config{
+				listen:    "127.0.0.1:4100",
+				registry:  "/home/tester/.config/patchbay/routes.json",
+				ledgerDir: "/home/tester/.local/state/patchbay/ledger",
+			},
+		},
+		{
+			name: "home fallback when xdg is set but empty",
+			env: map[string]string{
+				"XDG_CONFIG_HOME": "",
+				"XDG_STATE_HOME":  "",
+				"HOME":            "/home/tester",
+			},
+			want: config{
+				listen:    "127.0.0.1:4100",
+				registry:  "/home/tester/.config/patchbay/routes.json",
+				ledgerDir: "/home/tester/.local/state/patchbay/ledger",
+			},
+		},
+		{
+			name: "every setting overridden",
+			env: map[string]string{
+				"XDG_CONFIG_HOME":     "/xdg/config",
+				"XDG_STATE_HOME":      "/xdg/state",
+				"HOME":                "/home/tester",
+				"PATCHBAY_LISTEN":     "127.0.0.1:9999",
+				"PATCHBAY_REGISTRY":   "/etc/patchbay/routes.json",
+				"PATCHBAY_LEDGER_DIR": "/var/lib/patchbay",
+			},
+			want: config{
+				listen:    "127.0.0.1:9999",
+				registry:  "/etc/patchbay/routes.json",
+				ledgerDir: "/var/lib/patchbay",
+			},
+		},
+		{
+			name: "an empty override falls back to the default",
+			env: map[string]string{
+				"HOME":            "/home/tester",
+				"PATCHBAY_LISTEN": "",
+			},
+			want: config{
+				listen:    "127.0.0.1:4100",
+				registry:  "/home/tester/.config/patchbay/routes.json",
+				ledgerDir: "/home/tester/.local/state/patchbay/ledger",
+			},
+		},
+		{
+			name: "an override needs no home at all",
+			env: map[string]string{
+				"PATCHBAY_REGISTRY":   "/etc/patchbay/routes.json",
+				"PATCHBAY_LEDGER_DIR": "/var/lib/patchbay",
+			},
+			want: config{
+				listen:    "127.0.0.1:4100",
+				registry:  "/etc/patchbay/routes.json",
+				ledgerDir: "/var/lib/patchbay",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := resolveConfig(envMap(tc.env))
+			if err != nil {
+				t.Fatalf("resolveConfig() error = %v; want nil", err)
+			}
+
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("resolveConfig() = %+v; want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveConfigWithNowhereToLook(t *testing.T) {
+	t.Parallel()
+
+	// Neither an override, nor an XDG directory, nor a home: there is no honest
+	// path to fall back to, and inventing one would write somebody's records
+	// somewhere they never asked for.
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "nothing set at all", env: map[string]string{}},
+		{name: "registry override only", env: map[string]string{"PATCHBAY_REGISTRY": "/etc/patchbay/routes.json"}},
+		{name: "ledger override only", env: map[string]string{"PATCHBAY_LEDGER_DIR": "/var/lib/patchbay"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := resolveConfig(envMap(tc.env)); err == nil {
+				t.Fatal("resolveConfig() error = nil; want a fatal misconfiguration")
+			}
+		})
+	}
+}
+
+func TestRunFailsOnAnUnusableListenAddress(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	tests := []struct {
+		name   string
+		listen string
+	}{
+		{name: "port out of range", listen: "127.0.0.1:99999"},
+		{name: "not an address at all", listen: "not-an-address"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := run(t.Context(), envMap(map[string]string{
+				"PATCHBAY_LISTEN":     tc.listen,
+				"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
+				"PATCHBAY_LEDGER_DIR": filepath.Join(dir, "ledger"),
+			}), quietLogger(), nil)
+
+			if err == nil {
+				t.Fatalf("run() with listen %q error = nil; want a bind failure", tc.listen)
+			}
+
+			if !strings.Contains(err.Error(), tc.listen) {
+				t.Fatalf("run() error = %v; want it to name the address it could not bind", err)
+			}
+		})
+	}
+}
+
+func TestRunFailsOnAnUnresolvableConfig(t *testing.T) {
+	t.Parallel()
+
+	if err := run(t.Context(), envMap(map[string]string{}), quietLogger(), nil); err == nil {
+		t.Fatal("run() error = nil; want the misconfiguration reported")
+	}
+}
+
+func TestRunServesUntilTheContextIsCancelled(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	ledgerDir := filepath.Join(dir, "state", "ledger")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+
+	go func() {
+		done <- run(ctx, envMap(map[string]string{
+			"PATCHBAY_LISTEN":     "127.0.0.1:0",
+			"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
+			"PATCHBAY_LEDGER_DIR": ledgerDir,
+		}), quietLogger(), nil)
+	}()
+
+	cancel()
+
+	if err := <-done; err != nil {
+		t.Fatalf("run() error = %v; want a clean shutdown", err)
+	}
+
+	info, err := os.Stat(ledgerDir)
+	if err != nil {
+		t.Fatalf("stat ledger directory: %v", err)
+	}
+
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("ledger directory mode = %o; want 700", perm)
+	}
+}
+
+func TestRunSurvivesAnUnusableLedger(t *testing.T) {
+	t.Parallel()
+
+	// A ledger that cannot be opened costs the records and nothing else. The
+	// gateway's whole point is that the default route keeps working.
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "not-a-directory")
+
+	if err := os.WriteFile(blocker, []byte("in the way"), 0o600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+
+	go func() {
+		done <- run(ctx, envMap(map[string]string{
+			"PATCHBAY_LISTEN":     "127.0.0.1:0",
+			"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
+			"PATCHBAY_LEDGER_DIR": filepath.Join(blocker, "ledger"),
+		}), quietLogger(), nil)
+	}()
+
+	cancel()
+
+	if err := <-done; err != nil {
+		t.Fatalf("run() error = %v; want the gateway to serve without a ledger", err)
+	}
+}
