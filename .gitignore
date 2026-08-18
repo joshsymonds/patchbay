@@ -1,0 +1,31 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/patchbay
+
+# Nix build output symlink
+/result
+
+# Coverage
+coverage.out
+
+# devenv
+/.devenv*
+/.direnv
+.devenv-shell-env.sh
+devenv.local.nix
+
+# Local secrets — never commit
+.env.local
+.envrc.local
+
+# Per-checkout golangci-lint cache (see devenv-base.nix)
+.golangci-cache/
+
+# Local git worktrees — never tracked
+.worktrees/

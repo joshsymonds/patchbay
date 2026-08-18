@@ -1,0 +1,7 @@
+allowUnfree: true
+inputs:
+  nixpkgs:
+    # This pin and flake.nix's are the SAME literal rev — one toolchain
+    # everywhere — enforced by scripts/check-nix-pin.sh at the top of `just
+    # check`. Move it only via `just bump-nix`.
+    url: github:NixOS/nixpkgs/e8273b29fe1390ec8d4603f2477357555291432e
