@@ -486,6 +486,15 @@ linters:
         linters:
           - revive
 
+      # internal/proxy IS a forwarding proxy: the inbound path and query are
+      # caller data by design. gosec's SSRF taint analysis defines no sanitizer,
+      # so it flags every proxy. The destination host is never taken from the
+      # request — it comes from the registry's validated base_url.
+      - path: 'internal/proxy/'
+        text: 'G704'
+        linters:
+          - gosec
+
       # Relax linters for test files
       - path: _test\.go
         linters:
