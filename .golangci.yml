@@ -138,7 +138,7 @@ linters:
     tagliatelle:
       case:
         rules:
-          json: camel
+          json: snake
           yaml: snake
 
     depguard:
