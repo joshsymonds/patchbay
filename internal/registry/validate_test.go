@@ -722,6 +722,34 @@ func TestValidateInsecure(t *testing.T) {
 			route: `{"base_url":"http://gpubox.lan:11434","auth":"inject","api_key_env_file":"KEY_FILE",` +
 				`"insecure":true}`,
 		},
+		{
+			name:  "insecure on an https route rejected",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
+				`"insecure":true}`,
+			wants: []string{`"probe"`, "insecure", "https://openrouter.ai/api"},
+		},
+		{
+			name:  "insecure on a loopback http route rejected",
+			alias: "probe",
+			route: `{"base_url":"http://127.0.0.1:8080","auth":"inject","api_key_env_file":"KEY_FILE",` +
+				`"insecure":true}`,
+			wants: []string{`"probe"`, "insecure", "http://127.0.0.1:8080"},
+		},
+		{
+			name:  "insecure on a localhost http route rejected",
+			alias: "probe",
+			route: `{"base_url":"http://localhost:1234/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
+				`"insecure":true}`,
+			wants: []string{`"probe"`, "insecure", "http://localhost:1234/api"},
+		},
+		{
+			name:  "insecure on a sigv4 route rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
+				`"model_map_env_file":"MAP_FILE","insecure":true}`,
+			wants: []string{`"probe"`, "sigv4", "insecure"},
+		},
 	})
 }
 

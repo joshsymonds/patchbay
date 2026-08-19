@@ -206,6 +206,11 @@ func validateSigV4(route Route) error {
 			AuthSigV4, fieldKeyEnvFile)
 	}
 
+	if route.Insecure {
+		return fmt.Errorf("%s routes must not set %s; the Bedrock endpoint is always https",
+			AuthSigV4, fieldInsecure)
+	}
+
 	required := []struct {
 		field string
 		value string
@@ -316,9 +321,19 @@ func validateBaseURL(raw string, insecure bool) error {
 
 	switch parsed.Scheme {
 	case "https":
+		if insecure {
+			return fmt.Errorf("%s is set but %s %q already uses https",
+				fieldInsecure, fieldBaseURL, raw)
+		}
+
 		return nil
 	case "http":
-		if host := parsed.Hostname(); host != loopbackHost && host != localhostHost && !insecure {
+		if host := parsed.Hostname(); host == loopbackHost || host == localhostHost {
+			if insecure {
+				return fmt.Errorf("%s is set but %s %q is loopback, where http is already allowed",
+					fieldInsecure, fieldBaseURL, raw)
+			}
+		} else if !insecure {
 			return fmt.Errorf("%s %q may only use http for %s or %s, or with %s set",
 				fieldBaseURL, raw, loopbackHost, localhostHost, fieldInsecure)
 		}
