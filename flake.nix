@@ -40,10 +40,24 @@
 
             env.CGO_ENABLED = 0;
           };
+          # The optional Codex-subscription upstream the home-manager module can
+          # run — see docs/chatgpt-subscription.md. Packaged from upstream
+          # release binaries in ./nix/cliproxyapi.
+          cliproxyapi = pkgs.callPackage ./nix/cliproxyapi { };
         in
         {
-          inherit patchbay;
+          inherit patchbay cliproxyapi;
           default = patchbay;
         });
+
+      # The supported deployment: `services.patchbay` as a home-manager module,
+      # running the gateway (and, opted in, the Codex-subscription upstream) as
+      # systemd user services. Documented in docs/nix.md.
+      homeModules = rec {
+        patchbay = import ./nix/hm-module.nix self;
+        default = patchbay;
+      };
+      # The name home-manager's own documentation has historically used.
+      homeManagerModules = self.homeModules;
     };
 }

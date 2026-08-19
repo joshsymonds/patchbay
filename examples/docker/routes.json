@@ -1,0 +1,23 @@
+{
+  "contexts": {
+    "personal": {
+      "routes": {
+        "openrouter/kimi-k2": {
+          "auth": "inject",
+          "base_url": "https://openrouter.ai/api",
+          "model": "moonshotai/kimi-k2",
+          "api_key_env_file": "PATCHBAY_OPENROUTER_KEY_FILE",
+          "strip_cache_control": true
+        },
+        "chatgpt/sol": {
+          "auth": "inject",
+          "base_url": "http://cli-proxy-api:8317",
+          "model": "gpt-5.6-sol",
+          "api_key_env_file": "PATCHBAY_CHATGPT_KEY_FILE",
+          "insecure": true,
+          "max_input_tokens": 372000
+        }
+      }
+    }
+  }
+}

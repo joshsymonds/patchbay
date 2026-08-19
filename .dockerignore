@@ -1,0 +1,6 @@
+# Allowlist: the Go build needs exactly the module definition and the source
+# trees the Dockerfile copies. Everything else stays out of the build context.
+*
+!go.mod
+!cmd/
+!internal/

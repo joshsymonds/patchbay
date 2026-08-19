@@ -1,0 +1,53 @@
+# patchbay under docker compose. Copy this directory, edit routes.json to
+# your registry, create the key files it names (see docs/docker.md for the
+# three commands), then:
+#
+#   docker compose up -d                      # the gateway alone
+#   docker compose --profile codex up -d      # plus the ChatGPT-subscription upstream
+#
+# The codex profile is a Terms-of-Use decision before it is a configuration
+# one — read docs/chatgpt-subscription.md before enabling it.
+
+services:
+  patchbay:
+    image: ghcr.io/joshsymonds/patchbay:latest
+    build:
+      context: ../..
+    restart: unless-stopped
+    ports:
+      # Host loopback ONLY. The forward path spends the caller's own Anthropic
+      # credentials, so anything that can reach this socket can spend them —
+      # "4100:4100" without the address would offer that to the whole LAN.
+      - "127.0.0.1:4100:4100"
+    environment:
+      # One variable per key file the registry names. Add or remove alongside
+      # the volumes below to match your routes.json.
+      PATCHBAY_CALLER_KEY_FILE: /etc/patchbay/caller.key
+      PATCHBAY_OPENROUTER_KEY_FILE: /etc/patchbay/openrouter.key
+      PATCHBAY_CHATGPT_KEY_FILE: /etc/patchbay/chatgpt.key
+    volumes:
+      # Every file here must exist before `up`: Docker turns a missing bind
+      # source into an empty directory, which then shadows the file.
+      - ./routes.json:/etc/patchbay/routes.json:ro
+      - ./caller.key:/etc/patchbay/caller.key:ro
+      - ./openrouter.key:/etc/patchbay/openrouter.key:ro
+      - ./chatgpt.key:/etc/patchbay/chatgpt.key:ro
+      - ledger:/var/lib/patchbay/ledger
+
+  # The optional Codex-subscription upstream: CLIProxyAPI, translating
+  # Anthropic Messages to the ChatGPT Codex OAuth backend. Upstream's own
+  # published image. No ports: patchbay reaches it by service name on the
+  # compose network, and nothing on the host needs to.
+  cli-proxy-api:
+    profiles: [codex]
+    image: eceasy/cli-proxy-api:v7.2.136
+    restart: unless-stopped
+    volumes:
+      - ./cliproxyapi.yaml:/CLIProxyAPI/config.yaml:ro
+      # OAuth state, minted once by the device login (docs/docker.md) and
+      # refreshed by the proxy from then on.
+      - codex-auth:/root/.cli-proxy-api
+
+volumes:
+  ledger:
+  codex-auth:

@@ -1,0 +1,16 @@
+# CLIProxyAPI config for the compose codex profile. 0.0.0.0 is correct HERE:
+# the container publishes no port, so only the compose network reaches it.
+host: 0.0.0.0
+port: 8317
+auth-dir: "~/.cli-proxy-api"
+# The listener key patchbay injects — the same string chatgpt.key holds. A
+# label, not a secret: the credential is the OAuth state in the codex-auth
+# volume. See docs/chatgpt-subscription.md.
+api-keys:
+  - "patchbay-local"
+# Empty secret-key disables the management API and its control panel (which
+# otherwise auto-downloads a web UI from GitHub at runtime).
+remote-management:
+  allow-remote: false
+  secret-key: ""
+  disable-control-panel: true

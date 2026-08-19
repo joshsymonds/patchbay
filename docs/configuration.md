@@ -149,6 +149,9 @@ has to be a cloud:
 patchbay appends `/v1/messages` verbatim, so the server must answer the
 Messages API at that path — an OpenAI-style `/v1/chat/completions` server needs
 a translating proxy in front.
+[chatgpt-subscription.md](chatgpt-subscription.md) is a worked example of
+exactly that shape: CLIProxyAPI on loopback translating Messages to the Codex
+backend.
 
 `insecure` is the operator accepting, in the reviewed document itself, that
 this route travels an unencrypted link: anyone on that network path can read

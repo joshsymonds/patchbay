@@ -110,8 +110,10 @@ environment variable, whose *value* is the path of a file holding the key.
 verbatim, so `https://openrouter.ai/api` + `/v1/messages` is what gets
 requested. Check your provider's own Anthropic-compatible endpoint and set the
 root that produces it. The upstream does not have to be a cloud — a model
-server on your own network works too; see
-[Local models](docs/configuration.md#local-models).
+server on your own network works too ([Local
+models](docs/configuration.md#local-models)), as does a translating proxy in
+front of a chat subscription
+([ChatGPT subscription routes](docs/chatgpt-subscription.md)).
 
 Put the provider key in the file that variable will name, then check the
 registry and run the gateway:
@@ -145,8 +147,10 @@ using its subscription login, patchbay forwards that login to Anthropic
 untouched, and `/model openrouter/glm-4.6` rides the OpenRouter key instead.
 
 A full example registry using all three auth modes is in
-[examples/routes.json](examples/routes.json), and a declarative deployment
-sketch in [examples/home-manager.nix](examples/home-manager.nix).
+[examples/routes.json](examples/routes.json). On Nix, the flake exports a
+home-manager module that runs all of this as a service — see
+[docs/nix.md](docs/nix.md). Without Nix, there is a container image and a
+compose example — see [docs/docker.md](docs/docker.md).
 
 ## Contexts
 
@@ -268,6 +272,13 @@ A few more guarantees worth knowing:
   registry v2 schema field by field, hot reload, failure semantics
 - [docs/auth-modes.md](docs/auth-modes.md) — `forward`, `inject`, `sigv4`, and
   the full Bedrock story
+- [docs/chatgpt-subscription.md](docs/chatgpt-subscription.md) — fronting a
+  ChatGPT subscription through CLIProxyAPI, and why that is a Terms-of-Use
+  decision before it is a configuration one
+- [docs/nix.md](docs/nix.md) — the flake outputs and the home-manager module,
+  including the one-flag `codexUpstream` deployment
+- [docs/docker.md](docs/docker.md) — the GHCR image and the compose example,
+  for hosts without Nix
 - [docs/ledger.md](docs/ledger.md) — the JSONL record schema
 - [docs/cli.md](docs/cli.md) — every subcommand with real output
 
