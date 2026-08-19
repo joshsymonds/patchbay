@@ -27,9 +27,17 @@ const (
 	testHost   = "testhost"
 	keyEnvName = "PATCHBAY_TEST_KEY_FILE"
 	testAPIKey = "sk-upstream-secret"
-	echoAlias  = "local/echo"
-	sseType    = "text/event-stream"
-	jsonType   = "application/json"
+
+	// callerKeyEnvName is the real environment variable the inject-route caller
+	// gate reads; testCallerKey is the secret the canonical inbound request
+	// presents in its X-Patchbay-Key header.
+	callerKeyEnvName = "PATCHBAY_CALLER_KEY_FILE"
+	callerKeyHeader  = "X-Patchbay-Key"
+	testCallerKey    = "sk-caller-secret"
+
+	echoAlias = "local/echo"
+	sseType   = "text/event-stream"
+	jsonType  = "application/json"
 
 	// noModel is what a record carries when the request named no model at all,
 	// standing in for the empty string the ledger refuses to store.
@@ -200,9 +208,15 @@ func identityRoute(baseURL string) string {
 		echoAlias, baseURL, keyEnvName)
 }
 
-// writeKeyFile points the key environment variable at a file holding key.
+// writeKeyFile provisions an inject route's server-side secrets: it points the
+// upstream key environment variable at a file holding key (returning that path)
+// and, so a request carrying the canonical X-Patchbay-Key is accepted, also
+// provisions a valid caller key file. A test that needs a bad or absent caller
+// key overrides callerKeyEnvName after calling this.
 func writeKeyFile(t *testing.T, key string) string {
 	t.Helper()
+
+	writeCallerKeyFile(t, testCallerKey)
 
 	path := filepath.Join(t.TempDir(), "api.key")
 	if err := os.WriteFile(path, []byte(key), 0o600); err != nil {
@@ -210,6 +224,21 @@ func writeKeyFile(t *testing.T, key string) string {
 	}
 
 	t.Setenv(keyEnvName, path)
+
+	return path
+}
+
+// writeCallerKeyFile points the caller key environment variable at a file
+// holding key, returning that path.
+func writeCallerKeyFile(t *testing.T, key string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "caller.key")
+	if err := os.WriteFile(path, []byte(key), 0o600); err != nil {
+		t.Fatalf("write caller key file: %v", err)
+	}
+
+	t.Setenv(callerKeyEnvName, path)
 
 	return path
 }
@@ -358,10 +387,13 @@ func serve(t *testing.T, cfg proxy.Config, req *http.Request) *httptest.Response
 	return rec
 }
 
-// messagesRequest builds an inbound /v1/messages request carrying body.
+// messagesRequest builds an inbound /v1/messages request carrying body. It
+// presents the canonical caller secret in X-Patchbay-Key, matching the file
+// writeKeyFile provisions, so an inject route accepts it.
 func messagesRequest(body string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
 	req.Header.Set("Content-Type", jsonType)
+	req.Header.Set(callerKeyHeader, testCallerKey)
 
 	return req
 }

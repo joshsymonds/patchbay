@@ -462,6 +462,8 @@ func TestOversizedResponseDropsCaptureNotStream(t *testing.T) {
 		t.Fatalf("build request: %v", err)
 	}
 
+	req.Header.Set(callerKeyHeader, testCallerKey)
+
 	resp, err := gateway.Client().Do(req)
 	if err != nil {
 		t.Fatalf("proxied request: %v", err)

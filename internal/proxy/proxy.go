@@ -319,11 +319,23 @@ func (p *Proxy) appendRecord(exch *exchange, capt *capture) {
 // carrying the inbound path and raw query verbatim, the caller's headers minus
 // the ones a proxy owns, and the route's credentials.
 func upstreamRequest(r *http.Request, route registry.Route, body []byte) (*http.Request, *gatewayError) {
-	if route.Auth == registry.AuthInject && !isInjectMessagesPath(r.URL.Path) {
-		return nil, &gatewayError{
-			status: http.StatusNotFound,
-			err: fmt.Errorf("route %q injects a key and only relays the Messages endpoints, not %s",
-				route.Alias, r.URL.Path),
+	// Both gates below live only inside the AuthInject branch, so a forward or
+	// default route never reaches either. DefaultRoute() is AuthForward, so a
+	// registry that fails to resolve falls to a route that is never checked —
+	// the default route can never fail closed. The caller-key check reads the
+	// inbound request, before copyHeader strips X-Patchbay-Key from the upstream
+	// copy below, so it sees the header the caller actually sent.
+	if route.Auth == registry.AuthInject {
+		if !isInjectMessagesPath(r.URL.Path) {
+			return nil, &gatewayError{
+				status: http.StatusNotFound,
+				err: fmt.Errorf("route %q injects a key and only relays the Messages endpoints, not %s",
+					route.Alias, r.URL.Path),
+			}
+		}
+
+		if keyErr := checkCallerKey(r); keyErr != nil {
+			return nil, keyErr
 		}
 	}
 
@@ -340,7 +352,8 @@ func upstreamRequest(r *http.Request, route registry.Route, body []byte) (*http.
 		}
 	}
 
-	copyHeader(req.Header, r.Header, droppedHeaders(r.Header, headerHost, headerContentLength, headerAcceptEncoding))
+	copyHeader(req.Header, r.Header,
+		droppedHeaders(r.Header, headerHost, headerContentLength, headerAcceptEncoding, callerKeyHeader))
 	req.Header.Set(headerAcceptEncoding, encodingIdentity)
 
 	if authErr := applyAuth(req, route); authErr != nil {

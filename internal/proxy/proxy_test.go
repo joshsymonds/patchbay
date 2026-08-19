@@ -117,6 +117,7 @@ func TestIdentityRoutePreservesBytesBothWays(t *testing.T) {
 	}
 
 	req.Header.Set("Content-Type", jsonType)
+	req.Header.Set(callerKeyHeader, testCallerKey)
 
 	resp, err := gateway.Client().Do(req)
 	if err != nil {
@@ -155,6 +156,7 @@ func TestForwardPreservesPathQueryAndHeaders(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages?beta=true&x=%20a+b",
 		strings.NewReader(fidelityBody))
+	req.Header.Set(callerKeyHeader, testCallerKey)
 	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14")
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	req.Header.Set("Accept-Encoding", "gzip, br")
@@ -326,8 +328,12 @@ func TestMissingKeyFails(t *testing.T) {
 		setup func(t *testing.T)
 	}{
 		{
-			name:  "environment variable unset",
-			setup: func(t *testing.T) { t.Helper(); t.Setenv(keyEnvName, "") },
+			name: "environment variable unset",
+			setup: func(t *testing.T) {
+				t.Helper()
+				writeCallerKeyFile(t, testCallerKey)
+				t.Setenv(keyEnvName, "")
+			},
 		},
 		{
 			name: "key file missing",
@@ -617,6 +623,165 @@ func TestInjectRouteRelaysOnlyMessagesEndpoints(t *testing.T) {
 
 	if stub.hits() != 1 {
 		t.Errorf("upstream received %d requests, want 1 for the forwarded Messages call", stub.hits())
+	}
+}
+
+// TestInjectRouteAcceptsCallerKeyAndStripsIt proves the caller gate's happy
+// path: a request presenting the shared secret in X-Patchbay-Key is injected
+// and forwarded, and the header — patchbay's own, never the upstream's — never
+// reaches the upstream.
+func TestInjectRouteAcceptsCallerKeyAndStripsIt(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistry(t, identityRoute(stub.url())),
+		Host:     testHost,
+	}, messagesRequest(fidelityBody))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	if got := stub.call(t).header.Get(callerKeyHeader); got != "" {
+		t.Errorf("upstream saw %s = %q, want it stripped", callerKeyHeader, got)
+	}
+}
+
+// TestInjectRouteRefusesMissingOrWrongCallerKey proves the gate fails closed on
+// a caller that cannot prove the secret: a wrong key and an absent header both
+// get a 403 (never 401, which Claude Code would treat as a re-login prompt),
+// the foreign key is never spent, and neither the presented nor the expected
+// secret leaks into the error body the ledger persists.
+func TestInjectRouteRefusesMissingOrWrongCallerKey(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		presented string
+		setHeader bool
+	}{
+		{name: "wrong key", presented: "sk-not-the-secret", setHeader: true},
+		{name: "empty header", presented: "", setHeader: true},
+		{name: "missing header", presented: "", setHeader: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			writeKeyFile(t, testAPIKey)
+
+			stub := newUpstream(t, jsonHandler(http.StatusOK, `{}`))
+			recorder := newRecorder()
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(fidelityBody))
+			req.Header.Set("Content-Type", jsonType)
+
+			if testCase.setHeader {
+				req.Header.Set(callerKeyHeader, testCase.presented)
+			}
+
+			rec := serve(t, proxy.Config{
+				Registry: newRegistry(t, identityRoute(stub.url())),
+				Recorder: recorder,
+				Host:     testHost,
+			}, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusForbidden, rec.Body.String())
+			}
+
+			assertGatewayError(t, rec.Body.Bytes())
+
+			if stub.hits() != 0 {
+				t.Errorf("upstream received %d requests, want 0 — the inject key must not be spent", stub.hits())
+			}
+
+			got := recorder.wait(t)
+
+			for _, secret := range []string{testCallerKey, testAPIKey, testCase.presented} {
+				if secret == "" {
+					continue
+				}
+
+				if strings.Contains(rec.Body.String(), secret) {
+					t.Errorf("error body leaks a key value %q", secret)
+				}
+
+				if strings.Contains(got.ErrorBody, secret) {
+					t.Errorf("ledger error_body leaks a key value %q", secret)
+				}
+			}
+		})
+	}
+}
+
+// TestInjectRouteFailsClosedWhenCallerKeyUnavailable proves a server-side
+// problem reading the expected caller key refuses the inject request with a 500
+// rather than injecting the household key for a caller that proved nothing.
+func TestInjectRouteFailsClosedWhenCallerKeyUnavailable(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		setup func(t *testing.T)
+	}{
+		{
+			name: "environment variable unset",
+			setup: func(t *testing.T) {
+				t.Helper()
+				writeKeyFile(t, testAPIKey)
+				t.Setenv(callerKeyEnvName, "")
+			},
+		},
+		{
+			name: "caller key file missing",
+			setup: func(t *testing.T) {
+				t.Helper()
+				writeKeyFile(t, testAPIKey)
+				t.Setenv(callerKeyEnvName, writeCallerKeyFile(t, testCallerKey)+".gone")
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			testCase.setup(t)
+
+			stub := newUpstream(t, jsonHandler(http.StatusOK, `{}`))
+
+			rec := serve(t, proxy.Config{
+				Registry: newRegistry(t, identityRoute(stub.url())),
+				Host:     testHost,
+			}, messagesRequest(fidelityBody))
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusInternalServerError, rec.Body.String())
+			}
+
+			assertGatewayError(t, rec.Body.Bytes())
+
+			if stub.hits() != 0 {
+				t.Errorf("upstream received %d requests, want 0 — the inject key must not be spent", stub.hits())
+			}
+		})
+	}
+}
+
+// TestForwardRouteSkipsCallerKeyAndStripsIt proves the gate is unreachable on a
+// forward route: the caller-key header is never required — a request without
+// any caller key file provisioned still forwards — yet the header, being
+// patchbay's own, is still stripped from the upstream request.
+func TestForwardRouteSkipsCallerKeyAndStripsIt(t *testing.T) {
+	stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
+
+	req := messagesRequest(`{"model":"claude-sonnet-5","max_tokens":16}`)
+	req.Header.Set(callerKeyHeader, "whatever-the-caller-sent")
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistry(t, ""),
+		Client:   anthropicClient(t, stub),
+		Host:     testHost,
+	}, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	if got := stub.call(t).header.Get(callerKeyHeader); got != "" {
+		t.Errorf("upstream saw %s = %q, want it stripped on the forward route too", callerKeyHeader, got)
 	}
 }
 
