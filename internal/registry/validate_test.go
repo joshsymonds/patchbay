@@ -710,6 +710,21 @@ func TestValidateSigV4FieldPairing(t *testing.T) {
 	})
 }
 
+// Rule 9: insecure permits plain http on a non-loopback host, and is rejected
+// anywhere it would change nothing.
+func TestValidateInsecure(t *testing.T) {
+	t.Parallel()
+
+	runValidationCases(t, []validationCase{
+		{
+			name:  "insecure http accepted for a lan host",
+			alias: "local/qwen",
+			route: `{"base_url":"http://gpubox.lan:11434","auth":"inject","api_key_env_file":"KEY_FILE",` +
+				`"insecure":true}`,
+		},
+	})
+}
+
 // A sigv4 route's schema fields survive parsing into the resolved Route, since
 // the pipeline signs and maps models from them.
 func TestSigV4RouteFieldsResolve(t *testing.T) {

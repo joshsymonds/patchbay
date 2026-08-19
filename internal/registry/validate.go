@@ -147,7 +147,7 @@ func validateRoute(route Route) error {
 	// A sigv4 route names no base_url at all — validateSigV4 refuses one — because
 	// its endpoint comes from the region it signs for.
 	if route.Auth != AuthSigV4 {
-		if err := validateBaseURL(route.BaseURL); err != nil {
+		if err := validateBaseURL(route.BaseURL, route.Insecure); err != nil {
 			return err
 		}
 	}
@@ -300,10 +300,11 @@ func validateInject(route Route) error {
 	return validateNoAWSFields(route)
 }
 
-// validateBaseURL requires an absolute https URL. Plain http is allowed only
-// for loopback, where there is no network to eavesdrop on, so tests can point a
-// route at a local stub server.
-func validateBaseURL(raw string) error {
+// validateBaseURL requires an absolute https URL. Plain http is allowed for
+// loopback, where there is no network to eavesdrop on, and for a route that
+// declares insecure — the operator accepting the eavesdroppable link in the
+// registry itself, typically for a model server on their own LAN.
+func validateBaseURL(raw string, insecure bool) error {
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("%s %q is not a valid URL: %w", fieldBaseURL, raw, err)
@@ -317,9 +318,9 @@ func validateBaseURL(raw string) error {
 	case "https":
 		return nil
 	case "http":
-		if host := parsed.Hostname(); host != loopbackHost && host != localhostHost {
-			return fmt.Errorf("%s %q may only use http for %s or %s",
-				fieldBaseURL, raw, loopbackHost, localhostHost)
+		if host := parsed.Hostname(); host != loopbackHost && host != localhostHost && !insecure {
+			return fmt.Errorf("%s %q may only use http for %s or %s, or with %s set",
+				fieldBaseURL, raw, loopbackHost, localhostHost, fieldInsecure)
 		}
 
 		return nil

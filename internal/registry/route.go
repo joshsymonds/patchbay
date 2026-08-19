@@ -82,6 +82,11 @@ type Route struct {
 	// MaxOutputTokens caps the request's output tokens. Zero means no cap.
 	MaxOutputTokens int
 
+	// Insecure permits a plain-http base_url on a non-loopback host. The route
+	// then travels an eavesdroppable link, so the operator opts in per route,
+	// where a registry review will see it.
+	Insecure bool
+
 	// StripCacheControl removes cache_control markers before forwarding.
 	StripCacheControl bool
 

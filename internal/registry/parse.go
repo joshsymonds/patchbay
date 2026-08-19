@@ -25,6 +25,7 @@ const (
 	fieldAWSRegion         = "aws_region"
 	fieldModelMapEnvFile   = "model_map_env_file"
 	fieldExtraBody         = "extra_body"
+	fieldInsecure          = "insecure"
 	fieldMaxInputTokens    = "max_input_tokens"
 	fieldMaxOutputTokens   = "max_output_tokens"
 	fieldStripCacheControl = "strip_cache_control"
@@ -196,6 +197,8 @@ func assignField(route *Route, name string, value json.RawMessage) error {
 		route.ExtraBody = bytes.Clone(value)
 
 		return nil
+	case fieldInsecure:
+		return decodeField(&route.Insecure, name, value)
 	case fieldMaxInputTokens:
 		return decodeField(&route.MaxInputTokens, name, value)
 	case fieldMaxOutputTokens:
