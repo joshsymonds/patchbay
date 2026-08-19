@@ -328,6 +328,7 @@ func TestValidate(t *testing.T) {
 		{name: "valid", mutate: func(*ledger.Record) {}, wantErr: false},
 		{name: "valid with empty alias", mutate: func(r *ledger.Record) { r.Alias = "" }, wantErr: false},
 		{name: "valid auth mode forward", mutate: func(r *ledger.Record) { r.AuthMode = "forward" }, wantErr: false},
+		{name: "valid auth mode sigv4", mutate: func(r *ledger.Record) { r.AuthMode = "sigv4" }, wantErr: false},
 		{name: "zero timestamp", mutate: func(r *ledger.Record) { r.Timestamp = time.Time{} }, wantErr: true},
 		{name: "empty host", mutate: func(r *ledger.Record) { r.Host = "" }, wantErr: true},
 		{name: "blank host", mutate: func(r *ledger.Record) { r.Host = "   " }, wantErr: true},

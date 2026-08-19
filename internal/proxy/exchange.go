@@ -85,7 +85,7 @@ func (e *exchange) record(host string, capt *capture) ledger.Record {
 		CredentialClass: e.credentialClass,
 
 		Alias:         e.route.Alias,
-		Upstream:      e.route.BaseURL,
+		Upstream:      e.route.Upstream(),
 		Model:         namedModel(e.upstreamModel()),
 		RequestModel:  namedModel(e.requestModel),
 		AuthMode:      string(e.route.Auth),

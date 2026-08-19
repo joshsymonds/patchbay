@@ -991,3 +991,43 @@ func TestShowModelDescribesTheContextsOwnAlias(t *testing.T) {
 		})
 	}
 }
+
+// sigv4DefaultContext is a context whose default route signs for Bedrock. Its
+// listing is synthesized the same way an inject context's is: the Anthropic-side
+// model ids are exactly the keys of the route's model map, so the listing needs
+// nothing from the map file and never names a Bedrock model.
+const sigv4DefaultContext = `"work":{"default_route":{"auth":"sigv4","aws_profile":"work",` +
+	`"aws_region":"us-east-2","model_map_env_file":"BEDROCK_MODEL_MAP_FILE",` +
+	`"model":"claude-sonnet-5","max_input_tokens":200000},"routes":{` + workRoutes + `}}`
+
+func TestModelListIsSynthesizedForASigV4Context(t *testing.T) {
+	t.Parallel()
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, upstreamList("claude-opus-5")))
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+sigv4DefaultContext),
+		Client:   anthropicClient(t, stub),
+	}, modelsRequest("/ctx/work/v1/models"))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
+	}
+
+	if stub.hits() != 0 {
+		t.Fatalf("upstream saw %d fetches; want none for a synthesized listing", stub.hits())
+	}
+
+	list := decodeList(t, rec.Body.Bytes())
+
+	want := []string{"work-atlas", "claude-sonnet-5"}
+	if got := ids(t, list); !reflect.DeepEqual(got, want) {
+		t.Fatalf("data ids = %v; want the aliases then the default route's model: %v", got, want)
+	}
+
+	entry := entryFields(t, list.Data[1])
+	if got := entry["max_input_tokens"]; got != float64(200000) {
+		t.Fatalf("max_input_tokens = %v; want the route's ceiling", got)
+	}
+}

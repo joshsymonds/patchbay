@@ -50,8 +50,14 @@ const (
 
 // upstreamCall is one request as the stub upstream received it.
 type upstreamCall struct {
-	method   string
-	path     string
+	method string
+
+	// path is the decoded request path; escapedPath is the path exactly as it
+	// arrived on the wire, which is what a percent-escaped Bedrock ARN is judged
+	// by.
+	path        string
+	escapedPath string
+
 	rawQuery string
 	header   http.Header
 	body     []byte
@@ -100,11 +106,12 @@ func (u *upstream) wrap(t *testing.T, handle http.HandlerFunc) http.Handler {
 		}
 
 		u.calls <- upstreamCall{
-			method:   r.Method,
-			path:     r.URL.Path,
-			rawQuery: r.URL.RawQuery,
-			header:   r.Header.Clone(),
-			body:     body,
+			method:      r.Method,
+			path:        r.URL.Path,
+			escapedPath: r.URL.EscapedPath(),
+			rawQuery:    r.URL.RawQuery,
+			header:      r.Header.Clone(),
+			body:        body,
 		}
 
 		r.Body = io.NopCloser(strings.NewReader(string(body)))
@@ -231,7 +238,7 @@ func identityRoute(baseURL string) string {
 func writeKeyFile(t *testing.T, key string) string {
 	t.Helper()
 
-	writeCallerKeyFile(t, testCallerKey)
+	writeCallerKeyFile(t)
 
 	path := filepath.Join(t.TempDir(), "api.key")
 	if err := os.WriteFile(path, []byte(key), 0o600); err != nil {
@@ -244,12 +251,12 @@ func writeKeyFile(t *testing.T, key string) string {
 }
 
 // writeCallerKeyFile points the caller key environment variable at a file
-// holding key, returning that path.
-func writeCallerKeyFile(t *testing.T, key string) string {
+// holding the canonical caller secret, returning that path.
+func writeCallerKeyFile(t *testing.T) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "caller.key")
-	if err := os.WriteFile(path, []byte(key), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(testCallerKey), 0o600); err != nil {
 		t.Fatalf("write caller key file: %v", err)
 	}
 

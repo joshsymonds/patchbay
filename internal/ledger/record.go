@@ -13,11 +13,14 @@ import (
 // one ledger line unbounded.
 const maxErrorBodyBytes = 4096
 
-// The two ways patchbay presents credentials upstream: forward the client's own
-// credential unchanged, or inject a configured one.
+// The three ways patchbay presents credentials upstream: forward the client's
+// own credential unchanged, inject a configured one, or sign the request with
+// AWS SigV4. A mode outside this set is refused rather than stored, the same way
+// a credential class is.
 const (
 	authModeForward = "forward"
 	authModeInject  = "inject"
+	authModeSigV4   = "sigv4"
 )
 
 // The credential classes a record may carry. They classify the credential the
@@ -86,7 +89,7 @@ func (r Record) Validate() error {
 		}
 	}
 	switch r.AuthMode {
-	case authModeForward, authModeInject:
+	case authModeForward, authModeInject, authModeSigV4:
 	default:
 		return fmt.Errorf("ledger record has invalid auth_mode %q", r.AuthMode)
 	}

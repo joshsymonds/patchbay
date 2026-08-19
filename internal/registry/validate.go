@@ -109,13 +109,21 @@ func validateRoute(route Route) error {
 		if err := validateInject(route); err != nil {
 			return err
 		}
+	case AuthSigV4:
+		if err := validateSigV4(route); err != nil {
+			return err
+		}
 	default:
-		return fmt.Errorf("%s %q is not a valid auth mode (want %q or %q)",
-			fieldAuth, route.Auth, AuthForward, AuthInject)
+		return fmt.Errorf("%s %q is not a valid auth mode (want %q, %q or %q)",
+			fieldAuth, route.Auth, AuthForward, AuthInject, AuthSigV4)
 	}
 
-	if err := validateBaseURL(route.BaseURL); err != nil {
-		return err
+	// A sigv4 route names no base_url at all — validateSigV4 refuses one — because
+	// its endpoint comes from the region it signs for.
+	if route.Auth != AuthSigV4 {
+		if err := validateBaseURL(route.BaseURL); err != nil {
+			return err
+		}
 	}
 
 	if err := validateTokenCeilings(route); err != nil {
@@ -154,6 +162,62 @@ func validateForward(route Route) error {
 		return fmt.Errorf("%s routes must not set %s", AuthForward, fieldKeyEnvFile)
 	}
 
+	return validateNoAWSFields(route)
+}
+
+// validateSigV4 enforces what signing needs and what it forbids: a profile to
+// export credentials from, a region to sign for and reach, and a model map to
+// translate the caller's model id through — and no base_url or key file, both of
+// which would name a second, contradictory way to address or pay an upstream.
+func validateSigV4(route Route) error {
+	if route.BaseURL != "" {
+		return fmt.Errorf("%s routes must not set %s; the Bedrock endpoint is derived from %s",
+			AuthSigV4, fieldBaseURL, fieldAWSRegion)
+	}
+
+	if route.APIKeyEnvFile != "" {
+		return fmt.Errorf("%s routes must not set %s; they pay with AWS credentials",
+			AuthSigV4, fieldKeyEnvFile)
+	}
+
+	required := []struct {
+		field string
+		value string
+	}{
+		{field: fieldAWSProfile, value: route.AWSProfile},
+		{field: fieldAWSRegion, value: route.AWSRegion},
+		{field: fieldModelMapEnvFile, value: route.ModelMapEnvFile},
+	}
+
+	for _, entry := range required {
+		if strings.TrimSpace(entry.value) == "" {
+			return fmt.Errorf("%s routes require a non-empty %s", AuthSigV4, entry.field)
+		}
+	}
+
+	return nil
+}
+
+// validateNoAWSFields refuses the sigv4-only fields on a route that does not
+// sign: a forward or inject route that names an AWS profile is one whose author
+// expected signing that will never happen.
+func validateNoAWSFields(route Route) error {
+	forbidden := []struct {
+		field string
+		value string
+	}{
+		{field: fieldAWSProfile, value: route.AWSProfile},
+		{field: fieldAWSRegion, value: route.AWSRegion},
+		{field: fieldModelMapEnvFile, value: route.ModelMapEnvFile},
+	}
+
+	for _, entry := range forbidden {
+		if entry.value != "" {
+			return fmt.Errorf("%s routes must not set %s, which only %s routes use",
+				route.Auth, entry.field, AuthSigV4)
+		}
+	}
+
 	return nil
 }
 
@@ -175,7 +239,7 @@ func validateInject(route Route) error {
 			AuthInject, claudeMarker, fieldModel, route.Model)
 	}
 
-	return nil
+	return validateNoAWSFields(route)
 }
 
 // validateBaseURL requires an absolute https URL. Plain http is allowed only

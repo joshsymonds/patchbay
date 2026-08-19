@@ -3,6 +3,8 @@ package registry_test
 import (
 	"strings"
 	"testing"
+
+	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
 // siblingRoute is a valid route that shares every fixture file. A file-level
@@ -562,5 +564,134 @@ func TestStrictDecodeRejectsMalformedRegistries(t *testing.T) {
 			assertDefault(t, reg, "sibling-ok")
 			assertErrMentions(t, reg.Err(), tc.wants)
 		})
+	}
+}
+
+// Rule 8: a sigv4 route signs with AWS credentials, so it needs a profile, a
+// region and a model map, and it has no base_url of its own — the Bedrock
+// endpoint is derived from the region.
+func TestValidateSigV4FieldPairing(t *testing.T) {
+	t.Parallel()
+
+	runValidationCases(t, []validationCase{
+		{
+			name:  "complete sigv4 route accepted",
+			alias: "bedrock/sonnet",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
+				`"model_map_env_file":"BEDROCK_MODEL_MAP_FILE","model":"claude-sonnet-5"}`,
+		},
+		{
+			name:  "sigv4 without aws_profile rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "sigv4", "aws_profile"},
+		},
+		{
+			name:  "sigv4 with an empty aws_profile rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "sigv4", "aws_profile"},
+		},
+		{
+			name:  "sigv4 without aws_region rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "sigv4", "aws_region"},
+		},
+		{
+			name:  "sigv4 with an empty aws_region rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "sigv4", "aws_region"},
+		},
+		{
+			name:  "sigv4 without model_map_env_file rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2"}`,
+			wants: []string{`"probe"`, "sigv4", "model_map_env_file"},
+		},
+		{
+			name:  "sigv4 with an empty model_map_env_file rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":""}`,
+			wants: []string{`"probe"`, "sigv4", "model_map_env_file"},
+		},
+		{
+			name:  "sigv4 with a base_url rejected",
+			alias: "probe",
+			route: `{"base_url":"https://bedrock-runtime.us-east-2.amazonaws.com","auth":"sigv4",` +
+				`"aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "sigv4", "base_url", "aws_region"},
+		},
+		{
+			name:  "sigv4 with an api key file rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
+				`"model_map_env_file":"MAP_FILE","api_key_env_file":"KEY_FILE"}`,
+			wants: []string{`"probe"`, "sigv4", "api_key_env_file"},
+		},
+		{
+			name:  "forward with aws_profile rejected",
+			alias: "probe",
+			route: `{"base_url":"https://api.anthropic.com","auth":"forward","aws_profile":"work"}`,
+			wants: []string{`"probe"`, "forward", "aws_profile"},
+		},
+		{
+			name:  "forward with aws_region rejected",
+			alias: "probe",
+			route: `{"base_url":"https://api.anthropic.com","auth":"forward","aws_region":"us-east-2"}`,
+			wants: []string{`"probe"`, "forward", "aws_region"},
+		},
+		{
+			name:  "inject with model_map_env_file rejected",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
+				`"model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "inject", "model_map_env_file"},
+		},
+		{
+			name:  "inject with aws_region rejected",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
+				`"aws_region":"us-east-2"}`,
+			wants: []string{`"probe"`, "inject", "aws_region"},
+		},
+		{
+			name:  "sigv4 naming a claude model accepted",
+			alias: "bedrock/claude",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
+				`"model_map_env_file":"MAP_FILE","model":"claude-sonnet-5","max_input_tokens":200000}`,
+		},
+	})
+}
+
+// A sigv4 route's schema fields survive parsing into the resolved Route, since
+// the pipeline signs and maps models from them.
+func TestSigV4RouteFieldsResolve(t *testing.T) {
+	t.Parallel()
+
+	reg := newRegistry(t, personalDoc(`"bedrock/sonnet":{"auth":"sigv4","aws_profile":"work",`+
+		`"aws_region":"us-east-2","model_map_env_file":"MAP_FILE","model":"claude-sonnet-5"}`))
+
+	if err := reg.Err(); err != nil {
+		t.Fatalf("Err() = %v; want nil for a valid registry", err)
+	}
+
+	route := bare(t, reg, "bedrock/sonnet")
+
+	if route.Auth != registry.AuthSigV4 {
+		t.Errorf("Auth = %q; want %q", route.Auth, registry.AuthSigV4)
+	}
+
+	if route.AWSProfile != "work" {
+		t.Errorf("AWSProfile = %q; want %q", route.AWSProfile, "work")
+	}
+
+	if route.AWSRegion != "us-east-2" {
+		t.Errorf("AWSRegion = %q; want %q", route.AWSRegion, "us-east-2")
+	}
+
+	if route.ModelMapEnvFile != "MAP_FILE" {
+		t.Errorf("ModelMapEnvFile = %q; want %q", route.ModelMapEnvFile, "MAP_FILE")
 	}
 }

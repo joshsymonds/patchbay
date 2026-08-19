@@ -18,6 +18,19 @@ const (
 	// AuthInject drops the caller's credentials and substitutes a key read from
 	// the file named by the route's APIKeyEnvFile.
 	AuthInject AuthMode = "inject"
+
+	// AuthSigV4 drops the caller's credentials and signs the request with AWS
+	// SigV4 for Bedrock, using credentials exported from the route's named AWS
+	// profile.
+	AuthSigV4 AuthMode = "sigv4"
+)
+
+// bedrockEndpointPrefix and bedrockEndpointSuffix bracket the region in a
+// bedrock-runtime endpoint. A sigv4 route names no base_url: its endpoint is
+// derived from the region it signs for, so the two can never disagree.
+const (
+	bedrockEndpointPrefix = "https://bedrock-runtime."
+	bedrockEndpointSuffix = ".amazonaws.com"
 )
 
 // Route is the resolved destination for one request: where it goes, what model
@@ -41,6 +54,20 @@ type Route struct {
 	// path of a file holding the API key — never the key itself. Inject routes
 	// only.
 	APIKeyEnvFile string
+
+	// AWSProfile is the AWS profile whose credentials sign the request. Sigv4
+	// routes only.
+	AWSProfile string
+
+	// AWSRegion is the AWS region the request is signed for, and the region of
+	// the Bedrock endpoint it is sent to. Sigv4 routes only.
+	AWSRegion string
+
+	// ModelMapEnvFile is the NAME of an environment variable whose VALUE is the
+	// path of a JSON file mapping Anthropic model ids to Bedrock model ids —
+	// never a Bedrock id itself, which is why none of them appears in the
+	// registry. Sigv4 routes only.
+	ModelMapEnvFile string
 
 	// ExtraBody is merged into the request JSON at forward time. It is nil when
 	// the route sets no extra body. Treat it as read-only: every Resolve of the
@@ -79,6 +106,23 @@ type Context struct {
 	// Routes are the context's aliases, keyed by the model name that selects
 	// them.
 	Routes map[string]Route
+}
+
+// Upstream is the API root this route actually reaches: the base_url it names,
+// or — for a sigv4 route, which names none — the Bedrock endpoint its region
+// derives. It is what the ledger records as the upstream, so a record always
+// says where the request went.
+func (r Route) Upstream() string {
+	if r.Auth == AuthSigV4 {
+		return BedrockEndpoint(r.AWSRegion)
+	}
+
+	return r.BaseURL
+}
+
+// BedrockEndpoint returns the bedrock-runtime API root for region.
+func BedrockEndpoint(region string) string {
+	return bedrockEndpointPrefix + region + bedrockEndpointSuffix
 }
 
 // DefaultRoute returns the built-in route every unrecognized model rides: a

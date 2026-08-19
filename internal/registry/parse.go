@@ -21,6 +21,9 @@ const (
 	fieldModel             = "model"
 	fieldAuth              = "auth"
 	fieldKeyEnvFile        = "api_key_env_file"
+	fieldAWSProfile        = "aws_profile"
+	fieldAWSRegion         = "aws_region"
+	fieldModelMapEnvFile   = "model_map_env_file"
 	fieldExtraBody         = "extra_body"
 	fieldMaxInputTokens    = "max_input_tokens"
 	fieldMaxOutputTokens   = "max_output_tokens"
@@ -183,6 +186,12 @@ func assignField(route *Route, name string, value json.RawMessage) error {
 		return decodeField(&route.Auth, name, value)
 	case fieldKeyEnvFile:
 		return decodeField(&route.APIKeyEnvFile, name, value)
+	case fieldAWSProfile:
+		return decodeField(&route.AWSProfile, name, value)
+	case fieldAWSRegion:
+		return decodeField(&route.AWSRegion, name, value)
+	case fieldModelMapEnvFile:
+		return decodeField(&route.ModelMapEnvFile, name, value)
 	case fieldExtraBody:
 		route.ExtraBody = bytes.Clone(value)
 

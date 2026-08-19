@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/joshsymonds/patchbay/internal/anthropic"
+	"github.com/joshsymonds/patchbay/internal/awssig"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
@@ -110,6 +111,10 @@ type Proxy struct {
 	host     string
 	logger   *slog.Logger
 
+	// credentials exports and caches the AWS credentials sigv4 routes sign with,
+	// one cache per profile shared by every request that rides one.
+	credentials *awssig.CredentialSource
+
 	// pending counts the record goroutines still in flight, so a host process
 	// can wait for them instead of closing the ledger out from under one.
 	pending sync.WaitGroup
@@ -128,11 +133,12 @@ func New(cfg Config) *Proxy {
 	}
 
 	return &Proxy{
-		registry: cfg.Registry,
-		recorder: cfg.Recorder,
-		client:   client,
-		host:     cfg.Host,
-		logger:   logger,
+		registry:    cfg.Registry,
+		recorder:    cfg.Recorder,
+		client:      client,
+		host:        cfg.Host,
+		logger:      logger,
+		credentials: awssig.NewCredentialSource(),
 	}
 }
 
@@ -187,7 +193,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		exch.requestBody = string(upstreamBody)
 	}
 
-	req, reqErr := upstreamRequest(r, route, upstreamBody)
+	req, reqErr := p.upstreamRequest(r, route, upstreamBody)
 	if reqErr != nil {
 		p.abort(r.Context(), w, exch, reqErr)
 
@@ -196,12 +202,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	sent := time.Now()
 
-	resp, doErr := p.client.Do(req)
-	if doErr != nil {
-		p.abort(r.Context(), w, exch, &gatewayError{
-			status: http.StatusBadGateway,
-			err:    fmt.Errorf("upstream request failed: %w", doErr),
-		})
+	resp, sendErr := p.send(r, route, upstreamBody, req)
+	if sendErr != nil {
+		p.abort(r.Context(), w, exch, sendErr)
 
 		return
 	}
@@ -212,7 +215,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	exch.status = resp.StatusCode
 	exch.contentType = resp.Header.Get(anthropic.HeaderContentType)
 
-	capt := p.stream(r.Context(), w, resp)
+	var capt *capture
+
+	if isBedrockStream(route, resp) {
+		// The caller is handed Anthropic SSE, so that — not the event-stream
+		// framing it arrived in — is what the record is summarized from.
+		exch.contentType = eventStreamType
+		capt = p.streamBedrock(r.Context(), w, resp)
+	} else {
+		capt = p.stream(r.Context(), w, resp)
+	}
 	exch.durationMS = millis(time.Since(start))
 
 	p.record(exch, capt)
@@ -245,7 +257,7 @@ func (p *Proxy) Drain(ctx context.Context) {
 // records it. An upstream's own error never comes through here: it is streamed
 // back untouched.
 func (p *Proxy) abort(ctx context.Context, w http.ResponseWriter, exch *exchange, gwErr *gatewayError) {
-	body := anthropic.ErrorBody(gwErr)
+	body := anthropic.TypedErrorBody(gwErr.anthropicType(), gwErr)
 
 	w.Header().Set(anthropic.HeaderContentType, "application/json")
 	w.WriteHeader(gwErr.status)
@@ -336,10 +348,88 @@ func (p *Proxy) appendRecord(exch *exchange, capt *capture) {
 	}
 }
 
+// send performs the upstream request and hands back its response.
+//
+// A sigv4 route gets one retry, and only on a 403: AWS refuses a signature made
+// with a credential that has since expired, which is the ordinary end of an SSO
+// session rather than a failure worth surfacing. The cached credential is
+// dropped so the retry exports a fresh one. A second refusal is patchbay's own
+// failure to report — the caller has no AWS credential of its own to fix, so a
+// relayed 403 would only read as a broken gateway.
+func (p *Proxy) send(
+	r *http.Request,
+	route registry.Route,
+	body []byte,
+	req *http.Request,
+) (*http.Response, *gatewayError) {
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, &gatewayError{
+			status:  http.StatusBadGateway,
+			errType: "",
+			err:     fmt.Errorf("upstream request failed: %w", err),
+		}
+	}
+
+	if route.Auth != registry.AuthSigV4 || resp.StatusCode != http.StatusForbidden {
+		return resp, nil
+	}
+
+	p.discard(r.Context(), resp)
+	p.credentials.Invalidate(route.AWSProfile)
+
+	retry, buildErr := p.upstreamRequest(r, route, body)
+	if buildErr != nil {
+		return nil, buildErr
+	}
+
+	resp, err = p.client.Do(retry)
+	if err != nil {
+		return nil, &gatewayError{
+			status:  http.StatusBadGateway,
+			errType: "",
+			err:     fmt.Errorf("upstream request failed: %w", err),
+		}
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		p.discard(r.Context(), resp)
+
+		return nil, &gatewayError{
+			status:  http.StatusBadGateway,
+			errType: "",
+			err: fmt.Errorf("bedrock refused the request signed with profile %q twice; run: aws sso login --profile %s",
+				route.AWSProfile, route.AWSProfile),
+		}
+	}
+
+	return resp, nil
+}
+
+// discard drains and closes a response nobody will read, so its connection goes
+// back to the pool rather than being torn down mid-body. A failure to drain
+// costs the connection and nothing else, which is worth a line in the log and
+// no more.
+func (p *Proxy) discard(ctx context.Context, resp *http.Response) {
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		p.logger.WarnContext(ctx, "draining a refused response failed", slog.Any("error", err))
+	}
+
+	if err := resp.Body.Close(); err != nil {
+		p.logger.WarnContext(ctx, "closing a refused response failed", slog.Any("error", err))
+	}
+}
+
 // upstreamRequest builds the request to send upstream: the route's base URL
 // carrying the inbound path and raw query verbatim, the caller's headers minus
 // the ones a proxy owns, and the route's credentials.
-func upstreamRequest(r *http.Request, route registry.Route, body []byte) (*http.Request, *gatewayError) {
+func (p *Proxy) upstreamRequest(r *http.Request, route registry.Route, body []byte) (*http.Request, *gatewayError) {
+	// A sigv4 route sends a translated, signed request to an endpoint its region
+	// derives, so it shares none of the relay path below.
+	if route.Auth == registry.AuthSigV4 {
+		return p.bedrockRequest(r, route, body)
+	}
+
 	// Both gates below live only inside the AuthInject branch, so a forward or
 	// default route never reaches either. DefaultRoute() is AuthForward, so a
 	// registry that fails to resolve falls to a route that is never checked —

@@ -331,7 +331,7 @@ func TestMissingKeyFails(t *testing.T) {
 			name: "environment variable unset",
 			setup: func(t *testing.T) {
 				t.Helper()
-				writeCallerKeyFile(t, testCallerKey)
+				writeCallerKeyFile(t)
 				t.Setenv(keyEnvName, "")
 			},
 		},
@@ -733,7 +733,7 @@ func TestInjectRouteFailsClosedWhenCallerKeyUnavailable(t *testing.T) {
 			setup: func(t *testing.T) {
 				t.Helper()
 				writeKeyFile(t, testAPIKey)
-				t.Setenv(callerKeyEnvName, writeCallerKeyFile(t, testCallerKey)+".gone")
+				t.Setenv(callerKeyEnvName, writeCallerKeyFile(t)+".gone")
 			},
 		},
 	} {
