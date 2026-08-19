@@ -136,7 +136,7 @@ func TestRewriteLeavesSharedExtraBodyIntact(t *testing.T) {
 	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
 	reg := newRegistry(t, rewriteRoute(stub.url()))
 
-	before := reg.Resolve(rewriteAlias)
+	before := resolveRoute(t, reg, rewriteAlias)
 	snapshot := bytes.Clone(before.ExtraBody)
 
 	rec := serve(t, proxy.Config{Registry: reg, Host: testHost}, messagesRequest(rewriteBody))
@@ -144,7 +144,7 @@ func TestRewriteLeavesSharedExtraBodyIntact(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 
-	after := reg.Resolve(rewriteAlias)
+	after := resolveRoute(t, reg, rewriteAlias)
 
 	if len(after.ExtraBody) == 0 || len(before.ExtraBody) == 0 {
 		t.Fatal("route has no extra_body to protect")

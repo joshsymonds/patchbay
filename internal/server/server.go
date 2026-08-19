@@ -17,10 +17,14 @@
 package server
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
+	"github.com/joshsymonds/patchbay/internal/anthropic"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
@@ -32,6 +36,13 @@ const (
 	modelPattern  = "GET " + modelsPath + "/{id}"
 	rootPattern   = "/"
 )
+
+// contextPrefix is how a request names the context it wants:
+// "/ctx/work/v1/messages" asks the work context for /v1/messages. The prefix is
+// stripped before anything else looks at the path, so every gate and every
+// upstream URL downstream sees the request exactly as it would have arrived
+// without one.
+const contextPrefix = "/ctx"
 
 // fetchTimeout bounds one upstream models call. Nothing on this surface
 // streams — a listing is a small document that either arrives promptly or is
@@ -93,7 +104,108 @@ func Handler(cfg Config) http.Handler {
 	mux.HandleFunc(modelPattern, gw.showModel)
 	mux.Handle(rootPattern, cfg.Proxy)
 
-	return mux
+	return gw.selectContext(mux)
+}
+
+// selectContext resolves the context a request named in its path, strips the
+// prefix that named it, and hands the rest to next with the selection attached.
+//
+// A request that named no context is passed through untouched: it selects the
+// personal context implicitly, and keeps working with no registry at all. A
+// request that DID name one is refused unless the current registry can produce
+// it — an unknown name, a broken file, a missing file. Falling through to
+// another context, or to the built-in default route, would answer a question
+// nobody asked, and the whole point of a context is that it is a boundary.
+func (gw *gateway) selectContext(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sel, stripped := splitContext(r.URL)
+
+		if !sel.Explicit {
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		if _, err := gw.registry.Resolve(sel, ""); err != nil {
+			gw.writeUnknownContext(r.Context(), w, err)
+
+			return
+		}
+
+		routed := r.WithContext(registry.WithSelection(r.Context(), sel))
+		routed.URL = stripped
+
+		next.ServeHTTP(w, routed)
+	})
+}
+
+// splitContext separates the context a request named from the path it actually
+// asked for. A path with no prefix selects the personal context implicitly and
+// is returned unchanged. A prefix naming nothing — "/ctx", "/ctx/", "/ctx//x",
+// or a name that will not come cleanly off the escaped path — is an explicit
+// selection of no context at all, which fails closed like any other name the
+// registry cannot produce.
+func splitContext(target *url.URL) (registry.Selection, *url.URL) {
+	implicit := registry.Selection{Name: registry.PersonalContext, Explicit: false}
+
+	after, found := strings.CutPrefix(target.EscapedPath(), contextPrefix)
+	if !found || (after != "" && !strings.HasPrefix(after, "/")) {
+		return implicit, target
+	}
+
+	name, _, _ := strings.Cut(strings.TrimPrefix(after, "/"), "/")
+	if name == "" {
+		return registry.Selection{Name: "", Explicit: true}, target
+	}
+
+	stripped, ok := stripPrefix(target, contextPrefix+"/"+name)
+	if !ok {
+		return registry.Selection{Name: "", Explicit: true}, target
+	}
+
+	return registry.Selection{Name: name, Explicit: true}, stripped
+}
+
+// stripPrefix removes prefix from both halves of a URL's path — the decoded
+// Path and the raw RawPath — the way http.StripPrefix does, so a path carrying
+// escaped bytes reaches the upstream as the bytes it arrived as. It reports
+// false when the prefix does not come cleanly off both.
+func stripPrefix(target *url.URL, prefix string) (*url.URL, bool) {
+	trimmed := strings.TrimPrefix(target.Path, prefix)
+	if len(trimmed) >= len(target.Path) {
+		return nil, false
+	}
+
+	rawTrimmed := strings.TrimPrefix(target.RawPath, prefix)
+	if target.RawPath != "" && len(rawTrimmed) >= len(target.RawPath) {
+		return nil, false
+	}
+
+	// "/ctx/work" asked the work context for the root, not for the empty path.
+	if trimmed == "" {
+		trimmed = "/"
+		rawTrimmed = ""
+	}
+
+	stripped := *target
+	stripped.Path = trimmed
+	stripped.RawPath = rawTrimmed
+
+	return &stripped, true
+}
+
+// writeUnknownContext refuses a request naming a context patchbay cannot
+// resolve. It answers 404 in Anthropic's own not-found taxonomy rather than a
+// type of patchbay's invention, so a client that has never heard of contexts
+// still gets an error it knows how to handle, and names the context it refused
+// so an operator can see which one. It never names anything else about the
+// request.
+func (gw *gateway) writeUnknownContext(ctx context.Context, w http.ResponseWriter, err error) {
+	gw.logger.WarnContext(ctx, "request named a context that cannot be resolved", slog.Any("error", err))
+
+	w.Header().Set(anthropic.HeaderContentType, jsonContentType)
+	w.WriteHeader(http.StatusNotFound)
+	gw.write(ctx, w, anthropic.TypedErrorBody(anthropic.ErrorTypeNotFound, err))
 }
 
 // defaultClient is the client used when the host process supplies none. It

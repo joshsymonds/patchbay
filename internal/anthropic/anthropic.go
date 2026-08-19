@@ -24,6 +24,16 @@ const ErrorMessagePrefix = "patchbay: "
 // which keeps the caller's contract — always Anthropic-shaped JSON — even then.
 const fallbackErrorBody = `{"type":"error","error":{"type":"api_error","message":"patchbay: internal error"}}`
 
+// Error types from Anthropic's own taxonomy. A failure patchbay originates is
+// still described in the vocabulary a client already knows, so nothing has to
+// learn a bespoke type to handle it: ErrorTypeAPI is the generic gateway
+// failure, and ErrorTypeNotFound is what a request naming something patchbay
+// cannot resolve gets.
+const (
+	ErrorTypeAPI      = "api_error"
+	ErrorTypeNotFound = "not_found_error"
+)
+
 // Header names patchbay handles itself rather than treating as ordinary
 // request metadata: the credentials that pay for an answer, the version and
 // beta flags that shape it, and the type of the answer itself.
@@ -54,10 +64,18 @@ type errorPayload struct {
 // JSON the caller can recognize as patchbay's own. An upstream's own error is
 // never one of these: it is passed through untouched.
 func ErrorBody(err error) []byte {
+	return TypedErrorBody(ErrorTypeAPI, err)
+}
+
+// TypedErrorBody is ErrorBody with the error type named explicitly, for a
+// failure whose honest description is something other than a generic gateway
+// error. errType belongs to Anthropic's taxonomy — patchbay does not invent
+// types, because a client that has never seen one cannot handle it.
+func TypedErrorBody(errType string, err error) []byte {
 	body, marshalErr := json.Marshal(errorEnvelope{
 		Type: "error",
 		Error: errorPayload{
-			Type:    "api_error",
+			Type:    errType,
 			Message: ErrorMessagePrefix + err.Error(),
 		},
 	})

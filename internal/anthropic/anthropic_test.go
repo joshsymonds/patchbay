@@ -18,6 +18,25 @@ func TestErrorBodyIsAnthropicShapedAndMarkedAsPatchbaysOwn(t *testing.T) {
 	}
 }
 
+func TestTypedErrorBodyCarriesTheNamedErrorType(t *testing.T) {
+	t.Parallel()
+
+	got := string(anthropic.TypedErrorBody(anthropic.ErrorTypeNotFound, errors.New(`unknown context "work"`)))
+	want := `{"type":"error","error":{"type":"not_found_error","message":"patchbay: unknown context \"work\""}}`
+
+	if got != want {
+		t.Fatalf("TypedErrorBody() = %s; want %s", got, want)
+	}
+}
+
+func TestErrorTypeNotFoundIsAnthropicsOwnTaxonomy(t *testing.T) {
+	t.Parallel()
+
+	if anthropic.ErrorTypeNotFound != "not_found_error" {
+		t.Fatalf("ErrorTypeNotFound = %q; want %q", anthropic.ErrorTypeNotFound, "not_found_error")
+	}
+}
+
 func TestErrorMessagePrefixMarksTheSender(t *testing.T) {
 	t.Parallel()
 

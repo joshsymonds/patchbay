@@ -41,8 +41,11 @@ func validRecord(t *testing.T) ledger.Record {
 	t.Helper()
 
 	return ledger.Record{
-		Timestamp:     testTimestamp(t, testDay),
-		Host:          "gnomon",
+		Timestamp:       testTimestamp(t, testDay),
+		Host:            "gnomon",
+		Context:         "personal",
+		CredentialClass: ledger.CredentialOAuth,
+
 		Alias:         "bedrock",
 		Upstream:      "https://api.anthropic.com",
 		Model:         "claude-fable-5",
@@ -333,6 +336,40 @@ func TestValidate(t *testing.T) {
 		{name: "empty request model", mutate: func(r *ledger.Record) { r.RequestModel = "" }, wantErr: true},
 		{name: "empty auth mode", mutate: func(r *ledger.Record) { r.AuthMode = "" }, wantErr: true},
 		{name: "unknown auth mode", mutate: func(r *ledger.Record) { r.AuthMode = "passthrough" }, wantErr: true},
+		{
+			name:    "credential class api_key",
+			mutate:  func(r *ledger.Record) { r.CredentialClass = ledger.CredentialAPIKey },
+			wantErr: false,
+		},
+		{
+			name:    "credential class none",
+			mutate:  func(r *ledger.Record) { r.CredentialClass = ledger.CredentialNone },
+			wantErr: false,
+		},
+		{
+			name:    "empty credential class, as a record written before contexts existed",
+			mutate:  func(r *ledger.Record) { r.CredentialClass = "" },
+			wantErr: false,
+		},
+		{
+			name:    "unknown credential class",
+			mutate:  func(r *ledger.Record) { r.CredentialClass = "sigv4" },
+			wantErr: true,
+		},
+		{
+			name:    "a credential class that is a header value",
+			mutate:  func(r *ledger.Record) { r.CredentialClass = "Bearer sk-ant-secret" },
+			wantErr: true,
+		},
+		{
+			name:    "empty context, as a record written before contexts existed",
+			mutate:  func(r *ledger.Record) { r.Context = "" },
+			wantErr: false,
+		},
+		{name: "blank context", mutate: func(r *ledger.Record) { r.Context = "   " }, wantErr: true},
+		{name: "named context", mutate: func(r *ledger.Record) { r.Context = "work" }, wantErr: false},
+		{name: "context with a slash", mutate: func(r *ledger.Record) { r.Context = "work/eu" }, wantErr: true},
+		{name: "uppercase context", mutate: func(r *ledger.Record) { r.Context = "Work" }, wantErr: true},
 		{name: "negative status", mutate: func(r *ledger.Record) { r.Status = -1 }, wantErr: true},
 		{name: "negative input tokens", mutate: func(r *ledger.Record) { r.InputTokens = -1 }, wantErr: true},
 		{name: "negative output tokens", mutate: func(r *ledger.Record) { r.OutputTokens = -1 }, wantErr: true},
@@ -595,14 +632,16 @@ func TestConcurrentAppendLosesNothing(t *testing.T) {
 			defer wg.Done()
 			for seq := range perWriter {
 				rec := ledger.Record{
-					Timestamp:    testTimestamp(t, testDay),
-					Host:         "gnomon",
-					Alias:        fmt.Sprintf("w%d-r%d", writer, seq),
-					Upstream:     "https://api.anthropic.com",
-					Model:        "claude-fable-5",
-					RequestModel: "claude-fable-5",
-					AuthMode:     "inject",
-					Status:       200,
+					Timestamp:       testTimestamp(t, testDay),
+					Host:            "gnomon",
+					Context:         "personal",
+					CredentialClass: ledger.CredentialOAuth,
+					Alias:           fmt.Sprintf("w%d-r%d", writer, seq),
+					Upstream:        "https://api.anthropic.com",
+					Model:           "claude-fable-5",
+					RequestModel:    "claude-fable-5",
+					AuthMode:        "inject",
+					Status:          200,
 				}
 				if err := led.Append(rec); err != nil {
 					errs <- err
@@ -636,6 +675,78 @@ func TestConcurrentAppendLosesNothing(t *testing.T) {
 	}
 }
 
+// TestRecordCarriesContextAndCredentialClass pins the two attribution fields
+// on the wire. credential_class is a classification of the INBOUND credential
+// and never a value read off a header, which is why the vocabulary is closed:
+// anything outside it is refused rather than written.
+func TestRecordCarriesContextAndCredentialClass(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	led := openLedger(t, dir)
+
+	rec := validRecord(t)
+	rec.Context = "work"
+	rec.CredentialClass = ledger.CredentialAPIKey
+
+	if err := led.Append(rec); err != nil {
+		t.Fatalf("Append returned error: %v", err)
+	}
+
+	line, err := os.ReadFile(filepath.Join(dir, testDayFile))
+	if err != nil {
+		t.Fatalf("read ledger file: %v", err)
+	}
+
+	var fields map[string]any
+	if unmarshalErr := json.Unmarshal(line, &fields); unmarshalErr != nil {
+		t.Fatalf("decode ledger line %q: %v", line, unmarshalErr)
+	}
+
+	if fields["context"] != "work" {
+		t.Fatalf("context field = %v; want %q", fields["context"], "work")
+	}
+
+	if fields["credential_class"] != "api_key" {
+		t.Fatalf("credential_class field = %v; want %q", fields["credential_class"], "api_key")
+	}
+
+	records, scanErr := led.Scan(testDay)
+	if scanErr != nil {
+		t.Fatalf("Scan returned error: %v", scanErr)
+	}
+
+	if len(records) != 1 || records[0].Context != "work" || records[0].CredentialClass != ledger.CredentialAPIKey {
+		t.Fatalf("Scan returned %+v; want the record's own context and credential class", records)
+	}
+}
+
+// TestCredentialClassVocabularyIsClosed names the only three classifications a
+// record may carry, so no future caller can smuggle a credential in as one.
+func TestCredentialClassVocabularyIsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{name: "oauth", got: ledger.CredentialOAuth, want: "oauth"},
+		{name: "api key", got: ledger.CredentialAPIKey, want: "api_key"},
+		{name: "none", got: ledger.CredentialNone, want: "none"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if tc.got != tc.want {
+				t.Fatalf("credential class = %q; want %q", tc.got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRecordSchemaCarriesNoAuthHeaders is the type-level guarantee that no
 // credential-bearing header can reach the ledger: the schema has no header
 // field at all, so a fully-populated record cannot serialize one.
@@ -643,8 +754,11 @@ func TestRecordSchemaCarriesNoAuthHeaders(t *testing.T) {
 	t.Parallel()
 
 	rec := ledger.Record{
-		Timestamp:     testTimestamp(t, testDay),
-		Host:          "gnomon",
+		Timestamp:       testTimestamp(t, testDay),
+		Host:            "gnomon",
+		Context:         "work",
+		CredentialClass: ledger.CredentialOAuth,
+
 		Alias:         "bedrock",
 		Upstream:      "https://api.anthropic.com",
 		Model:         "claude-fable-5",
@@ -792,5 +906,44 @@ func appendRaw(t *testing.T, path, text string) {
 	}
 	if err := file.Close(); err != nil {
 		t.Fatalf("close %s after raw append: %v", path, err)
+	}
+}
+
+// TestScanReadsRecordsWrittenBeforeContexts is the compatibility guarantee for
+// the ledger files already on disk across the fleet: they carry neither
+// attribution field, and reading our own history must not report them as
+// corruption.
+func TestScanReadsRecordsWrittenBeforeContexts(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	const legacy = `{"timestamp":"2026-02-03T13:45:12.123456789Z","host":"gnomon","alias":"bedrock",` +
+		`"upstream":"https://api.anthropic.com","model":"claude-fable-5","request_model":"claude-fable-5",` +
+		`"auth_mode":"inject","status":200,"input_tokens":1234,"output_tokens":567,"duration_ms":8910,` +
+		`"upstream_ms":120,"block_shape":["thinking","text"],"drop_signature":false,"stop_reason":"end_turn"}` +
+		"\n"
+
+	if err := os.WriteFile(filepath.Join(dir, testDayFile), []byte(legacy), 0o600); err != nil {
+		t.Fatalf("write legacy ledger file: %v", err)
+	}
+
+	led := openLedger(t, dir)
+
+	records, err := led.Scan(testDay)
+	if err != nil {
+		t.Fatalf("Scan of a pre-contexts ledger file returned error: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("Scan returned %d records; want the one legacy record", len(records))
+	}
+
+	if records[0].Context != "" || records[0].CredentialClass != "" {
+		t.Fatalf("legacy record = %+v; want both attribution fields empty", records[0])
+	}
+
+	if records[0].Model != "claude-fable-5" {
+		t.Fatalf("legacy record model = %q; want the value it was written with", records[0].Model)
 	}
 }

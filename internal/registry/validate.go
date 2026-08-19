@@ -21,10 +21,66 @@ const (
 	localhostHost = "localhost"
 )
 
-// validateRoutes checks every route and fails the whole file on the first
+// validateContexts checks every context and fails the whole file on the first
 // violation. Validation is deliberately all-or-nothing: a registry with one bad
 // route is a registry the operator did not mean to ship, and honoring the rest
-// of it would silently apply a configuration nobody reviewed.
+// of it would silently apply a configuration nobody reviewed. That holds across
+// contexts too — a broken work context invalidates the personal one, because
+// the document is what the operator wrote and reviewed, not each half of it.
+func validateContexts(contexts map[string]Context) error {
+	names := make([]string, 0, len(contexts))
+	for name := range contexts {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	for _, name := range names {
+		if err := validateContextName(name); err != nil {
+			return err
+		}
+
+		if err := validateContext(contexts[name]); err != nil {
+			return fmt.Errorf("context %q: %w", name, err)
+		}
+	}
+
+	return nil
+}
+
+// validateContextName holds a context name to what a URL path segment can carry
+// unambiguously. A request selects a context by name in its own path, so a name
+// needing escaping — or one that could read as a path traversal — is a name the
+// gateway would have to guess about, and it refuses to guess.
+func validateContextName(name string) error {
+	if name == "" {
+		return fmt.Errorf("empty %s key", fieldContexts)
+	}
+
+	for _, char := range name {
+		lower := char >= 'a' && char <= 'z'
+		digit := char >= '0' && char <= '9'
+
+		if !lower && !digit && char != '-' {
+			return fmt.Errorf(
+				"context %q must use only lowercase letters, digits and dashes; found %q", name, char)
+		}
+	}
+
+	return nil
+}
+
+// validateContext applies every route rule to a context's default route and to
+// each of its aliases.
+func validateContext(ctx Context) error {
+	if err := validateRoute(ctx.DefaultRoute); err != nil {
+		return fmt.Errorf("%s: %w", fieldDefaultRoute, err)
+	}
+
+	return validateRoutes(ctx.Routes)
+}
+
+// validateRoutes checks every route in one context, in alias order.
 func validateRoutes(routes map[string]Route) error {
 	aliases := make([]string, 0, len(routes))
 	for alias := range routes {

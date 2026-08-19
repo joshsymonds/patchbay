@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joshsymonds/patchbay/internal/anthropic"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
@@ -15,34 +16,61 @@ import (
 // dropped: a request that named no model is worth recording as exactly that.
 const modelNone = "(none)"
 
+// bearerScheme is the credential scheme a subscription OAuth token arrives
+// under. Matching it is how the inbound credential is classified without ever
+// reading the token itself.
+const bearerScheme = "bearer "
+
 // exchange accumulates everything one request contributes to its ledger record.
 // It belongs to a single request and is never shared.
 type exchange struct {
-	route        registry.Route
-	requestModel string
-	start        time.Time
-	status       int
-	contentType  string
-	upstreamMS   int64
-	durationMS   int64
-	requestBody  string
-	errorBody    string
+	route           registry.Route
+	context         string
+	credentialClass string
+	requestModel    string
+	start           time.Time
+	status          int
+	contentType     string
+	upstreamMS      int64
+	durationMS      int64
+	requestBody     string
+	errorBody       string
 }
 
-// newExchange starts recording a request that arrived at start asking for
-// requestModel and resolved to route.
-func newExchange(route registry.Route, requestModel string, start time.Time) *exchange {
+// newExchange starts recording a request that arrived at start in the named
+// context under credentialClass, asking for requestModel and resolved to route.
+func newExchange(route registry.Route, ctxName, credentialClass, requestModel string, start time.Time) *exchange {
 	return &exchange{
-		route:        route,
-		requestModel: requestModel,
-		start:        start,
-		status:       0,
-		contentType:  "",
-		upstreamMS:   0,
-		durationMS:   0,
-		requestBody:  "",
-		errorBody:    "",
+		route:           route,
+		context:         ctxName,
+		credentialClass: credentialClass,
+		requestModel:    requestModel,
+		start:           start,
+		status:          0,
+		contentType:     "",
+		upstreamMS:      0,
+		durationMS:      0,
+		requestBody:     "",
+		errorBody:       "",
 	}
+}
+
+// credentialClass classifies the credential the client presented, without ever
+// reading its value: an OAuth bearer is what a Claude Code subscription session
+// sends, x-api-key is what a console key sends, and a request with neither pays
+// for nothing itself. Only the classification is ever recorded.
+func credentialClass(header http.Header) string {
+	if authorization := header.Get(anthropic.HeaderAuthorization); authorization != "" {
+		if strings.HasPrefix(strings.ToLower(authorization), bearerScheme) {
+			return ledger.CredentialOAuth
+		}
+	}
+
+	if header.Get(anthropic.HeaderClientKey) != "" {
+		return ledger.CredentialAPIKey
+	}
+
+	return ledger.CredentialNone
 }
 
 // record builds the ledger record for the finished exchange. capt is the
@@ -51,8 +79,11 @@ func newExchange(route registry.Route, requestModel string, start time.Time) *ex
 // either way.
 func (e *exchange) record(host string, capt *capture) ledger.Record {
 	rec := ledger.Record{
-		Timestamp:     e.start,
-		Host:          host,
+		Timestamp:       e.start,
+		Host:            host,
+		Context:         e.context,
+		CredentialClass: e.credentialClass,
+
 		Alias:         e.route.Alias,
 		Upstream:      e.route.BaseURL,
 		Model:         namedModel(e.upstreamModel()),

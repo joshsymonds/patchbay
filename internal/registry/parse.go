@@ -14,6 +14,9 @@ import (
 // that needs fixing. fieldKeyEnvFile deliberately omits "API": a const spelled
 // fieldAPIKeyEnvFile trips gosec's hardcoded-credential heuristic (G101).
 const (
+	fieldContexts          = "contexts"
+	fieldRoutes            = "routes"
+	fieldDefaultRoute      = "default_route"
 	fieldBaseURL           = "base_url"
 	fieldModel             = "model"
 	fieldAuth              = "auth"
@@ -27,17 +30,21 @@ const (
 
 // registryFile is the top level of a registry document.
 type registryFile struct {
-	Routes map[string]json.RawMessage `json:"routes"`
+	Contexts map[string]json.RawMessage `json:"contexts"`
 }
 
-// parseRegistry strictly decodes a registry document into routes keyed by
-// alias. Unknown fields, trailing data and empty alias keys are all rejected:
-// a registry patchbay does not fully understand is not one it will honor.
+// parseRegistry strictly decodes a registry document into contexts keyed by
+// name. Unknown fields, trailing data and empty alias keys are all rejected: a
+// registry patchbay does not fully understand is not one it will honor. That
+// strictness is also what makes a document of some other shape — an older one
+// keyed by "routes", or a newer one this build has never seen — fail whole
+// rather than half-apply.
 //
-// Alias keys are otherwise unconstrained. Directory-style names such as
-// "openrouter/sol" are the convention, but they are matched whole and never
-// parsed, so no character is special and none is disallowed.
-func parseRegistry(data []byte) (map[string]Route, error) {
+// Alias keys are unconstrained. Directory-style names such as "openrouter/sol"
+// are the convention, but they are matched whole and never parsed, so no
+// character is special and none is disallowed. Context names are the opposite:
+// they ride in a URL path, and validateContexts holds them to that.
+func parseRegistry(data []byte) (map[string]Context, error) {
 	var file registryFile
 
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -51,23 +58,79 @@ func parseRegistry(data []byte) (map[string]Route, error) {
 		return nil, errors.New("unexpected trailing data after the registry document")
 	}
 
-	aliases := make([]string, 0, len(file.Routes))
-	for alias := range file.Routes {
-		aliases = append(aliases, alias)
+	names := sortedKeys(file.Contexts)
+	contexts := make(map[string]Context, len(names))
+
+	for _, name := range names {
+		parsed, err := parseContext(name, file.Contexts[name])
+		if err != nil {
+			return nil, fmt.Errorf("context %q: %w", name, err)
+		}
+
+		contexts[name] = parsed
 	}
 
-	sort.Strings(aliases)
+	return contexts, nil
+}
 
-	routes := make(map[string]Route, len(aliases))
+// parseContext decodes one context object: its optional default route and its
+// aliases. Every key is matched explicitly, so an unknown or misspelled field
+// is named in the error rather than ignored.
+func parseContext(name string, raw json.RawMessage) (Context, error) {
+	var fields map[string]json.RawMessage
 
-	for _, alias := range aliases {
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return Context{}, fmt.Errorf("decode context: %w", err)
+	}
+
+	// A context that declares no default route rides the built-in one, which is
+	// exactly what a bare Claude model got before contexts existed.
+	parsed := Context{Name: name, DefaultRoute: DefaultRoute(), Routes: map[string]Route{}}
+
+	for _, field := range sortedKeys(fields) {
+		switch field {
+		case fieldDefaultRoute:
+			// The default route answers for models no alias claims, so it has no
+			// alias of its own to be found under.
+			route, err := parseRoute("", fields[field])
+			if err != nil {
+				return Context{}, fmt.Errorf("%s: %w", fieldDefaultRoute, err)
+			}
+
+			parsed.DefaultRoute = route
+		case fieldRoutes:
+			routes, err := parseRoutes(fields[field])
+			if err != nil {
+				return Context{}, err
+			}
+
+			parsed.Routes = routes
+		default:
+			return Context{}, fmt.Errorf("unknown field %q", field)
+		}
+	}
+
+	return parsed, nil
+}
+
+// parseRoutes decodes a context's routes object into routes keyed by alias.
+func parseRoutes(raw json.RawMessage) (map[string]Route, error) {
+	var entries map[string]json.RawMessage
+
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil, fmt.Errorf("field %q: %w", fieldRoutes, err)
+	}
+
+	routes := make(map[string]Route, len(entries))
+
+	for _, alias := range sortedKeys(entries) {
 		if alias == "" {
 			return nil, errors.New("empty alias key")
 		}
 
-		route, err := parseRoute(alias, file.Routes[alias])
+		route, err := parseRoute(alias, entries[alias])
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("alias %q: %w", alias, err)
 		}
 
 		routes[alias] = route
@@ -76,27 +139,33 @@ func parseRegistry(data []byte) (map[string]Route, error) {
 	return routes, nil
 }
 
+// sortedKeys returns a map's keys in order, so a document with several problems
+// always reports the same one.
+func sortedKeys[Val any](values map[string]Val) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	return keys
+}
+
 // parseRoute decodes one route object. Every key is matched explicitly so an
 // unknown or misspelled field is named in the error rather than ignored.
 func parseRoute(alias string, raw json.RawMessage) (Route, error) {
 	var fields map[string]json.RawMessage
 
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		return Route{}, fmt.Errorf("alias %q: decode route: %w", alias, err)
+		return Route{}, fmt.Errorf("decode route: %w", err)
 	}
-
-	names := make([]string, 0, len(fields))
-	for name := range fields {
-		names = append(names, name)
-	}
-
-	sort.Strings(names)
 
 	route := Route{Alias: alias}
 
-	for _, name := range names {
+	for _, name := range sortedKeys(fields) {
 		if err := assignField(&route, name, fields[name]); err != nil {
-			return Route{}, fmt.Errorf("alias %q: %w", alias, err)
+			return Route{}, err
 		}
 	}
 

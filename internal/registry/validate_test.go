@@ -10,9 +10,10 @@ import (
 const siblingRoute = `"sibling-ok":{"base_url":"https://openrouter.ai/api",` +
 	`"model":"openai/gpt-5.6-luna","auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"}`
 
-// fixture wraps one route under alias next to the always-valid sibling.
+// fixture wraps one route under alias next to the always-valid sibling, in the
+// personal context.
 func fixture(alias, route string) string {
-	return `{"routes":{` + siblingRoute + `,"` + alias + `":` + route + `}}`
+	return personalDoc(siblingRoute + `,"` + alias + `":` + route)
 }
 
 // assertErrMentions fails unless err is non-nil and names every want fragment.
@@ -52,11 +53,11 @@ func assertAccepted(t *testing.T, body, alias string) {
 		t.Fatalf("Err() = %v; want nil for a valid registry", err)
 	}
 
-	if got := reg.Resolve(alias).Alias; got != alias {
+	if got := bare(t, reg, alias).Alias; got != alias {
 		t.Fatalf("Resolve(%q) returned alias %q; want the aliased route", alias, got)
 	}
 
-	if got := reg.Resolve("sibling-ok").Alias; got != "sibling-ok" {
+	if got := bare(t, reg, "sibling-ok").Alias; got != "sibling-ok" {
 		t.Fatalf("Resolve(%q) returned alias %q; want the sibling route", "sibling-ok", got)
 	}
 }
@@ -436,33 +437,91 @@ func TestStrictDecodeRejectsMalformedRegistries(t *testing.T) {
 		},
 		{
 			name:  "unknown top-level field",
-			body:  `{"routes":{},"bogus":1}`,
+			body:  `{"contexts":{},"bogus":1}`,
 			wants: []string{"unknown field", "bogus"},
 		},
 		{
+			name:  "v1 document keyed by routes",
+			body:  `{"routes":{` + siblingRoute + `}}`,
+			wants: []string{"unknown field", "routes"},
+		},
+		{
+			name:  "unknown field inside a context",
+			body:  contextDoc(`"personal":{"routes":{},"bogus":1}`),
+			wants: []string{`context "personal"`, "unknown field", "bogus"},
+		},
+		{
 			name:  "trailing json value",
-			body:  `{"routes":{}} {"routes":{}}`,
+			body:  `{"contexts":{}} {"contexts":{}}`,
 			wants: []string{"trailing"},
 		},
 		{
 			name:  "trailing garbage",
-			body:  `{"routes":{}}xyzzy`,
+			body:  `{"contexts":{}}xyzzy`,
 			wants: []string{"trailing"},
 		},
 		{
 			name:  "empty alias key",
-			body:  `{"routes":{"":{"base_url":"https://api.anthropic.com","auth":"forward"}}}`,
+			body:  personalDoc(`"":{"base_url":"https://api.anthropic.com","auth":"forward"}`),
 			wants: []string{"empty alias"},
 		},
 		{
+			name:  "empty context name",
+			body:  contextDoc(`"":{"routes":{}}`),
+			wants: []string{"empty contexts key"},
+		},
+		{
+			name:  "context name with an uppercase letter",
+			body:  contextDoc(`"Work":{"routes":{}}`),
+			wants: []string{`"Work"`, "lowercase"},
+		},
+		{
+			name:  "context name with a slash",
+			body:  contextDoc(`"work/eu":{"routes":{}}`),
+			wants: []string{`"work/eu"`, "lowercase"},
+		},
+		{
+			name:  "context name with a dot",
+			body:  contextDoc(`"..":{"routes":{}}`),
+			wants: []string{"lowercase"},
+		},
+		{
+			name:  "contexts is not an object",
+			body:  `{"contexts":[]}`,
+			wants: []string{"contexts"},
+		},
+		{
+			name:  "context value is not an object",
+			body:  contextDoc(`"personal":5`),
+			wants: []string{`context "personal"`},
+		},
+		{
 			name:  "routes is not an object",
-			body:  `{"routes":[]}`,
+			body:  contextDoc(`"personal":{"routes":[]}`),
 			wants: []string{"routes"},
 		},
 		{
 			name:  "route value is not an object",
-			body:  `{"routes":{"probe":5}}`,
+			body:  personalDoc(`"probe":5`),
 			wants: []string{`"probe"`},
+		},
+		{
+			name: "invalid default route",
+			body: contextDoc(`"personal":{"default_route":` +
+				`{"base_url":"https://evil.example","auth":"forward"},"routes":{}}`),
+			wants: []string{"default_route", "forward"},
+		},
+		{
+			name: "unknown field inside a default route",
+			body: contextDoc(`"personal":{"default_route":` +
+				`{"base_url":"https://api.anthropic.com","auth":"forward","bogus":1},"routes":{}}`),
+			wants: []string{"default_route", "unknown field", "bogus"},
+		},
+		{
+			name: "invalid route in a second context takes the whole file down",
+			body: contextDoc(`"personal":{"routes":{` + siblingRoute + `}},` +
+				`"work":{"routes":{"probe":{"auth":"nonsense"}}}`),
+			wants: []string{`context "work"`, `"probe"`, "auth"},
 		},
 		{
 			name:  "field with the wrong json type",
@@ -483,7 +542,7 @@ func TestStrictDecodeRejectsMalformedRegistries(t *testing.T) {
 		},
 		{
 			name:  "truncated json",
-			body:  `{"routes":{`,
+			body:  `{"contexts":{`,
 			wants: []string{"registry"},
 		},
 		{

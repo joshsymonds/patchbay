@@ -56,30 +56,49 @@ type upstreamEntry struct {
 	ID string `json:"id"`
 }
 
-// listModels answers GET /v1/models with the aliases this gateway serves,
-// followed by the models the caller's own Anthropic account can see and no
-// alias already claims.
+// listModels answers GET /v1/models for the context the request selected: the
+// aliases that context serves, followed — when the context still answers from
+// Anthropic — by the models the caller's own account can see and no alias
+// already claims.
 //
-// The merge is gateway-local: no ledger record is written, because nothing was
-// proxied. It also never fails. An upstream that is unreachable, refuses the
-// caller's credentials or answers with something that is not a listing costs
-// the upstream half and is logged; the caller still gets the aliases, with 200.
+// A context whose default route rides somewhere else gets a listing patchbay
+// synthesizes whole. Anthropic has nothing to say about a context that never
+// reaches it, so nothing is asked of it: the honest listing is the context's
+// own aliases plus the model its default route rewrites to.
+//
+// Either way the answer is gateway-local: no ledger record is written, because
+// nothing was proxied. It also never fails. An upstream that is unreachable,
+// refuses the caller's credentials or answers with something that is not a
+// listing costs the upstream half and is logged; the caller still gets the
+// aliases, with 200.
 func (gw *gateway) listModels(w http.ResponseWriter, r *http.Request) {
-	aliases := gw.registry.Aliases()
-	if err := gw.registry.Err(); err != nil {
-		gw.warnRegistry(r.Context(), err)
+	res, err := gw.registry.Resolve(registry.SelectionFrom(r.Context()), "")
+	if err != nil {
+		gw.writeUnknownContext(r.Context(), w, err)
+
+		return
 	}
 
-	data := make([]any, 0, len(aliases))
-	ids := make([]string, 0, len(aliases))
-	claimed := make(map[string]bool, len(aliases))
+	if regErr := gw.registry.Err(); regErr != nil {
+		gw.warnRegistry(r.Context(), regErr)
+	}
+
+	if !answersFromAnthropic(res.DefaultRoute) {
+		gw.writeJSON(r.Context(), w, synthesizedList(res))
+
+		return
+	}
+
+	data := make([]any, 0, len(res.Aliases))
+	ids := make([]string, 0, len(res.Aliases))
+	claimed := make(map[string]bool, len(res.Aliases))
 
 	// The alias page is only ever the first page. A request carrying a
 	// pagination cursor is asking the upstream for a later page, so prepending
 	// the aliases again would repeat them on every page and report an alias as
 	// that page's first_id. Skip them and let the upstream's own page stand.
 	if !r.URL.Query().Has("after_id") {
-		for _, route := range aliases {
+		for _, route := range res.Aliases {
 			data = append(data, aliasEntry(route))
 			ids = append(ids, route.Alias)
 			claimed[route.Alias] = true
@@ -101,15 +120,52 @@ func (gw *gateway) listModels(w http.ResponseWriter, r *http.Request) {
 	gw.writeJSON(r.Context(), w, mergedList(data, ids, listing))
 }
 
-// showModel answers GET /v1/models/{id}. An alias patchbay serves is described
-// from the registry; anything else is the upstream's to answer, and its reply —
-// a model, a 404, a rejected key — is relayed exactly as it came back. The
-// upstream's own answer is the honest one, so patchbay never substitutes a
-// guess for it.
+// answersFromAnthropic reports whether a context's default route still reaches
+// Anthropic on the caller's own credentials. A forward route may target no
+// other upstream — validation admits none — so the auth mode is the whole test.
+func answersFromAnthropic(route registry.Route) bool {
+	return route.Auth == registry.AuthForward
+}
+
+// synthesizedList is the whole listing for a context that never reaches
+// Anthropic: its aliases, then the model its default route rewrites to. A
+// default route that rewrites nothing has no model id to advertise and
+// contributes no entry, because the gateway will not invent one.
+func synthesizedList(res registry.Resolution) modelList {
+	data := make([]any, 0, len(res.Aliases)+1)
+	ids := make([]string, 0, len(res.Aliases)+1)
+	claimed := make(map[string]bool, len(res.Aliases))
+
+	for _, route := range res.Aliases {
+		data = append(data, aliasEntry(route))
+		ids = append(ids, route.Alias)
+		claimed[route.Alias] = true
+	}
+
+	if model := res.DefaultRoute.Model; model != "" && !claimed[model] {
+		data = append(data, defaultEntry(res.DefaultRoute))
+		ids = append(ids, model)
+	}
+
+	return mergedList(data, ids, upstreamListing{Data: nil, HasMore: false, LastID: nil})
+}
+
+// showModel answers GET /v1/models/{id} for the context the request selected.
+// An alias that context serves is described from the registry; anything else is
+// the upstream's to answer, and its reply — a model, a 404, a rejected key — is
+// relayed exactly as it came back. The upstream's own answer is the honest one,
+// so patchbay never substitutes a guess for it.
 func (gw *gateway) showModel(w http.ResponseWriter, r *http.Request) {
+	res, err := gw.registry.Resolve(registry.SelectionFrom(r.Context()), "")
+	if err != nil {
+		gw.writeUnknownContext(r.Context(), w, err)
+
+		return
+	}
+
 	id := r.PathValue("id")
 
-	for _, route := range gw.registry.Aliases() {
+	for _, route := range res.Aliases {
 		if route.Alias == id {
 			gw.writeJSON(r.Context(), w, aliasEntry(route))
 
@@ -307,6 +363,20 @@ func aliasEntry(route registry.Route) modelEntry {
 		Type:           "model",
 		ID:             route.Alias,
 		DisplayName:    route.Alias,
+		CreatedAt:      epochCreatedAt,
+		MaxInputTokens: route.MaxInputTokens,
+		MaxTokens:      route.MaxOutputTokens,
+	}
+}
+
+// defaultEntry renders a context's default route as a listing entry. Its id is
+// the model it rewrites to, which is the only name a caller can ask for and
+// actually reach it by.
+func defaultEntry(route registry.Route) modelEntry {
+	return modelEntry{
+		Type:           "model",
+		ID:             route.Model,
+		DisplayName:    route.Model,
 		CreatedAt:      epochCreatedAt,
 		MaxInputTokens: route.MaxInputTokens,
 		MaxTokens:      route.MaxOutputTokens,

@@ -62,6 +62,25 @@ type Route struct {
 	CaptureBodies bool
 }
 
+// Context is one named set of routes: the aliases it serves, and the default
+// route every model no alias in it claims rides. Contexts are how one gateway
+// keeps separate worlds separate — a request selects one by URL path prefix,
+// and nothing it holds is visible from any other.
+type Context struct {
+	// Name is the key the context was found under, and the name a request
+	// selects it by in its path.
+	Name string
+
+	// DefaultRoute governs every model this context's routes do not claim. A
+	// context that declares none gets the built-in default route, which is a
+	// plain forward to Anthropic on the caller's own credentials.
+	DefaultRoute Route
+
+	// Routes are the context's aliases, keyed by the model name that selects
+	// them.
+	Routes map[string]Route
+}
+
 // DefaultRoute returns the built-in route every unrecognized model rides: a
 // plain forward to Anthropic with no rewrite and no capture. It is a fixed
 // value that is never read from the registry file, so a broken registry can

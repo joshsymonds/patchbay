@@ -55,6 +55,7 @@ const (
 type upstreamCall struct {
 	method   string
 	path     string
+	escaped  string
 	rawQuery string
 	host     string
 	header   http.Header
@@ -78,6 +79,7 @@ func newUpstream(t *testing.T, handle http.HandlerFunc) *upstream {
 		stub.calls <- upstreamCall{
 			method:   r.Method,
 			path:     r.URL.Path,
+			escaped:  r.URL.EscapedPath(),
 			rawQuery: r.URL.RawQuery,
 			host:     r.Host,
 			header:   r.Header.Clone(),
@@ -138,13 +140,29 @@ func deadClient(t *testing.T) *http.Client {
 	}}
 }
 
-// newRegistry writes a registry file holding the given route entries and
-// returns a Registry reading it.
+// newRegistry writes a registry file holding the given route entries in the
+// personal context and returns a Registry reading it.
 func newRegistry(t *testing.T, routes string) *registry.Registry {
 	t.Helper()
 
+	return newContextRegistry(t, `"personal":{"routes":{`+routes+`}}`)
+}
+
+// newContextRegistry writes a registry file holding whole context entries and
+// returns a Registry reading it.
+func newContextRegistry(t *testing.T, contexts string) *registry.Registry {
+	t.Helper()
+
+	return newRawRegistry(t, `{"contexts":{`+contexts+`}}`)
+}
+
+// newRawRegistry writes body verbatim as the registry file, for the documents a
+// test needs to be broken.
+func newRawRegistry(t *testing.T, body string) *registry.Registry {
+	t.Helper()
+
 	path := filepath.Join(t.TempDir(), "registry.json")
-	if err := os.WriteFile(path, []byte(`{"routes":{`+routes+`}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write registry: %v", err)
 	}
 
@@ -167,6 +185,7 @@ func (s *sentinel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.calls <- upstreamCall{
 		method:   r.Method,
 		path:     r.URL.Path,
+		escaped:  r.URL.EscapedPath(),
 		rawQuery: r.URL.RawQuery,
 		host:     r.Host,
 		header:   r.Header.Clone(),

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/proxy"
@@ -492,5 +494,332 @@ func TestOversizedResponseDropsCaptureNotStream(t *testing.T) {
 
 	if got.Status != http.StatusOK {
 		t.Errorf("record status = %d, want %d", got.Status, http.StatusOK)
+	}
+}
+
+// workContext is a second context whose default route rides a foreign upstream,
+// so a request in it resolves nothing the personal context holds.
+func workContext(baseURL string) string {
+	return fmt.Sprintf(`"work":{"default_route":{"base_url":%q,"model":"vendor/work-1",`+
+		`"auth":"inject","api_key_env_file":%q},"routes":{}}`, baseURL, keyEnvName)
+}
+
+// TestRecordsTheResolvedContext pins the attribution half of contexts: every
+// record names the context that served it, and a named context resolves its own
+// routes rather than another context's aliases.
+func TestRecordsTheResolvedContext(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	tests := []struct {
+		name        string
+		named       string
+		wantContext string
+		wantAlias   string
+		wantModel   string
+	}{
+		{
+			name:        "a bare path is the personal context",
+			named:       "",
+			wantContext: "personal",
+			wantAlias:   echoAlias,
+			wantModel:   echoAlias,
+		},
+		{
+			name:        "a named context resolves its own default route",
+			named:       "work",
+			wantContext: "work",
+			wantAlias:   "",
+			wantModel:   "vendor/work-1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+			recorder := newRecorder()
+
+			req := messagesRequest(fidelityBody)
+			if tc.named != "" {
+				req = inContext(req, tc.named)
+			}
+
+			rec := serve(t, proxy.Config{
+				Registry: newContextRegistry(t,
+					`"personal":{"routes":{`+identityRoute(stub.url())+`}},`+workContext(stub.url())),
+				Recorder: recorder,
+				Host:     testHost,
+			}, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+			}
+
+			got := recorder.wait(t)
+
+			if got.Context != tc.wantContext {
+				t.Errorf("context = %q, want %q", got.Context, tc.wantContext)
+			}
+
+			if got.Alias != tc.wantAlias {
+				t.Errorf("alias = %q, want %q", got.Alias, tc.wantAlias)
+			}
+
+			if got.Model != tc.wantModel {
+				t.Errorf("model = %q, want %q", got.Model, tc.wantModel)
+			}
+
+			if err := got.Validate(); err != nil {
+				t.Errorf("record does not validate: %v", err)
+			}
+		})
+	}
+}
+
+// TestPipelineFailsClosedOnAnUnknownContext is the pipeline's own half of the
+// fail-closed rule. The HTTP surface refuses an unknown context before the
+// pipeline is reached, so this is the registry-reloaded-underneath race: the
+// request is refused, never served by another context or the default route.
+func TestPipelineFailsClosedOnAnUnknownContext(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+	recorder := newRecorder()
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistry(t, identityRoute(stub.url())),
+		Recorder: recorder,
+		Host:     testHost,
+	}, inContext(messagesRequest(fidelityBody), "vanished"))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+
+	if stub.hits() != 0 {
+		t.Fatalf("upstream received %d requests; want none for an unknown context", stub.hits())
+	}
+
+	if !strings.Contains(rec.Body.String(), `unknown context \"vanished\"`) {
+		t.Fatalf("body = %s; want it to name the context it refused", rec.Body.String())
+	}
+
+	// A refusal is still an event worth auditing, so it leaves a record naming
+	// the context that was refused.
+	got := recorder.wait(t)
+
+	if got.Context != "vanished" || got.Status != http.StatusNotFound {
+		t.Fatalf("record = %+v; want the refusal recorded against the named context", got)
+	}
+
+	if err := got.Validate(); err != nil {
+		t.Fatalf("refusal record does not validate: %v", err)
+	}
+}
+
+// TestRecordsTheInboundCredentialClass classifies the credential the CLIENT
+// presented, which is not the one the route pays with: every case below rides
+// an inject route, whose own credential never appears in the record.
+func TestRecordsTheInboundCredentialClass(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    string
+	}{
+		{
+			name:    "oauth bearer",
+			headers: map[string]string{"Authorization": "Bearer sk-ant-oat01-subscription"},
+			want:    ledger.CredentialOAuth,
+		},
+		{
+			name:    "lowercase bearer scheme",
+			headers: map[string]string{"Authorization": "bearer sk-ant-oat01-subscription"},
+			want:    ledger.CredentialOAuth,
+		},
+		{
+			name:    "api key",
+			headers: map[string]string{"X-Api-Key": "sk-ant-api03-console"},
+			want:    ledger.CredentialAPIKey,
+		},
+		{
+			name: "both, an oauth session that also sent a key",
+			headers: map[string]string{
+				"Authorization": "Bearer sk-ant-oat01-subscription",
+				"X-Api-Key":     "sk-ant-api03-console",
+			},
+			want: ledger.CredentialOAuth,
+		},
+		{
+			name:    "an authorization header that is not a bearer",
+			headers: map[string]string{"Authorization": "Basic dXNlcjpwYXNz"},
+			want:    ledger.CredentialNone,
+		},
+		{
+			name:    "no credential at all",
+			headers: map[string]string{},
+			want:    ledger.CredentialNone,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			writeKeyFile(t, testAPIKey)
+
+			stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+			recorder := newRecorder()
+
+			req := messagesRequest(fidelityBody)
+			for name, value := range tc.headers {
+				req.Header.Set(name, value)
+			}
+
+			rec := serve(t, proxy.Config{
+				Registry: newRegistry(t, identityRoute(stub.url())),
+				Recorder: recorder,
+				Host:     testHost,
+			}, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+			}
+
+			got := recorder.wait(t)
+
+			if got.CredentialClass != tc.want {
+				t.Errorf("credential_class = %q, want %q", got.CredentialClass, tc.want)
+			}
+		})
+	}
+}
+
+// TestRecordNeverCarriesACredentialValue is the safety property behind the
+// classification: a request whose every credential header holds a distinctive
+// secret leaves a record with none of them anywhere in it.
+func TestRecordNeverCarriesACredentialValue(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	const (
+		oauthSecret  = "sk-ant-oat01-do-not-record-me"
+		clientSecret = "sk-ant-api03-do-not-record-me"
+	)
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+	recorder := newRecorder()
+
+	req := messagesRequest(fidelityBody)
+	req.Header.Set("Authorization", "Bearer "+oauthSecret)
+	req.Header.Set("X-Api-Key", clientSecret)
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistry(t, identityRoute(stub.url())),
+		Recorder: recorder,
+		Host:     testHost,
+	}, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	got := recorder.wait(t)
+
+	line, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("encode record: %v", err)
+	}
+
+	for _, secret := range []string{oauthSecret, clientSecret, testAPIKey, testCallerKey} {
+		if strings.Contains(string(line), secret) {
+			t.Fatalf("record line contains the secret %q: %s", secret, line)
+		}
+	}
+
+	if got.CredentialClass != ledger.CredentialOAuth {
+		t.Fatalf("credential_class = %q, want %q", got.CredentialClass, ledger.CredentialOAuth)
+	}
+}
+
+// TestEveryRecordNamesItsContextAndCredentialClass is the write side of the
+// ledger's read-side leniency: Validate accepts a record with neither
+// attribution field so ledger files written before contexts existed can still
+// be read, and this is what keeps a current binary from ever writing one that
+// shape — down every path that produces a record, including the ones where
+// nothing was forwarded at all.
+func TestEveryRecordNamesItsContextAndCredentialClass(t *testing.T) {
+	tests := []struct {
+		name        string
+		request     func(t *testing.T, stub *upstream) *http.Request
+		wantContext string
+	}{
+		{
+			name: "a forwarded turn",
+			request: func(*testing.T, *upstream) *http.Request {
+				return messagesRequest(fidelityBody)
+			},
+			wantContext: "personal",
+		},
+		{
+			name: "a turn in a named context",
+			request: func(*testing.T, *upstream) *http.Request {
+				return inContext(messagesRequest(fidelityBody), "personal")
+			},
+			wantContext: "personal",
+		},
+		{
+			name: "a request whose body could not be read",
+			request: func(*testing.T, *upstream) *http.Request {
+				req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+					iotest.ErrReader(errors.New("the caller went away mid-body")))
+				req.Header.Set(callerKeyHeader, testCallerKey)
+
+				return req
+			},
+			wantContext: "personal",
+		},
+		{
+			name: "a request refused for naming an unknown context",
+			request: func(*testing.T, *upstream) *http.Request {
+				return inContext(messagesRequest(fidelityBody), "vanished")
+			},
+			wantContext: "vanished",
+		},
+		{
+			name: "a request refused at the inject path gate",
+			request: func(*testing.T, *upstream) *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "/v1/organizations/usage_report",
+					strings.NewReader(fidelityBody))
+				req.Header.Set(callerKeyHeader, testCallerKey)
+
+				return req
+			},
+			wantContext: "personal",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			writeKeyFile(t, testAPIKey)
+
+			stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+			recorder := newRecorder()
+
+			serve(t, proxy.Config{
+				Registry: newRegistry(t, identityRoute(stub.url())),
+				Recorder: recorder,
+				Host:     testHost,
+			}, tc.request(t, stub))
+
+			got := recorder.wait(t)
+
+			if got.Context != tc.wantContext {
+				t.Errorf("context = %q, want %q", got.Context, tc.wantContext)
+			}
+
+			if got.CredentialClass == "" {
+				t.Error("credential_class is empty; a current binary must never write a legacy-shaped record")
+			}
+
+			if err := got.Validate(); err != nil {
+				t.Errorf("record does not validate: %v", err)
+			}
+		})
 	}
 }

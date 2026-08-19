@@ -114,8 +114,11 @@ func TestDropSignatureMatchesRecordedShape(t *testing.T) {
 	for _, blockTypes := range shapes {
 		shape := ledger.BlockShape(blockTypes)
 		rec := ledger.Record{
-			Timestamp:     testTimestamp(t, testDay),
-			Host:          "gnomon",
+			Timestamp:       testTimestamp(t, testDay),
+			Host:            "gnomon",
+			Context:         "personal",
+			CredentialClass: ledger.CredentialOAuth,
+
 			Upstream:      "https://api.anthropic.com",
 			Model:         "claude-fable-5",
 			RequestModel:  "claude-fable-5",

@@ -792,3 +792,202 @@ func TestOneModelFindsANamespacedAlias(t *testing.T) {
 		t.Fatalf("entry = %v; want %v", got, want)
 	}
 }
+
+// injectDefaultContext is a context whose default route is paid for with a
+// foreign key. Nothing in it is Anthropic's to describe, so its listing is
+// patchbay's own to synthesize.
+const injectDefaultContext = `"work":{"default_route":{"base_url":"https://openrouter.ai/api",` +
+	`"model":"openai/gpt-5.6-luna","auth":"inject",` +
+	`"api_key_env_file":"OPENROUTER_API_KEY_FILE",` +
+	`"max_input_tokens":262144,"max_output_tokens":65536},"routes":{` + workRoutes + `}}`
+
+// forwardDefaultContext is a context that leaves the default route alone, so
+// its listing still merges the caller's own Anthropic models.
+const forwardDefaultContext = `"work":{"routes":{` + workRoutes + `}}`
+
+func TestModelListUnderAContextMergesWhenItsDefaultIsAnthropic(t *testing.T) {
+	t.Parallel()
+
+	// The context's own aliases, then the models the caller's credentials can
+	// see — the same bargain the bare path has always made, scoped to one
+	// context's aliases.
+	stub := newUpstream(t, jsonHandler(http.StatusOK, upstreamList("claude-opus-5")))
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+forwardDefaultContext),
+		Client:   anthropicClient(t, stub),
+	}, modelsRequest("/ctx/work/v1/models"))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
+	}
+
+	list := decodeList(t, rec.Body.Bytes())
+
+	want := []string{"work-atlas", "claude-opus-5"}
+	if got := ids(t, list); !reflect.DeepEqual(got, want) {
+		t.Fatalf("data ids = %v; want the work context's aliases then upstream: %v", got, want)
+	}
+
+	if stub.hits() != 1 {
+		t.Fatalf("upstream saw %d fetches; want the one merge fetch", stub.hits())
+	}
+
+	if got := stub.call(t); got.path != "/v1/models" {
+		t.Fatalf("upstream fetch path = %q; want the unprefixed %q", got.path, "/v1/models")
+	}
+}
+
+func TestModelListIsSynthesizedForANonAnthropicContext(t *testing.T) {
+	t.Parallel()
+
+	// The caller's Anthropic account has nothing to say about a context that
+	// never reaches Anthropic, so nothing is asked of it: the listing is the
+	// context's aliases plus the model its default route rewrites to.
+	stub := newUpstream(t, jsonHandler(http.StatusOK, upstreamList("claude-opus-5")))
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+injectDefaultContext),
+		Client:   anthropicClient(t, stub),
+	}, modelsRequest("/ctx/work/v1/models"))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
+	}
+
+	if stub.hits() != 0 {
+		t.Fatalf("upstream saw %d fetches; want none for a synthesized listing", stub.hits())
+	}
+
+	list := decodeList(t, rec.Body.Bytes())
+
+	want := []string{"work-atlas", "openai/gpt-5.6-luna"}
+	if got := ids(t, list); !reflect.DeepEqual(got, want) {
+		t.Fatalf("data ids = %v; want %v", got, want)
+	}
+
+	if list.HasMore {
+		t.Fatal("has_more = true; want false — a synthesized listing is the whole listing")
+	}
+
+	if list.FirstID == nil || *list.FirstID != "work-atlas" {
+		t.Fatalf("first_id = %v; want work-atlas", list.FirstID)
+	}
+
+	if list.LastID == nil || *list.LastID != "openai/gpt-5.6-luna" {
+		t.Fatalf("last_id = %v; want openai/gpt-5.6-luna", list.LastID)
+	}
+
+	entries := []struct {
+		name  string
+		index int
+		want  map[string]any
+	}{
+		{
+			name:  "an alias of the context",
+			index: 0,
+			want: map[string]any{
+				"type":             "model",
+				"id":               "work-atlas",
+				"display_name":     "work-atlas",
+				"created_at":       epochCreatedAt,
+				"max_input_tokens": float64(131072),
+			},
+		},
+		{
+			name:  "the default route's own model",
+			index: 1,
+			want: map[string]any{
+				"type":             "model",
+				"id":               "openai/gpt-5.6-luna",
+				"display_name":     "openai/gpt-5.6-luna",
+				"created_at":       epochCreatedAt,
+				"max_input_tokens": float64(262144),
+				"max_tokens":       float64(65536),
+			},
+		},
+	}
+
+	for _, tc := range entries {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := entryFields(t, list.Data[tc.index]); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("entry %d = %v; want exactly %v", tc.index, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBareModelListIsThePersonalContext(t *testing.T) {
+	t.Parallel()
+
+	// An unprefixed listing is the personal context's listing, and never sees
+	// another context's aliases.
+	stub := newUpstream(t, jsonHandler(http.StatusOK, upstreamList("claude-opus-5")))
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+injectDefaultContext),
+		Client:   anthropicClient(t, stub),
+	}, modelsRequest("/v1/models"))
+
+	list := decodeList(t, rec.Body.Bytes())
+
+	want := []string{"luna-fast", "claude-opus-5"}
+	if got := ids(t, list); !reflect.DeepEqual(got, want) {
+		t.Fatalf("data ids = %v; want the personal context merged with upstream: %v", got, want)
+	}
+}
+
+func TestShowModelDescribesTheContextsOwnAlias(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		target   string
+		wantID   string
+		wantHits int
+	}{
+		{name: "an alias of the named context", target: "/ctx/work/v1/models/work-atlas", wantID: "work-atlas"},
+		{name: "an alias of the personal context", target: "/v1/models/luna-fast", wantID: "luna-fast"},
+		{
+			name:     "a personal alias is not the work context's to describe",
+			target:   "/ctx/work/v1/models/luna-fast",
+			wantID:   "claude-opus-5",
+			wantHits: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// The upstream answers for anything the context does not claim, which
+			// is how a name it has never heard of is relayed rather than guessed at.
+			stub := newUpstream(t, jsonHandler(http.StatusOK,
+				`{"type":"model","id":"claude-opus-5","display_name":"Claude Opus 5",`+
+					`"created_at":"2026-01-01T00:00:00Z"}`))
+
+			rec := serve(t, server.Config{
+				Proxy:    newSentinel(),
+				Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+forwardDefaultContext),
+				Client:   anthropicClient(t, stub),
+			}, modelsRequest(tc.target))
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
+			}
+
+			if got := entryFields(t, rec.Body.Bytes())["id"]; got != tc.wantID {
+				t.Fatalf("model id = %v; want %q", got, tc.wantID)
+			}
+
+			if stub.hits() != tc.wantHits {
+				t.Fatalf("upstream saw %d fetches; want %d", stub.hits(), tc.wantHits)
+			}
+		})
+	}
+}

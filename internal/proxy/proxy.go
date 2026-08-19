@@ -141,9 +141,15 @@ func New(cfg Config) *Proxy {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
+	// The context a request selected is decided by the HTTP surface, which
+	// strips the prefix that named it before the pipeline sees the path. A
+	// request that named none selects the personal context.
+	sel := registry.SelectionFrom(r.Context())
+	class := credentialClass(r.Header)
+
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, requestLimitBytes))
 	if err != nil {
-		p.abort(r.Context(), w, newExchange(registry.DefaultRoute(), "", start), &gatewayError{
+		p.abort(r.Context(), w, newExchange(registry.DefaultRoute(), sel.Name, class, "", start), &gatewayError{
 			status: readFailureStatus(err),
 			err:    fmt.Errorf("read request body: %w", err),
 		})
@@ -152,8 +158,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestModel := extractModel(body)
-	route := p.registry.Resolve(requestModel)
-	exch := newExchange(route, requestModel, start)
+
+	res, resErr := p.registry.Resolve(sel, requestModel)
+	if resErr != nil {
+		// The surface already refused every context it could not resolve, so
+		// reaching here means the registry changed underneath this request. It
+		// fails closed all the same: a named context is never served by another.
+		// The record carries the built-in route the way every other refusal
+		// does — nothing was sent anywhere, and a record the ledger would drop
+		// for want of an upstream is a refusal nobody can audit.
+		p.abort(r.Context(), w, newExchange(registry.DefaultRoute(), res.Context, class, requestModel, start),
+			&gatewayError{status: http.StatusNotFound, err: resErr})
+
+		return
+	}
+
+	route := res.Route
+	exch := newExchange(route, res.Context, class, requestModel, start)
 
 	upstreamBody, bodyErr := forwardBody(body, route)
 	if bodyErr != nil {

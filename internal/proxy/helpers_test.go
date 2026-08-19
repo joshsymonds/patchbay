@@ -188,17 +188,32 @@ func boundaries(body string, splits []int) []int {
 	return append(offsets, len(body))
 }
 
-// newRegistry writes a registry file holding the given route entries and
-// returns a Registry reading it.
+// newRegistry writes a registry file holding the given route entries in the
+// personal context and returns a Registry reading it.
 func newRegistry(t *testing.T, routes string) *registry.Registry {
 	t.Helper()
 
+	return newContextRegistry(t, `"personal":{"routes":{`+routes+`}}`)
+}
+
+// newContextRegistry writes a registry file holding whole context entries.
+func newContextRegistry(t *testing.T, contexts string) *registry.Registry {
+	t.Helper()
+
 	path := filepath.Join(t.TempDir(), "registry.json")
-	if err := os.WriteFile(path, []byte(`{"routes":{`+routes+`}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"contexts":{`+contexts+`}}`), 0o600); err != nil {
 		t.Fatalf("write registry: %v", err)
 	}
 
 	return registry.New(path)
+}
+
+// inContext returns req routed as if the HTTP surface had stripped a
+// /ctx/<name> prefix off its path, which is the only way a named context ever
+// reaches the pipeline.
+func inContext(req *http.Request, name string) *http.Request {
+	return req.WithContext(registry.WithSelection(req.Context(),
+		registry.Selection{Name: name, Explicit: true}))
 }
 
 // identityRoute is an inject route with no rewrite of any kind: the identity
@@ -416,4 +431,16 @@ func hash(data []byte) string {
 	sum := sha256.Sum256(data)
 
 	return fmt.Sprintf("%x", sum)
+}
+
+// resolveRoute resolves model the way a bare, unprefixed request does.
+func resolveRoute(t *testing.T, reg *registry.Registry, model string) registry.Route {
+	t.Helper()
+
+	res, err := reg.Resolve(registry.Selection{}, model)
+	if err != nil {
+		t.Fatalf("Resolve(%q) = %v; want no error", model, err)
+	}
+
+	return res.Route
 }

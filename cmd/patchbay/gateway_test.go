@@ -22,10 +22,13 @@ const (
 	// aliasName is the one foreign alias the end-to-end registry defines.
 	aliasName = "luna-fast"
 
-	// lunaRegistry is a registry file with that alias in it.
-	lunaRegistry = `{"routes":{"` + aliasName + `":{"base_url":"https://openrouter.ai/api",` +
+	// lunaRegistry is a registry file with that alias in the personal context,
+	// alongside a work context that keeps the built-in Anthropic default route.
+	lunaRegistry = `{"contexts":{"personal":{"routes":{"` + aliasName +
+		`":{"base_url":"https://openrouter.ai/api",` +
 		`"model":"openai/gpt-5.6-luna","auth":"inject",` +
-		`"api_key_env_file":"PATCHBAY_TEST_KEY_FILE"}}}`
+		`"api_key_env_file":"PATCHBAY_TEST_KEY_FILE"}}},` +
+		`"work":{"routes":{}}}}`
 
 	// upstreamModels is the listing the stub Anthropic answers with.
 	upstreamModels = `{"data":[{"type":"model","id":"claude-opus-5",` +
@@ -321,6 +324,32 @@ func TestGatewayServesEndToEnd(t *testing.T) {
 		t.Fatal("the upstream never saw the proxied request")
 	}
 
+	// The same request under a context prefix reaches the same upstream with the
+	// prefix stripped, and is recorded against the context that served it.
+	status, body = postBody(t, gw.base+"/ctx/work/v1/messages", `{"max_tokens":16}`)
+	if status != http.StatusOK {
+		t.Fatalf("POST /ctx/work/v1/messages status = %d; want %d", status, http.StatusOK)
+	}
+
+	if body != upstreamMessage {
+		t.Fatalf("context-prefixed body = %q; want the upstream's bytes %q", body, upstreamMessage)
+	}
+
+	// The upstream saw the path with the context prefix already gone.
+	if !stub.sawPath("POST /v1/messages") {
+		t.Fatal("the upstream never saw the context-prefixed request at its stripped path")
+	}
+
+	// A context nothing defines is refused outright, never served by another.
+	status, body = postBody(t, gw.base+"/ctx/bogus/v1/messages", `{"model":"claude-opus-5","max_tokens":16}`)
+	if status != http.StatusNotFound {
+		t.Fatalf("POST /ctx/bogus/v1/messages status = %d; want %d", status, http.StatusNotFound)
+	}
+
+	if !strings.Contains(body, "not_found_error") || !strings.Contains(body, "unknown context") {
+		t.Fatalf("unknown-context body = %q; want an Anthropic not_found_error naming the context", body)
+	}
+
 	gw.stop()
 
 	assertRecorded(t, ledgerDir)
@@ -345,12 +374,26 @@ func assertRecorded(t *testing.T, ledgerDir string) {
 		t.Fatalf("scan ledger: %v", scanErr)
 	}
 
-	if len(records) != 1 {
-		t.Fatalf("ledger holds %d records; want the one proxied request", len(records))
+	// Two records, not three: the unknown-context refusal is answered by the
+	// HTTP surface before the pipeline, and the surface writes no records.
+	if len(records) != 2 {
+		t.Fatalf("ledger holds %d records; want the two proxied requests", len(records))
 	}
 
 	if records[0].Status != http.StatusOK || records[0].Upstream != "https://api.anthropic.com" {
 		t.Fatalf("record = %+v; want the default route's answer", records[0])
+	}
+
+	wantContexts := []string{"personal", "work"}
+	for i, want := range wantContexts {
+		if records[i].Context != want {
+			t.Fatalf("record %d context = %q; want %q", i, records[i].Context, want)
+		}
+
+		if records[i].CredentialClass != ledger.CredentialNone {
+			t.Fatalf("record %d credential_class = %q; want %q",
+				i, records[i].CredentialClass, ledger.CredentialNone)
+		}
 	}
 }
 
@@ -383,7 +426,7 @@ func TestGatewayReportsABrokenRegistryAtStartup(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "routes.json")
 
-	writeFile(t, registryPath, `{"routes":{"broken":{"auth":"nonsense"}}}`)
+	writeFile(t, registryPath, `{"contexts":{"personal":{"routes":{"broken":{"auth":"nonsense"}}}}}`)
 
 	stub := newStubUpstream(t)
 	gw := startGateway(t, registryPath, filepath.Join(dir, "ledger"), stub.client(t))
