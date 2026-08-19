@@ -109,7 +109,9 @@ environment variable, whose *value* is the path of a file holding the key.
 `base_url` is a root, not an endpoint: the inbound path is appended to it
 verbatim, so `https://openrouter.ai/api` + `/v1/messages` is what gets
 requested. Check your provider's own Anthropic-compatible endpoint and set the
-root that produces it.
+root that produces it. The upstream does not have to be a cloud — a model
+server on your own network works too; see
+[Local models](docs/configuration.md#local-models).
 
 Put the provider key in the file that variable will name, then check the
 registry and run the gateway:

@@ -88,7 +88,7 @@ context.
 | Field | Type | Meaning |
 |---|---|---|
 | `auth` | string | Required. `forward`, `inject` or `sigv4`. See [auth-modes.md](auth-modes.md). |
-| `base_url` | string | The upstream API root. The inbound path and raw query are appended verbatim, so `https://openrouter.ai/api` + `/v1/messages` is what gets requested. Absolute `https` URL, or `http` only for `127.0.0.1`/`localhost`. |
+| `base_url` | string | The upstream API root. The inbound path and raw query are appended verbatim, so `https://openrouter.ai/api` + `/v1/messages` is what gets requested. Absolute `https` URL, or `http` for `127.0.0.1`/`localhost` — any other `http` host requires `insecure`. |
 | `model` | string | Rewrite target: the model actually asked of the upstream. Omitted or empty means identity — forward whatever model the caller named. |
 | `api_key_env_file` | string | The NAME of an environment variable whose VALUE is the path of a file holding the API key. Never the key, and never a path. |
 | `aws_profile` | string | `sigv4` only. The AWS profile whose credentials sign the request. |
@@ -97,6 +97,7 @@ context.
 | `extra_body` | object | Merged over the request document's top-level keys at forward time; the route's values win over the caller's. Must be a JSON object. |
 | `max_input_tokens` | integer ≥ 0 | Advertised as `max_input_tokens` on `/v1/models`. **Not enforced** — it is a published ceiling, not an applied one. Zero omits it. |
 | `max_output_tokens` | integer ≥ 0 | Clamps the request's `max_tokens` down to this when the caller asks for more. Also advertised as `max_tokens` in the listing. Zero means no cap. |
+| `insecure` | bool | Permits a plain-`http` `base_url` on a non-loopback host, accepting that the route travels an unencrypted link — see [Local models](#local-models). Setting it anywhere it changes nothing (an `https` route, a loopback `http` route, a `sigv4` route) fails validation, so a set flag always means what it says. On an `inject` route the injected API key travels in cleartext over that link. |
 | `strip_cache_control` | bool | Removes every `cache_control` key from the request document, at any depth. Prompt caching is Anthropic's; a foreign upstream may reject the marker. |
 | `capture_bodies` | bool | Records the forwarded request body and the response body in this route's ledger records. Off by default. |
 
@@ -112,8 +113,9 @@ violation fails the whole document.
 
 | | `forward` | `inject` | `sigv4` |
 |---|---|---|---|
-| `base_url` | **required**, and must be exactly `https://api.anthropic.com` | required, `https` (or `http` for loopback) | **forbidden** — the endpoint is derived from `aws_region` |
+| `base_url` | **required**, and must be exactly `https://api.anthropic.com` | required, `https` (or `http` for loopback, or with `insecure`) | **forbidden** — the endpoint is derived from `aws_region` |
 | `api_key_env_file` | **forbidden** | **required**, non-empty | **forbidden** |
+| `insecure` | forbidden — the Anthropic endpoint is `https` | allowed only on a non-loopback `http` `base_url` | **forbidden** — the Bedrock endpoint is always `https` |
 | `aws_profile` | forbidden | forbidden | **required**, non-blank, and only lowercase letters, digits, dashes, dots and underscores |
 | `aws_region` | forbidden | forbidden | **required**, non-blank, and only lowercase letters, digits and dashes |
 | `model_map_env_file` | forbidden | forbidden | **required**, non-blank |
@@ -128,6 +130,33 @@ caller's own subscription token upstream, so Anthropic is the only place it may
 go. The `claude` restriction on `inject` is the misbilling rule: a route paid
 for with a foreign key must not present itself as a Claude model, in the ledger
 or anywhere else.
+
+### Local models
+
+A route can point at a model server on your own network — anything that speaks
+the Anthropic Messages API, such as a recent Ollama. Nothing about the upstream
+has to be a cloud:
+
+```json
+"local/qwen": {
+  "base_url": "http://gpubox.lan:11434",
+  "auth": "inject",
+  "api_key_env_file": "PATCHBAY_LOCAL_KEY_FILE",
+  "insecure": true
+}
+```
+
+patchbay appends `/v1/messages` verbatim, so the server must answer the
+Messages API at that path — an OpenAI-style `/v1/chat/completions` server needs
+a translating proxy in front.
+
+`insecure` is the operator accepting, in the reviewed document itself, that
+this route travels an unencrypted link: anyone on that network path can read
+the conversation and the injected API key. For a keyless local server the key
+file can hold a placeholder, but the flag is still the honest description of
+the link. The alternatives that avoid it are an SSH tunnel (`base_url` becomes
+loopback) or TLS in front of the model server — for example `tailscale serve`,
+which yields a valid `https` endpoint with no certificate management.
 
 Validate before you deploy:
 
