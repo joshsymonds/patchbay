@@ -143,31 +143,58 @@ func (r *Registry) Resolve(sel Selection, model string) (Resolution, error) {
 	}
 
 	found, ok := r.contexts[name]
-	if !ok {
-		if sel.Explicit {
-			return Resolution{Context: name}, fmt.Errorf("%w %q", ErrUnknownContext, name)
-		}
-
-		return Resolution{
-			Context:      name,
-			Route:        DefaultRoute(),
-			DefaultRoute: DefaultRoute(),
-			Aliases:      []Route{},
-		}, nil
+	if !ok && sel.Explicit {
+		return Resolution{Context: name}, fmt.Errorf("%w %q", ErrUnknownContext, name)
 	}
 
-	res := Resolution{
-		Context:      name,
-		Route:        found.DefaultRoute,
-		DefaultRoute: found.DefaultRoute,
-		Aliases:      aliasList(found.Routes),
-	}
+	res := resolution(name, found, ok)
 
 	if route, matched := found.Routes[model]; matched {
 		res.Route = route
 	}
 
 	return res, nil
+}
+
+// Contexts returns every context the registry currently serves, sorted by name,
+// alongside whether the registry file behind them actually loaded. It is the
+// same lookup Resolve answers one request with, so nothing built from it can
+// describe a context differently from how the pipeline forwards to it.
+//
+// The personal context is always present. A missing or broken file costs every
+// other context, and reports loaded false, but a bare request still rides the
+// built-in default route — so a document that left personal out would describe a
+// gateway that does not exist.
+func (r *Registry) Contexts() ([]Resolution, bool) {
+	r.refresh()
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	names := make([]string, 0, len(r.contexts)+1)
+	for name := range r.contexts {
+		names = append(names, name)
+	}
+
+	if _, ok := r.contexts[PersonalContext]; !ok {
+		names = append(names, PersonalContext)
+	}
+
+	slices.Sort(names)
+
+	all := make([]Resolution, 0, len(names))
+	for _, name := range names {
+		found, ok := r.contexts[name]
+		all = append(all, resolution(name, found, ok))
+	}
+
+	return all, r.err == nil && r.stamp.exists
+}
+
+// Path is the registry file this Registry reads. It is fixed for the lifetime of
+// the Registry — only the file's contents are ever reloaded.
+func (r *Registry) Path() string {
+	return r.path
 }
 
 // Err returns the parse or validation error from the current registry file, or
@@ -208,6 +235,27 @@ func (r *Registry) refresh() {
 	r.contexts, r.err = loadContexts(r.path)
 	r.stamp = current
 	r.loaded = true
+}
+
+// resolution describes one context: the one the file defines under name, or —
+// when found is not a loaded context — the built-in world a bare request rides
+// when the registry has nothing to add.
+func resolution(name string, found Context, ok bool) Resolution {
+	if !ok {
+		return Resolution{
+			Context:      name,
+			Route:        DefaultRoute(),
+			DefaultRoute: DefaultRoute(),
+			Aliases:      []Route{},
+		}
+	}
+
+	return Resolution{
+		Context:      name,
+		Route:        found.DefaultRoute,
+		DefaultRoute: found.DefaultRoute,
+		Aliases:      aliasList(found.Routes),
+	}
 }
 
 // aliasList returns a context's routes sorted by alias, as the caller's own

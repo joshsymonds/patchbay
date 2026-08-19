@@ -100,7 +100,7 @@ func (p *Proxy) bedrockRequest(r *http.Request, route registry.Route, body []byt
 	}
 
 	copyHeader(req.Header, r.Header,
-		droppedHeaders(r.Header, headerHost, headerContentLength, headerAcceptEncoding, callerKeyHeader))
+		droppedHeaders(r.Header, headerHost, headerContentLength, headerAcceptEncoding, CallerKeyHeader))
 	req.Header.Del(anthropic.HeaderAuthorization)
 	req.Header.Del(anthropic.HeaderClientKey)
 	req.Header.Set(headerAcceptEncoding, encodingIdentity)

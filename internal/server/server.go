@@ -71,6 +71,11 @@ type Config struct {
 	// gets slog.Default(), which is what the host process configured for
 	// everything else.
 	Logger *slog.Logger
+
+	// Listen is the address the host process bound, reported by the
+	// introspection endpoint so a caller reading the document knows which
+	// gateway answered it.
+	Listen string
 }
 
 // gateway answers the endpoints patchbay serves from its own knowledge. It is
@@ -80,15 +85,24 @@ type gateway struct {
 	registry *registry.Registry
 	client   *http.Client
 	logger   *slog.Logger
+	listen   string
 }
 
-// Handler returns the gateway's HTTP surface: the two model endpoints answered
-// locally, and cfg.Proxy for every other path and every other method.
+// Handler returns the gateway's HTTP surface: the introspection endpoint, the
+// two model endpoints answered locally, and cfg.Proxy for every other path and
+// every other method.
+//
+// Introspection is dispatched ahead of everything else, context selection
+// included. Its prefix is patchbay's own — no Anthropic endpoint lives under it
+// and no context can put one there — so a path under it that nothing serves is
+// answered here rather than becoming a request to Anthropic that the caller
+// never made.
 func Handler(cfg Config) http.Handler {
 	gw := &gateway{
 		registry: cfg.Registry,
 		client:   cfg.Client,
 		logger:   cfg.Logger,
+		listen:   cfg.Listen,
 	}
 
 	if gw.client == nil {
@@ -104,7 +118,26 @@ func Handler(cfg Config) http.Handler {
 	mux.HandleFunc(modelPattern, gw.showModel)
 	mux.Handle(rootPattern, cfg.Proxy)
 
-	return gw.selectContext(mux)
+	return gw.selectIntrospection(gw.selectContext(mux))
+}
+
+// selectIntrospection answers everything under patchbay's own path prefix and
+// passes everything else to next.
+//
+// It is a plain prefix test rather than another ServeMux on purpose: a mux
+// cleans the request path and redirects a caller whose path was not already
+// clean, and every path that is not introspection is one the proxy has to
+// forward exactly as it arrived.
+func (gw *gateway) selectIntrospection(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == introspectRoot || strings.HasPrefix(r.URL.Path, introspectPrefix) {
+			gw.introspect(w, r)
+
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // selectContext resolves the context a request named in its path, strips the

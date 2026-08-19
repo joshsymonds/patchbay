@@ -189,14 +189,22 @@ func startGateway(t *testing.T, registryPath, ledgerDir string, client *http.Cli
 
 	logs := newLogRecorder()
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
+	done := make(chan int, 1)
 
+	// Through the subcommand a shell would type, so the whole path from the
+	// command line to the bound socket is what these tests exercise.
 	go func() {
-		done <- run(ctx, envMap(map[string]string{
-			"PATCHBAY_LISTEN":     "127.0.0.1:0",
-			"PATCHBAY_REGISTRY":   registryPath,
-			"PATCHBAY_LEDGER_DIR": ledgerDir,
-		}), slog.New(logs), client)
+		done <- dispatch(ctx, []string{"serve"}, cli{
+			stdout: io.Discard,
+			stderr: io.Discard,
+			lookupEnv: envMap(map[string]string{
+				"PATCHBAY_LISTEN":     "127.0.0.1:0",
+				"PATCHBAY_REGISTRY":   registryPath,
+				"PATCHBAY_LEDGER_DIR": ledgerDir,
+			}),
+			client: client,
+			logger: slog.New(logs),
+		})
 	}()
 
 	addr := logs.waitFor(t, "patchbay listening")["listen"]
@@ -207,8 +215,8 @@ func startGateway(t *testing.T, registryPath, ledgerDir string, client *http.Cli
 		stop: func() {
 			cancel()
 
-			if err := <-done; err != nil {
-				t.Errorf("run() error = %v; want a clean shutdown", err)
+			if code := <-done; code != exitOK {
+				t.Errorf("serve exited %d; want %d on a clean shutdown", code, exitOK)
 			}
 		},
 	}

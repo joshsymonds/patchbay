@@ -464,7 +464,7 @@ func (p *Proxy) upstreamRequest(r *http.Request, route registry.Route, body []by
 	}
 
 	copyHeader(req.Header, r.Header,
-		droppedHeaders(r.Header, headerHost, headerContentLength, headerAcceptEncoding, callerKeyHeader))
+		droppedHeaders(r.Header, headerHost, headerContentLength, headerAcceptEncoding, CallerKeyHeader))
 	req.Header.Set(headerAcceptEncoding, encodingIdentity)
 
 	if authErr := applyAuth(req, route); authErr != nil {

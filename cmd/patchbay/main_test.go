@@ -169,18 +169,18 @@ func TestRunFailsOnAnUnusableListenAddress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := run(t.Context(), envMap(map[string]string{
+			err := serveGateway(t.Context(), envMap(map[string]string{
 				"PATCHBAY_LISTEN":     tc.listen,
 				"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
 				"PATCHBAY_LEDGER_DIR": filepath.Join(dir, "ledger"),
 			}), quietLogger(), nil)
 
 			if err == nil {
-				t.Fatalf("run() with listen %q error = nil; want a bind failure", tc.listen)
+				t.Fatalf("serveGateway() with listen %q error = nil; want a bind failure", tc.listen)
 			}
 
 			if !strings.Contains(err.Error(), tc.listen) {
-				t.Fatalf("run() error = %v; want it to name the address it could not bind", err)
+				t.Fatalf("serveGateway() error = %v; want it to name the address it could not bind", err)
 			}
 		})
 	}
@@ -189,8 +189,8 @@ func TestRunFailsOnAnUnusableListenAddress(t *testing.T) {
 func TestRunFailsOnAnUnresolvableConfig(t *testing.T) {
 	t.Parallel()
 
-	if err := run(t.Context(), envMap(map[string]string{}), quietLogger(), nil); err == nil {
-		t.Fatal("run() error = nil; want the misconfiguration reported")
+	if err := serveGateway(t.Context(), envMap(map[string]string{}), quietLogger(), nil); err == nil {
+		t.Fatal("serveGateway() error = nil; want the misconfiguration reported")
 	}
 }
 
@@ -204,7 +204,7 @@ func TestRunServesUntilTheContextIsCancelled(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- run(ctx, envMap(map[string]string{
+		done <- serveGateway(ctx, envMap(map[string]string{
 			"PATCHBAY_LISTEN":     "127.0.0.1:0",
 			"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
 			"PATCHBAY_LEDGER_DIR": ledgerDir,
@@ -214,7 +214,7 @@ func TestRunServesUntilTheContextIsCancelled(t *testing.T) {
 	cancel()
 
 	if err := <-done; err != nil {
-		t.Fatalf("run() error = %v; want a clean shutdown", err)
+		t.Fatalf("serveGateway() error = %v; want a clean shutdown", err)
 	}
 
 	info, err := os.Stat(ledgerDir)
@@ -243,7 +243,7 @@ func TestRunSurvivesAnUnusableLedger(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- run(ctx, envMap(map[string]string{
+		done <- serveGateway(ctx, envMap(map[string]string{
 			"PATCHBAY_LISTEN":     "127.0.0.1:0",
 			"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
 			"PATCHBAY_LEDGER_DIR": filepath.Join(blocker, "ledger"),
@@ -253,6 +253,6 @@ func TestRunSurvivesAnUnusableLedger(t *testing.T) {
 	cancel()
 
 	if err := <-done; err != nil {
-		t.Fatalf("run() error = %v; want the gateway to serve without a ledger", err)
+		t.Fatalf("serveGateway() error = %v; want the gateway to serve without a ledger", err)
 	}
 }
