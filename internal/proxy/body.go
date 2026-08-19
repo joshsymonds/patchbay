@@ -146,6 +146,14 @@ func stripCacheControl(document map[string]json.RawMessage) {
 // Anything that is not an object or an array is returned as the exact bytes it
 // arrived as, so numbers keep the precision they were written with.
 func strippedValue(value json.RawMessage) json.RawMessage {
+	// Nothing to strip if the field name appears nowhere in this subtree, so the
+	// whole unmarshal/remarshal of a container that cannot hold it is skipped. A
+	// false-positive substring match — the name inside some string value — simply
+	// falls through to the existing, correct path below and is handled there.
+	if !bytes.Contains(value, []byte(fieldCacheControl)) {
+		return value
+	}
+
 	switch firstToken(value) {
 	case '{':
 		var object map[string]json.RawMessage

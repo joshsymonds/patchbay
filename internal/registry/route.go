@@ -1,6 +1,10 @@
 package registry
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/joshsymonds/patchbay/internal/anthropic"
+)
 
 // AuthMode selects how patchbay authenticates a proxied request upstream.
 type AuthMode string
@@ -15,10 +19,6 @@ const (
 	// the file named by the route's APIKeyEnvFile.
 	AuthInject AuthMode = "inject"
 )
-
-// anthropicBaseURL is the only upstream a forward route may target, and the
-// base URL of the built-in default route.
-const anthropicBaseURL = "https://api.anthropic.com"
 
 // Route is the resolved destination for one request: where it goes, what model
 // it asks for, and how it pays.
@@ -47,7 +47,9 @@ type Route struct {
 	// same alias shares these bytes.
 	ExtraBody json.RawMessage
 
-	// MaxInputTokens caps the request's input tokens. Zero means no cap.
+	// MaxInputTokens is advertised as max_input_tokens on /v1/models. The proxy
+	// does not enforce it: it is a ceiling published for clients to read, not one
+	// the pipeline applies to a request. Zero omits it from the listing.
 	MaxInputTokens int
 
 	// MaxOutputTokens caps the request's output tokens. Zero means no cap.
@@ -66,7 +68,7 @@ type Route struct {
 // never break it.
 func DefaultRoute() Route {
 	return Route{
-		BaseURL: anthropicBaseURL,
+		BaseURL: anthropic.BaseURL,
 		Auth:    AuthForward,
 	}
 }

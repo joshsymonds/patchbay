@@ -12,12 +12,6 @@ import (
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
-// anthropicBaseURL is the only upstream the model endpoints ask. Both the
-// listing merge and the single-model relay speak to Anthropic on the caller's
-// behalf with the caller's own credentials; a foreign upstream is the
-// pipeline's business, never this one's.
-const anthropicBaseURL = "https://api.anthropic.com"
-
 // modelList is the /v1/models envelope. Entries are held as encoded values so
 // an upstream model is relayed as the bytes it arrived as, with every field it
 // carried, while an alias entry is a struct of this package's own.
@@ -80,10 +74,16 @@ func (gw *gateway) listModels(w http.ResponseWriter, r *http.Request) {
 	ids := make([]string, 0, len(aliases))
 	claimed := make(map[string]bool, len(aliases))
 
-	for _, route := range aliases {
-		data = append(data, aliasEntry(route))
-		ids = append(ids, route.Alias)
-		claimed[route.Alias] = true
+	// The alias page is only ever the first page. A request carrying a
+	// pagination cursor is asking the upstream for a later page, so prepending
+	// the aliases again would repeat them on every page and report an alias as
+	// that page's first_id. Skip them and let the upstream's own page stand.
+	if !r.URL.Query().Has("after_id") {
+		for _, route := range aliases {
+			data = append(data, aliasEntry(route))
+			ids = append(ids, route.Alias)
+			claimed[route.Alias] = true
+		}
 	}
 
 	listing := gw.upstreamModels(r)
@@ -137,9 +137,19 @@ func (gw *gateway) relayModel(w http.ResponseWriter, r *http.Request) {
 
 	defer resp.Body.Close()
 
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, responseLimitBytes))
+	// Read one byte past the ceiling so an upstream that overruns it is caught
+	// rather than silently truncated and relayed as a fragment under the
+	// upstream's own 2xx.
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, responseLimitBytes+1))
 	if readErr != nil {
 		gw.writeError(ctx, w, http.StatusBadGateway, fmt.Errorf("read upstream response: %w", readErr))
+
+		return
+	}
+
+	if len(body) > responseLimitBytes {
+		gw.writeError(ctx, w, http.StatusBadGateway,
+			fmt.Errorf("upstream response exceeds the %d-byte ceiling", responseLimitBytes))
 
 		return
 	}
@@ -167,9 +177,18 @@ func (gw *gateway) upstreamModels(r *http.Request) upstreamListing {
 
 	defer resp.Body.Close()
 
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, responseLimitBytes))
+	// Read one byte past the ceiling to tell a listing that fits from one that
+	// overruns it, so an oversized body is refused explicitly rather than left to
+	// fail an opaque json.Unmarshal.
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, responseLimitBytes+1))
 	if readErr != nil {
 		gw.warn(ctx, fmt.Errorf("read upstream response: %w", readErr))
+
+		return upstreamListing{}
+	}
+
+	if len(body) > responseLimitBytes {
+		gw.warn(ctx, fmt.Errorf("upstream response exceeds the %d-byte ceiling", responseLimitBytes))
 
 		return upstreamListing{}
 	}
@@ -190,16 +209,16 @@ func (gw *gateway) upstreamModels(r *http.Request) upstreamListing {
 	return listing
 }
 
-// fetch asks Anthropic for path on the caller's behalf. The base URL is a
-// constant of this package and the caller's path is set on the parsed URL
-// afterwards, so no caller-supplied string is ever parsed as a whole URL and
-// the destination host cannot move.
+// fetch asks Anthropic for path on the caller's behalf. The base URL is a fixed
+// constant and the caller's path is set on the parsed URL afterwards, so no
+// caller-supplied string is ever parsed as a whole URL and the destination host
+// cannot move.
 func (gw *gateway) fetch(
 	ctx context.Context,
 	path, escapedPath, rawQuery string,
 	header http.Header,
 ) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, anthropicBaseURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, anthropic.BaseURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build upstream request: %w", err)
 	}

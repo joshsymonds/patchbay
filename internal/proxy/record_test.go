@@ -147,6 +147,87 @@ func TestRecordsNonStreamingTurn(t *testing.T) {
 	}
 }
 
+// partialSSETurn is the prefix of a streamed turn that never finishes: a
+// message_start and two adjacent thinking blocks, but no message_delta and no
+// message_stop. Summarized as if it were whole it would report a block shape, a
+// drop signature and input tokens — none of which a cut-short turn actually
+// completed.
+func partialSSETurn() string {
+	lines := []string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_01","model":"local/echo",` +
+			`"usage":{"input_tokens":1234,"output_tokens":1}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}`,
+		"",
+	}
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// TestRecordsTruncatedStreamAsIncomplete covers a stream cut short mid-flight:
+// the upstream writes a partial turn and then drops the connection, so the
+// proxy's read fails short of the turn's own message_stop. The record must
+// reflect an incomplete turn — no block shape, no drop signature, no summarized
+// tokens or stop reason — rather than reporting the partial prefix as a
+// completed turn.
+func TestRecordsTruncatedStreamAsIncomplete(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	partial := partialSSETurn()
+	stub := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", sseType)
+		// Promise more than is delivered, so returning here leaves the response
+		// body short of its Content-Length and the proxy's read ends with an
+		// unexpected EOF rather than a clean one.
+		w.Header().Set("Content-Length", fmt.Sprint(len(partial)+1024))
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, partial)
+	})
+	recorder := newRecorder()
+	sink := newLogSink()
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistry(t, identityRoute(stub.url())),
+		Recorder: recorder,
+		Logger:   slog.New(sink),
+		Host:     testHost,
+	}, messagesRequest(fidelityBody))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	sink.waitFor(t, "upstream stream ended early")
+
+	got := recorder.wait(t)
+
+	if len(got.BlockShape) != 0 {
+		t.Errorf("block_shape = %v, want empty for a truncated turn", got.BlockShape)
+	}
+
+	if got.DropSignature {
+		t.Error("drop_signature = true, want false — a truncated prefix is not a summarized turn")
+	}
+
+	if got.InputTokens != 0 || got.OutputTokens != 0 {
+		t.Errorf("tokens = %d/%d, want 0/0 — a truncated turn is not summarized",
+			got.InputTokens, got.OutputTokens)
+	}
+
+	if got.StopReason != "" {
+		t.Errorf("stop_reason = %q, want empty — the turn never reached its stop", got.StopReason)
+	}
+
+	if err := got.Validate(); err != nil {
+		t.Errorf("record does not validate: %v", err)
+	}
+}
+
 // TestRecordsUpstreamError keeps the upstream's own error text in the record,
 // with no block shape to report.
 func TestRecordsUpstreamError(t *testing.T) {

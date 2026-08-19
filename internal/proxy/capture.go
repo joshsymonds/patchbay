@@ -15,6 +15,13 @@ const captureLimitBytes = 64 << 20
 type capture struct {
 	buf     []byte
 	dropped bool
+
+	// truncated marks a capture whose stream was cut short mid-flight — a client
+	// write failure or a non-EOF upstream read error — so the record is not
+	// summarized as a completed turn. It is distinct from dropped, which is the
+	// deliberate size-ceiling case: the two have different causes and are logged
+	// apart.
+	truncated bool
 }
 
 // write copies one streamed chunk, or drops the capture if that would exceed
@@ -35,9 +42,11 @@ func (c *capture) write(chunk []byte) {
 }
 
 // bytes returns what was captured, or nothing at all if the capture was
-// dropped.
+// dropped at the ceiling or truncated mid-stream. A truncated prefix is a
+// partial turn, and summarizing it would record a completed turn that never
+// finished, so it yields nothing just as a dropped capture does.
 func (c *capture) bytes() []byte {
-	if c == nil || c.dropped {
+	if c == nil || c.dropped || c.truncated {
 		return nil
 	}
 

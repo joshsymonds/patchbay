@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	"github.com/joshsymonds/patchbay/internal/anthropic"
 )
 
 // claudeMarker is the substring an inject route may never carry. A foreign key
@@ -60,16 +62,36 @@ func validateRoute(route Route) error {
 		return err
 	}
 
+	if err := validateTokenCeilings(route); err != nil {
+		return err
+	}
+
 	return validateExtraBody(route.ExtraBody)
+}
+
+// validateTokenCeilings rejects a negative token ceiling. A negative
+// max_output_tokens would silently disable the proxy's clamp, and a negative
+// max_input_tokens would be advertised on /v1/models as a nonsense ceiling; a
+// ceiling is either a positive limit or absent (zero), never below zero.
+func validateTokenCeilings(route Route) error {
+	if route.MaxInputTokens < 0 {
+		return fmt.Errorf("%s must not be negative, got %d", fieldMaxInputTokens, route.MaxInputTokens)
+	}
+
+	if route.MaxOutputTokens < 0 {
+		return fmt.Errorf("%s must not be negative, got %d", fieldMaxOutputTokens, route.MaxOutputTokens)
+	}
+
+	return nil
 }
 
 // validateForward enforces the exfiltration rule: a forward route sends the
 // caller's own credentials, so it may only ever reach Anthropic, and it has no
 // business naming a key file.
 func validateForward(route Route) error {
-	if route.BaseURL != anthropicBaseURL {
+	if route.BaseURL != anthropic.BaseURL {
 		return fmt.Errorf("%s routes must use %s %q, got %q",
-			AuthForward, fieldBaseURL, anthropicBaseURL, route.BaseURL)
+			AuthForward, fieldBaseURL, anthropic.BaseURL, route.BaseURL)
 	}
 
 	if route.APIKeyEnvFile != "" {

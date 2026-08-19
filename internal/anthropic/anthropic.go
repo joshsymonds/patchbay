@@ -9,6 +9,12 @@ package anthropic
 
 import "encoding/json"
 
+// BaseURL is the Anthropic API root every part of patchbay speaks to: the only
+// upstream a forward route may target, the base of the built-in default route,
+// and the single host the model endpoints ask. One declaration keeps the
+// registry's validation and the server's fetch from drifting apart.
+const BaseURL = "https://api.anthropic.com"
+
 // ErrorMessagePrefix marks a failure as patchbay's own rather than the
 // upstream's. Claude Code matches upstream error text to decide whether to
 // retry, so an error patchbay invented must never read like one Anthropic sent.

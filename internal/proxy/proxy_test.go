@@ -575,6 +575,51 @@ func TestConcurrentRequestsAreIndependent(t *testing.T) {
 	group.Wait()
 }
 
+// TestInjectRouteRelaysOnlyMessagesEndpoints proves an inject route, which pays
+// with a foreign key, refuses any path but the Messages endpoints: a stray
+// GET /v1/key on it is a patchbay 404 that never spends the key, while
+// /v1/messages on the same route still forwards.
+func TestInjectRouteRelaysOnlyMessagesEndpoints(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
+
+	// A non-Messages path on the inject route is refused before the key is spent.
+	blocked := httptest.NewRequest(http.MethodGet, "/v1/key", strings.NewReader(`{"model":"local/echo"}`))
+	blocked.Header.Set("Content-Type", jsonType)
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistry(t, identityRoute(stub.url())),
+		Host:     testHost,
+	}, blocked)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d for a non-Messages path on an inject route (body %q)",
+			rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+
+	assertGatewayError(t, rec.Body.Bytes())
+
+	if stub.hits() != 0 {
+		t.Errorf("upstream received %d requests, want 0 — the inject key must not be spent", stub.hits())
+	}
+
+	// The Messages endpoint on the same route still forwards.
+	rec = serve(t, proxy.Config{
+		Registry: newRegistry(t, identityRoute(stub.url())),
+		Host:     testHost,
+	}, messagesRequest(`{"model":"local/echo"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d — /v1/messages still forwards on an inject route (body %q)",
+			rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	if stub.hits() != 1 {
+		t.Errorf("upstream received %d requests, want 1 for the forwarded Messages call", stub.hits())
+	}
+}
+
 // failingReader is a request body that fails on first read.
 type failingReader struct{}
 

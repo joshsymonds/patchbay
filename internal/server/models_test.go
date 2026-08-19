@@ -423,6 +423,99 @@ func TestModelListRelaysUpstreamPagination(t *testing.T) {
 	}
 }
 
+func TestModelListSkipsAliasesWhenPaginating(t *testing.T) {
+	t.Parallel()
+
+	// A request carrying a pagination cursor is asking the upstream for a later
+	// page. Prepending the aliases again would repeat them on every page and
+	// report an alias as that page's first_id, so the aliases are skipped and the
+	// upstream's own page stands alone.
+	const listing = `{"data":[{"type":"model","id":"m3"},{"type":"model","id":"m4"}],` +
+		`"has_more":false,"first_id":"m3","last_id":"m4"}`
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, listing))
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newRegistry(t, lunaRoute+","+barePinRoute),
+		Client:   anthropicClient(t, stub),
+	}, modelsRequest("/v1/models?after_id=m2"))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
+	}
+
+	list := decodeList(t, rec.Body.Bytes())
+
+	want := []string{"m3", "m4"}
+	if got := ids(t, list); !reflect.DeepEqual(got, want) {
+		t.Fatalf("data ids = %v; want only the upstream page with no aliases: %v", got, want)
+	}
+
+	for _, id := range ids(t, list) {
+		if id == "luna-fast" || id == "anthropic/pinned" {
+			t.Fatalf("alias %q leaked onto a paginated page", id)
+		}
+	}
+
+	if list.FirstID == nil || *list.FirstID != "m3" {
+		t.Fatalf("first_id = %v; want the upstream's own first entry m3, not an alias", list.FirstID)
+	}
+}
+
+func TestOneModelRefusesAnOversizedUpstreamResponse(t *testing.T) {
+	t.Parallel()
+
+	// Past the response ceiling the relay must not serve a truncated fragment
+	// under the upstream's own 2xx. It answers a patchbay 502 instead.
+	stub := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", jsonType)
+		w.WriteHeader(http.StatusOK)
+
+		chunk := strings.Repeat("x", 1<<20)
+		for range 5 { // 5 MiB, past the 4 MiB ceiling.
+			io.WriteString(w, chunk)
+		}
+	})
+
+	sink := newLogSink()
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newRegistry(t, lunaRoute),
+		Client:   anthropicClient(t, stub),
+		Logger:   slog.New(sink),
+	}, modelsRequest("/v1/models/claude-opus-5"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d; want %d — an oversized upstream response is not a 200", rec.Code, http.StatusBadGateway)
+	}
+
+	if got := rec.Header().Get("Content-Type"); got != jsonType {
+		t.Fatalf("Content-Type = %q; want %q", got, jsonType)
+	}
+
+	var envelope struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode error body %q: %v", rec.Body.Bytes(), err)
+	}
+
+	if envelope.Type != "error" || envelope.Error.Type != "api_error" {
+		t.Fatalf("error envelope = %+v; want an Anthropic-format api_error", envelope)
+	}
+
+	if !strings.Contains(envelope.Error.Message, "patchbay: ") {
+		t.Fatalf("message = %q; want it marked as patchbay's own", envelope.Error.Message)
+	}
+}
+
 func TestOneModelAnswersAnAliasFromTheRegistry(t *testing.T) {
 	t.Parallel()
 

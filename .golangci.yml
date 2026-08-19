@@ -469,6 +469,10 @@ linters:
       locale: US
 
   exclusions:
+    # Off because several scoped rules below (the gosec G704/G705 suppressions,
+    # the per-path cmd and test relaxations) legitimately match nothing on a run
+    # that lints only a subset of packages; warn-unused would then flag those
+    # rules as dead and fail the gate on a partial run.
     warn-unused: false
 
     # Never lint anything under .claude/. Git worktrees (both `just new-worktree`
@@ -482,6 +486,9 @@ linters:
       - '\.claude/'
 
     rules:
+      # Each package names its single central type after the package itself —
+      # registry.Registry, ledger.Ledger, proxy.Proxy — which is the idiomatic
+      # name for a package's one subject, so revive's stutter warning is noise.
       - text: "will be used as .* by other packages, and that stutters"
         linters:
           - revive
@@ -528,16 +535,15 @@ linters:
           - varnamelen
           - musttag
 
-      # CLI entrypoints: fmt.Print, file I/O from args, arg count checks, cleanup close are idiomatic
-      # contextcheck: shutdown defer handlers correctly use context.Background() since parent ctx is canceled
+      # cmd/patchbay shuts down on a canceled context: its defer handlers
+      # (drainRecords, serve's shutdown) deliberately derive a fresh
+      # context.Background() with its own deadline, because the request/signal
+      # context that triggered the shutdown is already done and cannot bound the
+      # cleanup. contextcheck flags that as a non-inherited context; here it is
+      # correct by design.
       - path: 'cmd/.*\.go'
         linters:
           - contextcheck
-          - errcheck
-          - forbidigo
-          - gosec
-          - govet
-          - mnd
 
       # Allow local replacements in go.mod
       - path: go\.mod

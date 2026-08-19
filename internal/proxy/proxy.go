@@ -31,6 +31,17 @@ import (
 // written and flushed as it arrives, so this bounds latency, not throughput.
 const streamChunkBytes = 32768
 
+// The Messages endpoints an inject route is allowed to relay. An inject route
+// pays with a foreign key, so it exists to answer Messages turns and nothing
+// else; a stray path on it must not spend that key on some other endpoint.
+// messagesCountPath deliberately avoids the word "token" in its name: a const
+// spelled that way trips gosec's hardcoded-credential heuristic (G101), the
+// same way internal/anthropic's HeaderClientKey does.
+const (
+	messagesPath      = "/v1/messages"
+	messagesCountPath = "/v1/messages/count_tokens"
+)
+
 // requestLimitBytes caps the request body the gateway will hold in memory: 64
 // MiB, the same ceiling the response tee uses and for the same reason. The
 // whole body has to be buffered to be rewritten and replayed upstream, so an
@@ -47,6 +58,19 @@ const (
 	idleTimeout      = 90 * time.Second
 	continueTimeout  = 1 * time.Second
 	maxIdleConns     = 100
+
+	// maxIdleConnsPerHost keeps a pool of warm connections to the one upstream a
+	// gateway talks to. Go's default of 2 would force most concurrent turns to
+	// dial fresh even with 100 idle slots free, since nearly every request lands
+	// on the same host.
+	maxIdleConnsPerHost = 32
+
+	// responseHeaderTimeout bounds only the wait for the upstream's response
+	// headers, so a connected-but-silent upstream cannot hang a request forever.
+	// It does not conflict with the deliberate absence of an overall client
+	// timeout above: once the headers arrive the body streams with no deadline,
+	// so a long thinking turn is never truncated by it.
+	responseHeaderTimeout = 10 * time.Minute
 )
 
 // Recorder persists one ledger record per proxied request. *ledger.Ledger
@@ -119,7 +143,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, requestLimitBytes))
 	if err != nil {
-		p.abort(w, newExchange(registry.DefaultRoute(), "", start), &gatewayError{
+		p.abort(r.Context(), w, newExchange(registry.DefaultRoute(), "", start), &gatewayError{
 			status: readFailureStatus(err),
 			err:    fmt.Errorf("read request body: %w", err),
 		})
@@ -133,7 +157,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	upstreamBody, bodyErr := forwardBody(body, route)
 	if bodyErr != nil {
-		p.abort(w, exch, bodyErr)
+		p.abort(r.Context(), w, exch, bodyErr)
 
 		return
 	}
@@ -144,7 +168,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	req, reqErr := upstreamRequest(r, route, upstreamBody)
 	if reqErr != nil {
-		p.abort(w, exch, reqErr)
+		p.abort(r.Context(), w, exch, reqErr)
 
 		return
 	}
@@ -153,7 +177,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, doErr := p.client.Do(req)
 	if doErr != nil {
-		p.abort(w, exch, &gatewayError{
+		p.abort(r.Context(), w, exch, &gatewayError{
 			status: http.StatusBadGateway,
 			err:    fmt.Errorf("upstream request failed: %w", doErr),
 		})
@@ -167,7 +191,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	exch.status = resp.StatusCode
 	exch.contentType = resp.Header.Get(anthropic.HeaderContentType)
 
-	capt := p.stream(w, resp)
+	capt := p.stream(r.Context(), w, resp)
 	exch.durationMS = millis(time.Since(start))
 
 	p.record(exch, capt)
@@ -199,21 +223,21 @@ func (p *Proxy) Drain(ctx context.Context) {
 // abort answers a failure patchbay originated, in Anthropic's error shape, and
 // records it. An upstream's own error never comes through here: it is streamed
 // back untouched.
-func (p *Proxy) abort(w http.ResponseWriter, exch *exchange, gwErr *gatewayError) {
+func (p *Proxy) abort(ctx context.Context, w http.ResponseWriter, exch *exchange, gwErr *gatewayError) {
 	body := anthropic.ErrorBody(gwErr)
 
 	w.Header().Set(anthropic.HeaderContentType, "application/json")
 	w.WriteHeader(gwErr.status)
 
 	if _, writeErr := w.Write(body); writeErr != nil {
-		p.logger.Warn("client went away before the error reached it", slog.Any("error", writeErr))
+		p.logger.WarnContext(ctx, "client went away before the error reached it", slog.Any("error", writeErr))
 	}
 
 	exch.status = gwErr.status
 	exch.errorBody = string(body)
 	exch.durationMS = millis(time.Since(exch.start))
 
-	p.logger.Warn("gateway error", slog.String("alias", exch.route.Alias),
+	p.logger.WarnContext(ctx, "gateway error", slog.String("alias", exch.route.Alias),
 		slog.Int("status", gwErr.status), slog.Any("error", gwErr.err))
 
 	p.record(exch, nil)
@@ -222,12 +246,12 @@ func (p *Proxy) abort(w http.ResponseWriter, exch *exchange, gwErr *gatewayError
 // stream copies the upstream response to the client, flushing every chunk so a
 // streamed turn reaches the caller as it is produced, and tees a copy into the
 // capture the record is built from.
-func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) *capture {
+func (p *Proxy) stream(ctx context.Context, w http.ResponseWriter, resp *http.Response) *capture {
 	copyHeader(w.Header(), resp.Header, droppedHeaders(resp.Header))
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, canFlush := w.(http.Flusher)
-	capt := &capture{buf: nil, dropped: false}
+	capt := &capture{buf: nil, dropped: false, truncated: false}
 	buf := make([]byte, streamChunkBytes)
 
 	for {
@@ -237,7 +261,10 @@ func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) *capture {
 			capt.write(chunk)
 
 			if _, writeErr := w.Write(chunk); writeErr != nil {
-				p.logger.Warn("client went away mid-stream", slog.Any("error", writeErr))
+				// The client is gone, so the turn stops here: the capture holds a
+				// prefix, not a finished turn, and must not be summarized as one.
+				capt.truncated = true
+				p.logger.WarnContext(ctx, "client went away mid-stream", slog.Any("error", writeErr))
 
 				return capt
 			}
@@ -249,7 +276,11 @@ func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) *capture {
 
 		if readErr != nil {
 			if !errors.Is(readErr, io.EOF) {
-				p.logger.Warn("upstream stream ended early", slog.Any("error", readErr))
+				// A non-EOF read ends the turn short of its own message_stop, so the
+				// captured prefix is a partial turn, recorded as truncated rather
+				// than summarized as complete.
+				capt.truncated = true
+				p.logger.WarnContext(ctx, "upstream stream ended early", slog.Any("error", readErr))
 			}
 
 			return capt
@@ -288,6 +319,14 @@ func (p *Proxy) appendRecord(exch *exchange, capt *capture) {
 // carrying the inbound path and raw query verbatim, the caller's headers minus
 // the ones a proxy owns, and the route's credentials.
 func upstreamRequest(r *http.Request, route registry.Route, body []byte) (*http.Request, *gatewayError) {
+	if route.Auth == registry.AuthInject && !isInjectMessagesPath(r.URL.Path) {
+		return nil, &gatewayError{
+			status: http.StatusNotFound,
+			err: fmt.Errorf("route %q injects a key and only relays the Messages endpoints, not %s",
+				route.Alias, r.URL.Path),
+		}
+	}
+
 	target := strings.TrimSuffix(route.BaseURL, "/") + r.URL.EscapedPath()
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
@@ -309,6 +348,12 @@ func upstreamRequest(r *http.Request, route registry.Route, body []byte) (*http.
 	}
 
 	return req, nil
+}
+
+// isInjectMessagesPath reports whether path is one of the Messages endpoints an
+// inject route may relay.
+func isInjectMessagesPath(path string) bool {
+	return path == messagesPath || path == messagesCountPath
 }
 
 // readFailureStatus reports the status a failed body read deserves. A caller
@@ -340,9 +385,11 @@ func defaultClient() *http.Client {
 			DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: dialKeepAlive}).DialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          maxIdleConns,
+			MaxIdleConnsPerHost:   maxIdleConnsPerHost,
 			IdleConnTimeout:       idleTimeout,
 			TLSHandshakeTimeout:   handshakeTimeout,
 			ExpectContinueTimeout: continueTimeout,
+			ResponseHeaderTimeout: responseHeaderTimeout,
 		},
 		CheckRedirect: relayRedirect,
 		Jar:           nil,

@@ -380,6 +380,42 @@ func TestValidateExtraBody(t *testing.T) {
 	})
 }
 
+// Rule 7: a token ceiling is a positive limit or absent (zero). A negative
+// value would silently disable the output clamp and advertise a nonsense
+// max_input_tokens, so it is rejected.
+func TestValidateTokenCeilingsAreNotNegative(t *testing.T) {
+	t.Parallel()
+
+	runValidationCases(t, []validationCase{
+		{
+			name:  "negative max_input_tokens rejected",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","max_input_tokens":-1}`,
+			wants: []string{`"probe"`, "max_input_tokens"},
+		},
+		{
+			name:  "negative max_output_tokens rejected",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","max_output_tokens":-100}`,
+			wants: []string{`"probe"`, "max_output_tokens"},
+		},
+		{
+			name:  "zero ceilings accepted",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","max_input_tokens":0,"max_output_tokens":0}`,
+		},
+		{
+			name:  "positive ceilings accepted",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","max_input_tokens":262144,"max_output_tokens":65536}`,
+		},
+	})
+}
+
 func TestStrictDecodeRejectsMalformedRegistries(t *testing.T) {
 	t.Parallel()
 
