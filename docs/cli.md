@@ -106,12 +106,14 @@ openrouter/kimi-k2  inject  https://openrouter.ai/api  moonshotai/kimi-k2  26214
 $ patchbay routes --ctx work
 ALIAS             AUTH     UPSTREAM                                         MODEL            MAX_INPUT_TOKENS  CREDENTIAL_SOURCE
 anthropic-direct  forward  https://api.anthropic.com                        -                -                 caller
-bedrock/opus      sigv4    https://bedrock-runtime.us-west-2.amazonaws.com  claude-opus-4-5  200000            PATCHBAY_BEDROCK_MODEL_MAP_FILE
+bedrock/opus      sigv4    https://bedrock-runtime.us-west-2.amazonaws.com  claude-opus-4-5  200000            aws profile work-bedrock
 ```
 
-`CREDENTIAL_SOURCE` is always an environment **variable name** — or `caller`,
-meaning the route spends whatever the caller itself presented. It is never a
-path and never a secret. `-` marks a field the route does not set.
+`CREDENTIAL_SOURCE` is the environment **variable name** an inject route reads
+its key from, `aws profile <name>` for a route that signs with credentials the
+gateway exports for that profile, or `caller`, meaning the route spends whatever
+the caller itself presented. It is never a path and never a secret. `-` marks a
+field the route does not set.
 
 A context the gateway does not serve is named as such, along with what it does
 serve:
@@ -187,7 +189,7 @@ base_url: http://127.0.0.1:4100/ctx/work
 context: work
 ALIAS             AUTH     UPSTREAM                                         MODEL            MAX_INPUT_TOKENS  CREDENTIAL_SOURCE
 anthropic-direct  forward  https://api.anthropic.com                        -                -                 caller
-bedrock/opus      sigv4    https://bedrock-runtime.us-west-2.amazonaws.com  claude-opus-4-5  200000            PATCHBAY_BEDROCK_MODEL_MAP_FILE
+bedrock/opus      sigv4    https://bedrock-runtime.us-west-2.amazonaws.com  claude-opus-4-5  200000            aws profile work-bedrock
 ```
 
 Every file in the chain is listed even when it has nothing to say, because the
@@ -282,6 +284,8 @@ $ curl -s -H "X-Patchbay-Key: $(cat ~/.config/patchbay/caller.key)" \
       "default_route": {
         "auth": "sigv4",
         "upstream": "https://bedrock-runtime.us-west-2.amazonaws.com",
+        "aws_profile": "work-bedrock",
+        "aws_region": "us-west-2",
         "model_map_env_file": "PATCHBAY_BEDROCK_MODEL_MAP_FILE",
         "model_map_file": "/home/you/.config/patchbay/bedrock-models.json"
       },
@@ -295,6 +299,8 @@ $ curl -s -H "X-Patchbay-Key: $(cat ~/.config/patchbay/caller.key)" \
           "upstream": "https://bedrock-runtime.us-west-2.amazonaws.com",
           "model": "claude-opus-4-5",
           "max_input_tokens": 200000,
+          "aws_profile": "work-bedrock",
+          "aws_region": "us-west-2",
           "model_map_env_file": "PATCHBAY_BEDROCK_MODEL_MAP_FILE",
           "model_map_file": "/home/you/.config/patchbay/bedrock-models.json"
         }

@@ -92,11 +92,12 @@ type gateway struct {
 // two model endpoints answered locally, and cfg.Proxy for every other path and
 // every other method.
 //
-// Introspection is dispatched ahead of everything else, context selection
-// included. Its prefix is patchbay's own — no Anthropic endpoint lives under it
-// and no context can put one there — so a path under it that nothing serves is
-// answered here rather than becoming a request to Anthropic that the caller
-// never made.
+// Context selection runs first and introspection immediately after it, on the
+// path the selection left behind. The introspection prefix is patchbay's own —
+// no Anthropic endpoint lives under it and no context can put one there — so a
+// path under it that nothing serves is answered here rather than becoming a
+// request to Anthropic that the caller never made, and that holds for
+// "/ctx/work/_patchbay/anything" exactly as it does for the bare form.
 func Handler(cfg Config) http.Handler {
 	gw := &gateway{
 		registry: cfg.Registry,
@@ -118,7 +119,7 @@ func Handler(cfg Config) http.Handler {
 	mux.HandleFunc(modelPattern, gw.showModel)
 	mux.Handle(rootPattern, cfg.Proxy)
 
-	return gw.selectIntrospection(gw.selectContext(mux))
+	return gw.selectContext(gw.selectIntrospection(mux))
 }
 
 // selectIntrospection answers everything under patchbay's own path prefix and
@@ -141,35 +142,56 @@ func (gw *gateway) selectIntrospection(next http.Handler) http.Handler {
 }
 
 // selectContext resolves the context a request named in its path, strips the
-// prefix that named it, and hands the rest to next with the selection attached.
+// prefix that named it, and hands the rest to next with the selection and the
+// resolution it produced attached.
 //
-// A request that named no context is passed through untouched: it selects the
-// personal context implicitly, and keeps working with no registry at all. A
-// request that DID name one is refused unless the current registry can produce
-// it — an unknown name, a broken file, a missing file. Falling through to
-// another context, or to the built-in default route, would answer a question
-// nobody asked, and the whole point of a context is that it is a boundary.
+// This is the one place a request is resolved. Everything downstream — the
+// model endpoints, the whole proxy pipeline — reads the resolution off the
+// request rather than asking the registry again, so a registry file replaced
+// mid-request cannot serve the first half of a request from one document and
+// the second half from the next.
+//
+// A request that named no context still resolves, implicitly, to the personal
+// context, and keeps working with no registry at all. A request that DID name
+// one is refused unless the current registry can produce it — an unknown name, a
+// broken file, a missing file. Falling through to another context, or to the
+// built-in default route, would answer a question nobody asked, and the whole
+// point of a context is that it is a boundary.
 func (gw *gateway) selectContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sel, stripped := splitContext(r.URL)
 
-		if !sel.Explicit {
-			next.ServeHTTP(w, r)
-
-			return
-		}
-
-		if _, err := gw.registry.Resolve(sel, ""); err != nil {
+		res, err := gw.registry.Resolve(sel, "")
+		if err != nil {
 			gw.writeUnknownContext(r.Context(), w, err)
 
 			return
 		}
 
-		routed := r.WithContext(registry.WithSelection(r.Context(), sel))
-		routed.URL = stripped
+		ctx := registry.WithResolution(registry.WithSelection(r.Context(), sel), res)
+		routed := r.WithContext(ctx)
+
+		if sel.Explicit {
+			routed.URL = stripped
+		}
 
 		next.ServeHTTP(w, routed)
 	})
+}
+
+// ContextFromPath reports the context a request for path selects, by exactly
+// the split the gateway routes with. It is exported because patchbay's own CLI
+// has to say which context a configured base URL lands a project in, and a
+// second implementation of the rule is how the tool and the gateway come to
+// disagree about what a path means.
+//
+// A path naming no context selects the personal one. A path whose prefix names
+// nothing selects the empty name, which no registry can produce and which the
+// gateway refuses.
+func ContextFromPath(path string) string {
+	sel, _ := splitContext(&url.URL{Path: path})
+
+	return sel.Name
 }
 
 // splitContext separates the context a request named from the path it actually
@@ -235,10 +257,7 @@ func stripPrefix(target *url.URL, prefix string) (*url.URL, bool) {
 // request.
 func (gw *gateway) writeUnknownContext(ctx context.Context, w http.ResponseWriter, err error) {
 	gw.logger.WarnContext(ctx, "request named a context that cannot be resolved", slog.Any("error", err))
-
-	w.Header().Set(anthropic.HeaderContentType, jsonContentType)
-	w.WriteHeader(http.StatusNotFound)
-	gw.write(ctx, w, anthropic.TypedErrorBody(anthropic.ErrorTypeNotFound, err))
+	gw.writeTyped(ctx, w, http.StatusNotFound, anthropic.ErrorTypeNotFound, err)
 }
 
 // defaultClient is the client used when the host process supplies none. It

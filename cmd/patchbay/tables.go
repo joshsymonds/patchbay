@@ -23,6 +23,11 @@ const builtinDefault = "built-in anthropic forward"
 // caller itself presented. There is no file and no environment variable.
 const callerCredential = "caller"
 
+// awsProfileCredential prefixes the credential source of a signing route: the
+// AWS profile the gateway exports credentials for. It is a name in the
+// operator's own AWS config, never a credential.
+const awsProfileCredential = "aws profile "
+
 // absent is what a table prints for a field a route does not set. An empty cell
 // would be ambiguous with a field the gateway failed to report.
 const absent = "-"
@@ -193,14 +198,18 @@ func defaultRouteLabel(route server.RouteSummary) string {
 }
 
 // credentialSource names what a route pays with: the environment variable that
-// names its key file, the one that names its Bedrock model map, or the caller's
-// own credentials. It is a variable name, never a path and never a secret.
+// names its key file, the AWS profile the gateway exports credentials from, or
+// the caller's own credentials. It is a variable name or a profile name, never a
+// path and never a secret.
+//
+// A signing route's model map is deliberately not the answer here. The map
+// translates the model; what pays is the profile.
 func credentialSource(route server.RouteSummary) string {
 	switch {
 	case route.KeyEnvFile != "":
 		return route.KeyEnvFile
-	case route.ModelMapEnvFile != "":
-		return route.ModelMapEnvFile
+	case route.AWSProfile != "":
+		return awsProfileCredential + route.AWSProfile
 	default:
 		return callerCredential
 	}

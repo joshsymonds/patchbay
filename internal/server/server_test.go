@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/joshsymonds/patchbay/internal/registry"
 	"github.com/joshsymonds/patchbay/internal/server"
 )
 
@@ -379,5 +382,48 @@ func TestBarePathsDegradeWhenTheRegistryIsBroken(t *testing.T) {
 				t.Fatalf("proxy saw path %q; want %q", got.path, "/v1/messages")
 			}
 		})
+	}
+}
+
+// The surface resolves a request's context once and hands the pipeline that
+// resolution, so a registry file replaced while the request is in flight cannot
+// serve half of it from one document and half from the next.
+func TestTheSurfaceResolvesOncePerRequest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, path, `{"contexts":{"personal":{"routes":{`+lunaRoute+`}}}}`)
+
+	resolved := make(chan registry.Route, 1)
+	swapped := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// The file moves underneath the request, exactly as a rebuild would.
+		writeRegistry(t, path, `{"contexts":{"personal":{"routes":{}}}}`)
+
+		res, ok := registry.ResolutionFrom(r.Context())
+		if !ok {
+			t.Error("the pipeline was handed no resolution; every request must carry the one it made")
+
+			resolved <- registry.Route{}
+
+			return
+		}
+
+		resolved <- res.Select("luna-fast").Route
+	})
+
+	serve(t, server.Config{
+		Proxy:    swapped,
+		Registry: registry.New(path),
+	}, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"luna-fast"}`)))
+
+	if got := <-resolved; got.Alias != "luna-fast" {
+		t.Fatalf("route alias = %q; want the alias the request resolved to before the file changed", got.Alias)
+	}
+}
+
+// writeRegistry writes a registry document to path.
+func writeRegistry(t *testing.T, path, body string) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
 	}
 }

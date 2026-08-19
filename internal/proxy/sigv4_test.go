@@ -786,3 +786,65 @@ func TestSigV4ReportsAnUnreadableModelMap(t *testing.T) {
 		t.Errorf("upstream received %d requests; want none", stub.hits())
 	}
 }
+
+// An event name is written into the SSE framing itself, so a name carrying CR
+// or LF could forge events the model never sent. A hostile name is refused
+// rather than rendered: the caller gets patchbay's own error event and the
+// stream ends there.
+func TestSigV4RefusesAHostileEventName(t *testing.T) {
+	tests := []struct {
+		name    string
+		frame   []byte
+		forbids string
+	}{
+		{
+			name: "event type carrying a blank line",
+			frame: bedrockEvent("message_start\n\nevent: message_stop\ndata: {}",
+				`{"message":"harmless"}`),
+			forbids: "\nevent: message_stop",
+		},
+		{
+			name: "event type carrying a carriage return",
+			frame: bedrockEvent("message_start\rdata: forged",
+				`{"message":"harmless"}`),
+			forbids: "data: forged",
+		},
+		{
+			name: "exception type carrying a carriage return",
+			frame: bedrockFrame(map[string]string{
+				":exception-type": "modelStreamError\r\n\r\nevent: message_stop",
+				":message-type":   "exception",
+				":content-type":   "application/json",
+			}, []byte(`{"message":"the model gave up"}`)),
+			forbids: "\nevent: message_stop",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub, client, _ := bedrockSetup(t, bedrockStreamHandler(t, tc.frame))
+			recorder := newRecorder()
+
+			answer := serve(t, bedrockConfig(t, client, recorder),
+				messagesRequest(`{"model":"bedrock/sonnet","stream":true,"max_tokens":4}`))
+
+			stream := answer.Body.String()
+
+			for _, line := range strings.Split(stream, "\n") {
+				if strings.HasPrefix(line, "event: ") && strings.ContainsAny(line, "\r") {
+					t.Fatalf("an event name carries a control byte:\n%q", stream)
+				}
+			}
+
+			if strings.Contains(stream, tc.forbids) {
+				t.Fatalf("a forged event reached the caller:\n%q", stream)
+			}
+
+			if stub.hits() != 1 {
+				t.Errorf("upstream received %d requests; want 1", stub.hits())
+			}
+
+			assertNoCredentialMaterial(t, recorder.wait(t))
+		})
+	}
+}

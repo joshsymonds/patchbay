@@ -15,6 +15,13 @@ import (
 // paying for something that reads as a Claude model is a billing lie.
 const claudeMarker = "claude"
 
+// The alphabets an AWS region and an AWS profile are held to, spelled out for
+// the error a rejected one produces.
+const (
+	regionAlphabet  = "lowercase letters, digits and dashes"
+	profileAlphabet = "lowercase letters, digits, dashes, dots and underscores"
+)
+
 // loopbackHost and localhostHost are the only hosts allowed to drop TLS.
 const (
 	loopbackHost  = "127.0.0.1"
@@ -57,17 +64,36 @@ func validateContextName(name string) error {
 		return fmt.Errorf("empty %s key", fieldContexts)
 	}
 
-	for _, char := range name {
-		lower := char >= 'a' && char <= 'z'
-		digit := char >= '0' && char <= '9'
+	if err := ValidContextName(name); err != nil {
+		return fmt.Errorf("context %q %w", name, err)
+	}
 
-		if !lower && !digit && char != '-' {
-			return fmt.Errorf(
-				"context %q must use only lowercase letters, digits and dashes; found %q", name, char)
+	return nil
+}
+
+// ValidContextName reports what is wrong with a context name, or nil when
+// nothing is. It is exported because the ledger holds a stored context name to
+// exactly this rule before accepting a record: one declaration, so a name the
+// registry would never produce can never be read back as one it did.
+func ValidContextName(name string) error {
+	for _, char := range name {
+		if !isContextNameChar(char) {
+			return fmt.Errorf("must use only lowercase letters, digits and dashes; found %q", char)
 		}
 	}
 
 	return nil
+}
+
+// isContextNameChar reports whether char is one a context name may carry.
+func isContextNameChar(char rune) bool {
+	return isLowerAlphanumeric(char) || char == '-'
+}
+
+// isLowerAlphanumeric reports whether char is a lowercase letter or a digit,
+// which is the core of every name rule in this file.
+func isLowerAlphanumeric(char rune) bool {
+	return (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')
 }
 
 // validateContext applies every route rule to a context's default route and to
@@ -195,7 +221,39 @@ func validateSigV4(route Route) error {
 		}
 	}
 
+	if err := validateAWSName(fieldAWSRegion, route.AWSRegion, isRegionChar, regionAlphabet); err != nil {
+		return err
+	}
+
+	return validateAWSName(fieldAWSProfile, route.AWSProfile, isProfileChar, profileAlphabet)
+}
+
+// validateAWSName holds an AWS region or profile to the characters it may
+// carry. Both end up in something a request is built from — the region derives
+// the endpoint host and the profile is exported to the aws CLI's environment —
+// so a value that could carry a host, a path or an argument of its own is
+// refused here rather than interpreted later.
+func validateAWSName(field, value string, allowed func(rune) bool, alphabet string) error {
+	for _, char := range value {
+		if !allowed(char) {
+			return fmt.Errorf("%s %q must use only %s; found %q", field, value, alphabet, char)
+		}
+	}
+
 	return nil
+}
+
+// isRegionChar reports whether char is one an AWS region name may carry.
+func isRegionChar(char rune) bool {
+	return isLowerAlphanumeric(char) || char == '-'
+}
+
+// isProfileChar reports whether char is one an AWS profile name may carry.
+// Profiles legitimately hold dots and underscores — an SSO profile named
+// "acme_prod.admin" is ordinary — so those are allowed on top of the region's
+// alphabet, and nothing else is.
+func isProfileChar(char rune) bool {
+	return isRegionChar(char) || char == '.' || char == '_'
 }
 
 // validateNoAWSFields refuses the sigv4-only fields on a route that does not

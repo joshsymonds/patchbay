@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/registry"
 	"github.com/joshsymonds/patchbay/internal/server"
 )
@@ -275,6 +276,28 @@ func serve(t *testing.T, cfg server.Config, req *http.Request) *httptest.Respons
 // modelsRequest builds an inbound GET carrying no credentials.
 func modelsRequest(target string) *http.Request {
 	return httptest.NewRequest(http.MethodGet, target, nil)
+}
+
+// keyedRequest builds an inbound GET presenting the caller key, which every
+// request naming a context in its path has to.
+func keyedRequest(target string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set(proxy.CallerKeyHeader, callerKey)
+
+	return req
+}
+
+// modelMapFile writes a Bedrock model map and names it in the environment under
+// envName, the same double indirection the pipeline reads it through.
+func modelMapFile(t *testing.T, envName, body string) {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "models.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write model map: %v", err)
+	}
+
+	t.Setenv(envName, path)
 }
 
 // listResponse is the decoded /v1/models envelope, with each entry left as the

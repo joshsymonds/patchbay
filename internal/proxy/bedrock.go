@@ -42,13 +42,18 @@ const bedrockService = "bedrock"
 // before patchbay translates it into the SSE the caller expects.
 const bedrockStreamType = "application/vnd.amazon.eventstream"
 
+// firstPrintableByte is the lowest byte an SSE event name may carry: every byte
+// below it is a control character, and CR and LF among them would end the line
+// the name is written on.
+const firstPrintableByte = 0x20
+
+// errorEventName is the SSE event name patchbay's own failures are reported
+// under. It is a constant of this package, never anything an upstream named.
+const errorEventName = "error"
+
 // jsonContentType is what a translated Bedrock request is sent as and what a
 // non-streamed answer comes back as.
 const jsonContentType = "application/json"
-
-// errorTypeInvalidRequest is Anthropic's own type for a request the gateway
-// refuses on its face — here, a model no map entry claims.
-const errorTypeInvalidRequest = "invalid_request_error"
 
 // bedrockEventEnvelope is how Bedrock carries one Anthropic stream event: the
 // event JSON, base64 encoded, inside a one-field object.
@@ -66,33 +71,50 @@ type eventTypeProbe struct {
 // endpoint gates first, then the caller-key gate, then the model map, the body
 // translation and the signature. Nothing is exported or signed until the caller
 // has proved it may spend the account's credentials.
-func (p *Proxy) bedrockRequest(r *http.Request, route registry.Route, body []byte) (*http.Request, *gatewayError) {
+//
+// It also reports the credential generation the request was signed with, so a
+// refusal invalidates the credential that actually signed it rather than
+// whichever one the cache holds by the time the refusal lands.
+func (p *Proxy) bedrockRequest(
+	r *http.Request,
+	route registry.Route,
+	body []byte,
+) (*http.Request, uint64, *gatewayError) {
 	if gwErr := bedrockPathGate(r.URL.Path); gwErr != nil {
-		return nil, gwErr
+		return nil, 0, gwErr
 	}
 
 	if keyErr := checkCallerKey(r); keyErr != nil {
-		return nil, keyErr
+		return nil, 0, keyErr
+	}
+
+	// The body is decoded exactly once per attempt, and the model, the stream
+	// flag and the translated document all come out of that one document: a
+	// second parse of the same bytes is a second chance for the two readings to
+	// disagree about what the caller asked for.
+	document, docErr := bedrockDocument(body)
+	if docErr != nil {
+		return nil, 0, docErr
 	}
 
 	model := route.Model
 	if model == "" {
-		model = extractModel(body)
+		model = documentModel(document)
 	}
 
-	target, gwErr := bedrockTarget(route, model, body)
+	target, gwErr := bedrockTarget(route, model, documentWantsStream(document))
 	if gwErr != nil {
-		return nil, gwErr
+		return nil, 0, gwErr
 	}
 
-	translated, translateErr := translateBedrockBody(body)
+	translated, translateErr := translateBedrockDocument(document)
 	if translateErr != nil {
-		return nil, translateErr
+		return nil, 0, translateErr
 	}
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(translated))
 	if err != nil {
-		return nil, &gatewayError{
+		return nil, 0, &gatewayError{
 			status:  http.StatusInternalServerError,
 			errType: "",
 			err:     fmt.Errorf("build bedrock request: %w", err),
@@ -107,21 +129,24 @@ func (p *Proxy) bedrockRequest(r *http.Request, route registry.Route, body []byt
 	req.Header.Set(anthropic.HeaderContentType, jsonContentType)
 	req.Header.Set("Accept", jsonContentType)
 
-	return req, p.signBedrock(r.Context(), req, route, translated)
+	generation, signErr := p.signBedrock(r.Context(), req, route, translated)
+
+	return req, generation, signErr
 }
 
-// signBedrock exports the route's AWS credentials and signs req with them.
+// signBedrock exports the route's AWS credentials and signs req with them,
+// reporting which generation of the profile's credentials it signed with.
 func (p *Proxy) signBedrock(
 	ctx context.Context,
 	req *http.Request,
 	route registry.Route,
 	payload []byte,
-) *gatewayError {
-	creds, err := p.credentials.Credentials(ctx, route.AWSProfile)
+) (uint64, *gatewayError) {
+	creds, generation, err := p.credentials.Credentials(ctx, route.AWSProfile)
 	if err != nil {
 		// The source's own error is already sanitized; the advice is what the
 		// operator can act on, and neither says anything about a credential.
-		return &gatewayError{
+		return 0, &gatewayError{
 			status:  http.StatusBadGateway,
 			errType: "",
 			err: fmt.Errorf("aws credentials for profile %q are unavailable; run: aws sso login --profile %s",
@@ -130,14 +155,14 @@ func (p *Proxy) signBedrock(
 	}
 
 	if signErr := awssig.Sign(req, creds, bedrockService, route.AWSRegion, payload, time.Now()); signErr != nil {
-		return &gatewayError{
+		return 0, &gatewayError{
 			status:  http.StatusBadGateway,
 			errType: "",
 			err:     fmt.Errorf("sign the bedrock request: %w", signErr),
 		}
 	}
 
-	return nil
+	return generation, nil
 }
 
 // bedrockPathGate refuses every endpoint a Bedrock route cannot answer.
@@ -165,11 +190,11 @@ func bedrockPathGate(path string) *gatewayError {
 
 // bedrockTarget resolves the model through the route's map file and returns the
 // invocation URL for it, streamed or not.
-func bedrockTarget(route registry.Route, model string, body []byte) (string, *gatewayError) {
+func bedrockTarget(route registry.Route, model string, streamed bool) (string, *gatewayError) {
 	if model == "" {
 		return "", &gatewayError{
 			status:  http.StatusBadRequest,
-			errType: errorTypeInvalidRequest,
+			errType: anthropic.ErrorTypeInvalidRequest,
 			err:     errors.New("the request names no model to map to a Bedrock model"),
 		}
 	}
@@ -187,13 +212,13 @@ func bedrockTarget(route registry.Route, model string, body []byte) (string, *ga
 	if !mapped || bedrockModel == "" {
 		return "", &gatewayError{
 			status:  http.StatusBadRequest,
-			errType: errorTypeInvalidRequest,
+			errType: anthropic.ErrorTypeInvalidRequest,
 			err:     fmt.Errorf("model %q is not available on this Bedrock route", model),
 		}
 	}
 
 	suffix := invokeSuffix
-	if wantsStream(body) {
+	if streamed {
 		suffix = invokeStreamPath
 	}
 
@@ -225,35 +250,53 @@ func readModelMap(envName string) (map[string]string, error) {
 	return mapping, nil
 }
 
-// wantsStream reports whether the caller asked for a streamed turn.
-func wantsStream(body []byte) bool {
-	var probe struct {
-		Stream bool `json:"stream"`
-	}
-
-	if err := json.Unmarshal(body, &probe); err != nil {
-		return false
-	}
-
-	return probe.Stream
-}
-
-// translateBedrockBody is the whole request translation: drop the two fields
-// Bedrock carries in the URL rather than the body, add the version tag it
-// requires, and leave every other field exactly as the caller wrote it. The
-// document is walked as raw values rather than a struct on purpose — a field
-// this build has never heard of must still reach the model.
-func translateBedrockBody(body []byte) ([]byte, *gatewayError) {
+// bedrockDocument decodes the caller's body into the one document every other
+// step of the translation reads. It is the only place these bytes are parsed.
+func bedrockDocument(body []byte) (map[string]json.RawMessage, *gatewayError) {
 	var document map[string]json.RawMessage
 
 	if err := json.Unmarshal(body, &document); err != nil || document == nil {
 		return nil, &gatewayError{
 			status:  http.StatusBadRequest,
-			errType: errorTypeInvalidRequest,
+			errType: anthropic.ErrorTypeInvalidRequest,
 			err:     errors.New("a Bedrock route needs a JSON object body"),
 		}
 	}
 
+	return document, nil
+}
+
+// documentModel reads the model the decoded request names. A model that is not
+// a string names nothing, and is refused a moment later for having no mapping.
+func documentModel(document map[string]json.RawMessage) string {
+	var model string
+	if err := json.Unmarshal(document[fieldModel], &model); err != nil {
+		return ""
+	}
+
+	return model
+}
+
+// documentWantsStream reports whether the decoded request asked for a streamed
+// turn. Anything that is not a JSON true is not a request to stream.
+func documentWantsStream(document map[string]json.RawMessage) bool {
+	var streamed bool
+	if err := json.Unmarshal(document[fieldStream], &streamed); err != nil {
+		return false
+	}
+
+	return streamed
+}
+
+// translateBedrockDocument is the whole request translation: drop the two
+// fields Bedrock carries in the URL rather than the body, add the version tag
+// it requires, and leave every other field exactly as the caller wrote it. The
+// document is walked as raw values rather than a struct on purpose — a field
+// this build has never heard of must still reach the model.
+//
+// It consumes the document rather than the bytes, so nothing here re-reads what
+// bedrockDocument already read.
+func translateBedrockDocument(document map[string]json.RawMessage) ([]byte, *gatewayError) {
 	delete(document, fieldModel)
 	delete(document, fieldStream)
 
@@ -318,7 +361,7 @@ func (p *Proxy) streamBedrock(ctx context.Context, w http.ResponseWriter, resp *
 		}
 
 		event, done := bedrockSSE(msg)
-		if event != nil && !p.writeEvent(ctx, w, capt, flusher, canFlush, event) {
+		if event != nil && !p.writeChunk(ctx, w, capt, flusher, canFlush, event) {
 			return capt
 		}
 
@@ -326,32 +369,6 @@ func (p *Proxy) streamBedrock(ctx context.Context, w http.ResponseWriter, resp *
 			return capt
 		}
 	}
-}
-
-// writeEvent hands one translated event to the caller and the capture,
-// reporting whether the stream may continue.
-func (p *Proxy) writeEvent(
-	ctx context.Context,
-	w http.ResponseWriter,
-	capt *capture,
-	flusher http.Flusher,
-	canFlush bool,
-	event []byte,
-) bool {
-	capt.write(event)
-
-	if _, err := w.Write(event); err != nil {
-		capt.truncated = true
-		p.logger.WarnContext(ctx, "client went away mid-stream", slog.Any("error", err))
-
-		return false
-	}
-
-	if canFlush {
-		flusher.Flush()
-	}
-
-	return true
 }
 
 // bedrockSSE renders one decoded event-stream message as an SSE event, and
@@ -363,7 +380,7 @@ func bedrockSSE(msg awssig.Message) ([]byte, bool) {
 	if exception := msg.Headers[":exception-type"]; exception != "" {
 		body := anthropic.ErrorBody(fmt.Errorf("bedrock stream failed: %s", exception))
 
-		return sseEvent("error", body), true
+		return sseEvent(errorEventName, body), true
 	}
 
 	eventType := msg.Headers[":event-type"]
@@ -375,7 +392,7 @@ func bedrockSSE(msg awssig.Message) ([]byte, bool) {
 	if err := json.Unmarshal(msg.Payload, &envelope); err != nil || len(envelope.Bytes) == 0 {
 		body := anthropic.ErrorBody(errors.New("bedrock sent an event patchbay could not decode"))
 
-		return sseEvent("error", body), true
+		return sseEvent(errorEventName, body), true
 	}
 
 	var probe eventTypeProbe
@@ -383,7 +400,31 @@ func bedrockSSE(msg awssig.Message) ([]byte, bool) {
 		eventType = probe.Type
 	}
 
+	// The name is written into the SSE framing itself, so one carrying CR or LF
+	// could forge whole events the model never sent — and every other control
+	// byte is equally not a name. Such a message is refused rather than rendered:
+	// the caller gets patchbay's own error event, under the one fixed safe name,
+	// and the stream ends there.
+	if !safeEventName(eventType) {
+		body := anthropic.ErrorBody(errors.New("bedrock named an event patchbay will not render"))
+
+		return sseEvent(errorEventName, body), true
+	}
+
 	return sseEvent(eventType, envelope.Bytes), false
+}
+
+// safeEventName reports whether name can be written as an SSE event name at
+// all: anything below the printable range would end the line, or the event,
+// somewhere the framing did not intend.
+func safeEventName(name string) bool {
+	for _, char := range []byte(name) {
+		if char < firstPrintableByte {
+			return false
+		}
+	}
+
+	return true
 }
 
 // sseEvent renders one server-sent event in the shape Anthropic's own stream

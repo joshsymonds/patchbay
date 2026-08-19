@@ -43,6 +43,12 @@ const (
 	messagesCountPath = "/v1/messages/count_tokens"
 )
 
+// drainLimitBytes bounds the body patchbay reads off a response nobody will
+// look at. Draining is only worth doing to keep the connection reusable, so an
+// upstream that answers a refusal with megabytes must cost the connection
+// rather than the request that is waiting behind it.
+const drainLimitBytes = 64 << 10
+
 // requestLimitBytes caps the request body the gateway will hold in memory: 64
 // MiB, the same ceiling the response tee uses and for the same reason. The
 // whole body has to be buffered to be rewritten and replayed upstream, so an
@@ -165,14 +171,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	requestModel := extractModel(body)
 
-	res, resErr := p.registry.Resolve(sel, requestModel)
+	res, resErr := p.resolve(r.Context(), sel, requestModel)
 	if resErr != nil {
-		// The surface already refused every context it could not resolve, so
-		// reaching here means the registry changed underneath this request. It
-		// fails closed all the same: a named context is never served by another.
-		// The record carries the built-in route the way every other refusal
-		// does — nothing was sent anywhere, and a record the ledger would drop
-		// for want of an upstream is a refusal nobody can audit.
+		// Only a pipeline driven with no surface in front of it can reach here:
+		// through the gateway, the context was resolved before the request was
+		// routed and that resolution is the one used. It fails closed all the
+		// same: a named context is never served by another. The record carries
+		// the built-in route the way every other refusal does — nothing was sent
+		// anywhere, and a record the ledger would drop for want of an upstream is
+		// a refusal nobody can audit.
 		p.abort(r.Context(), w, newExchange(registry.DefaultRoute(), res.Context, class, requestModel, start),
 			&gatewayError{status: http.StatusNotFound, err: resErr})
 
@@ -193,7 +200,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		exch.requestBody = string(upstreamBody)
 	}
 
-	req, reqErr := p.upstreamRequest(r, route, upstreamBody)
+	req, generation, reqErr := p.upstreamRequest(r, route, upstreamBody)
 	if reqErr != nil {
 		p.abort(r.Context(), w, exch, reqErr)
 
@@ -202,7 +209,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	sent := time.Now()
 
-	resp, sendErr := p.send(r, route, upstreamBody, req)
+	resp, sendErr := p.send(r, route, upstreamBody, req, generation)
 	if sendErr != nil {
 		p.abort(r.Context(), w, exch, sendErr)
 
@@ -228,6 +235,30 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	exch.durationMS = millis(time.Since(start))
 
 	p.record(exch, capt)
+}
+
+// resolve picks the route serving model inside the request's own context.
+//
+// The HTTP surface resolves the context once, before anything dispatches on the
+// request, and attaches the resolution; consuming that is what keeps one request
+// on one registry document even when the file is replaced while the request is
+// in flight. A pipeline driven directly, with no surface in front of it,
+// resolves for itself.
+func (p *Proxy) resolve(
+	ctx context.Context,
+	sel registry.Selection,
+	model string,
+) (registry.Resolution, error) {
+	if res, ok := registry.ResolutionFrom(ctx); ok {
+		return res.Select(model), nil
+	}
+
+	res, err := p.registry.Resolve(sel, model)
+	if err != nil {
+		return res, fmt.Errorf("resolve the request context: %w", err)
+	}
+
+	return res, nil
 }
 
 // Drain waits for the record goroutines still in flight, or until ctx expires,
@@ -290,20 +321,10 @@ func (p *Proxy) stream(ctx context.Context, w http.ResponseWriter, resp *http.Re
 	for {
 		read, readErr := resp.Body.Read(buf)
 		if read > 0 {
-			chunk := buf[:read]
-			capt.write(chunk)
-
-			if _, writeErr := w.Write(chunk); writeErr != nil {
-				// The client is gone, so the turn stops here: the capture holds a
-				// prefix, not a finished turn, and must not be summarized as one.
-				capt.truncated = true
-				p.logger.WarnContext(ctx, "client went away mid-stream", slog.Any("error", writeErr))
-
+			// A client that has gone away ends the turn here: the capture holds a
+			// prefix, not a finished turn, and must not be summarized as one.
+			if !p.writeChunk(ctx, w, capt, flusher, canFlush, buf[:read]) {
 				return capt
-			}
-
-			if canFlush {
-				flusher.Flush()
 			}
 		}
 
@@ -319,6 +340,35 @@ func (p *Proxy) stream(ctx context.Context, w http.ResponseWriter, resp *http.Re
 			return capt
 		}
 	}
+}
+
+// writeChunk hands one piece of a streamed answer to the caller and to the
+// capture the record is summarized from, reporting whether the stream may
+// continue. Both stream loops go through it — the relayed one and the Bedrock
+// translation — so a client that goes away costs exactly the same thing either
+// way, and says so in one place.
+func (p *Proxy) writeChunk(
+	ctx context.Context,
+	w http.ResponseWriter,
+	capt *capture,
+	flusher http.Flusher,
+	canFlush bool,
+	chunk []byte,
+) bool {
+	capt.write(chunk)
+
+	if _, err := w.Write(chunk); err != nil {
+		capt.truncated = true
+		p.logger.WarnContext(ctx, "client went away mid-stream", slog.Any("error", err))
+
+		return false
+	}
+
+	if canFlush {
+		flusher.Flush()
+	}
+
+	return true
 }
 
 // record hands the finished exchange to the ledger without making the client
@@ -352,8 +402,9 @@ func (p *Proxy) appendRecord(exch *exchange, capt *capture) {
 //
 // A sigv4 route gets one retry, and only on a 403: AWS refuses a signature made
 // with a credential that has since expired, which is the ordinary end of an SSO
-// session rather than a failure worth surfacing. The cached credential is
-// dropped so the retry exports a fresh one. A second refusal is patchbay's own
+// session rather than a failure worth surfacing. The credential that signed the
+// refused request — named by generation, not by whatever the cache holds now —
+// is dropped so the retry exports a fresh one. A second refusal is patchbay's own
 // failure to report — the caller has no AWS credential of its own to fix, so a
 // relayed 403 would only read as a broken gateway.
 func (p *Proxy) send(
@@ -361,6 +412,7 @@ func (p *Proxy) send(
 	route registry.Route,
 	body []byte,
 	req *http.Request,
+	generation uint64,
 ) (*http.Response, *gatewayError) {
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -376,9 +428,9 @@ func (p *Proxy) send(
 	}
 
 	p.discard(r.Context(), resp)
-	p.credentials.Invalidate(route.AWSProfile)
+	p.credentials.Invalidate(route.AWSProfile, generation)
 
-	retry, buildErr := p.upstreamRequest(r, route, body)
+	retry, _, buildErr := p.upstreamRequest(r, route, body)
 	if buildErr != nil {
 		return nil, buildErr
 	}
@@ -407,11 +459,14 @@ func (p *Proxy) send(
 }
 
 // discard drains and closes a response nobody will read, so its connection goes
-// back to the pool rather than being torn down mid-body. A failure to drain
+// back to the pool rather than being torn down mid-body. The drain is bounded
+// at drainLimitBytes and the body is closed either way. A failure to drain
 // costs the connection and nothing else, which is worth a line in the log and
 // no more.
 func (p *Proxy) discard(ctx context.Context, resp *http.Response) {
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+	// A body that overruns the ceiling is simply abandoned: the connection is
+	// torn down rather than pooled, which is the cheaper of the two failures.
+	if _, err := io.CopyN(io.Discard, resp.Body, drainLimitBytes); err != nil && !errors.Is(err, io.EOF) {
 		p.logger.WarnContext(ctx, "draining a refused response failed", slog.Any("error", err))
 	}
 
@@ -423,7 +478,13 @@ func (p *Proxy) discard(ctx context.Context, resp *http.Response) {
 // upstreamRequest builds the request to send upstream: the route's base URL
 // carrying the inbound path and raw query verbatim, the caller's headers minus
 // the ones a proxy owns, and the route's credentials.
-func (p *Proxy) upstreamRequest(r *http.Request, route registry.Route, body []byte) (*http.Request, *gatewayError) {
+// It also reports the AWS credential generation a sigv4 request was signed
+// with; every other route signs nothing and reports zero.
+func (p *Proxy) upstreamRequest(
+	r *http.Request,
+	route registry.Route,
+	body []byte,
+) (*http.Request, uint64, *gatewayError) {
 	// A sigv4 route sends a translated, signed request to an endpoint its region
 	// derives, so it shares none of the relay path below.
 	if route.Auth == registry.AuthSigV4 {
@@ -438,7 +499,7 @@ func (p *Proxy) upstreamRequest(r *http.Request, route registry.Route, body []by
 	// copy below, so it sees the header the caller actually sent.
 	if route.Auth == registry.AuthInject {
 		if !isInjectMessagesPath(r.URL.Path) {
-			return nil, &gatewayError{
+			return nil, 0, &gatewayError{
 				status: http.StatusNotFound,
 				err: fmt.Errorf("route %q injects a key and only relays the Messages endpoints, not %s",
 					route.Alias, r.URL.Path),
@@ -446,7 +507,7 @@ func (p *Proxy) upstreamRequest(r *http.Request, route registry.Route, body []by
 		}
 
 		if keyErr := checkCallerKey(r); keyErr != nil {
-			return nil, keyErr
+			return nil, 0, keyErr
 		}
 	}
 
@@ -457,7 +518,7 @@ func (p *Proxy) upstreamRequest(r *http.Request, route registry.Route, body []by
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
 	if err != nil {
-		return nil, &gatewayError{
+		return nil, 0, &gatewayError{
 			status: http.StatusInternalServerError,
 			err:    fmt.Errorf("build upstream request: %w", err),
 		}
@@ -468,10 +529,10 @@ func (p *Proxy) upstreamRequest(r *http.Request, route registry.Route, body []by
 	req.Header.Set(headerAcceptEncoding, encodingIdentity)
 
 	if authErr := applyAuth(req, route); authErr != nil {
-		return nil, authErr
+		return nil, 0, authErr
 	}
 
-	return req, nil
+	return req, 0, nil
 }
 
 // isInjectMessagesPath reports whether path is one of the Messages endpoints an

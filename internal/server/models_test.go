@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/server"
 )
 
@@ -806,7 +808,7 @@ const injectDefaultContext = `"work":{"default_route":{"base_url":"https://openr
 const forwardDefaultContext = `"work":{"routes":{` + workRoutes + `}}`
 
 func TestModelListUnderAContextMergesWhenItsDefaultIsAnthropic(t *testing.T) {
-	t.Parallel()
+	callerKeyFile(t)
 
 	// The context's own aliases, then the models the caller's credentials can
 	// see — the same bargain the bare path has always made, scoped to one
@@ -817,7 +819,7 @@ func TestModelListUnderAContextMergesWhenItsDefaultIsAnthropic(t *testing.T) {
 		Proxy:    newSentinel(),
 		Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+forwardDefaultContext),
 		Client:   anthropicClient(t, stub),
-	}, modelsRequest("/ctx/work/v1/models"))
+	}, keyedRequest("/ctx/work/v1/models"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
@@ -840,7 +842,7 @@ func TestModelListUnderAContextMergesWhenItsDefaultIsAnthropic(t *testing.T) {
 }
 
 func TestModelListIsSynthesizedForANonAnthropicContext(t *testing.T) {
-	t.Parallel()
+	callerKeyFile(t)
 
 	// The caller's Anthropic account has nothing to say about a context that
 	// never reaches Anthropic, so nothing is asked of it: the listing is the
@@ -851,7 +853,7 @@ func TestModelListIsSynthesizedForANonAnthropicContext(t *testing.T) {
 		Proxy:    newSentinel(),
 		Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+injectDefaultContext),
 		Client:   anthropicClient(t, stub),
-	}, modelsRequest("/ctx/work/v1/models"))
+	}, keyedRequest("/ctx/work/v1/models"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
@@ -912,8 +914,6 @@ func TestModelListIsSynthesizedForANonAnthropicContext(t *testing.T) {
 
 	for _, tc := range entries {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			if got := entryFields(t, list.Data[tc.index]); !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("entry %d = %v; want exactly %v", tc.index, got, tc.want)
 			}
@@ -943,7 +943,7 @@ func TestBareModelListIsThePersonalContext(t *testing.T) {
 }
 
 func TestShowModelDescribesTheContextsOwnAlias(t *testing.T) {
-	t.Parallel()
+	callerKeyFile(t)
 
 	tests := []struct {
 		name     string
@@ -963,8 +963,6 @@ func TestShowModelDescribesTheContextsOwnAlias(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			// The upstream answers for anything the context does not claim, which
 			// is how a name it has never heard of is relayed rather than guessed at.
 			stub := newUpstream(t, jsonHandler(http.StatusOK,
@@ -975,7 +973,7 @@ func TestShowModelDescribesTheContextsOwnAlias(t *testing.T) {
 				Proxy:    newSentinel(),
 				Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+forwardDefaultContext),
 				Client:   anthropicClient(t, stub),
-			}, modelsRequest(tc.target))
+			}, keyedRequest(tc.target))
 
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
@@ -1000,8 +998,16 @@ const sigv4DefaultContext = `"work":{"default_route":{"auth":"sigv4","aws_profil
 	`"aws_region":"us-east-2","model_map_env_file":"BEDROCK_MODEL_MAP_FILE",` +
 	`"model":"claude-sonnet-5","max_input_tokens":200000},"routes":{` + workRoutes + `}}`
 
+// bedrockModelMap is a route's model map as it sits on disk: the ids a caller
+// may name, mapped to the Bedrock ids they ride. The values are the one thing
+// the file exists to keep out of sight, so no listing may ever carry one.
+const bedrockModelMap = `{"claude-sonnet-5":"arn:aws:bedrock:us-east-2::foundation-model/sonnet",` +
+	`"claude-haiku-5":"arn:aws:bedrock:us-east-2::foundation-model/haiku",` +
+	`"claude-unreachable-5":""}`
+
 func TestModelListIsSynthesizedForASigV4Context(t *testing.T) {
-	t.Parallel()
+	callerKeyFile(t)
+	modelMapFile(t, "BEDROCK_MODEL_MAP_FILE", bedrockModelMap)
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, upstreamList("claude-opus-5")))
 
@@ -1009,7 +1015,7 @@ func TestModelListIsSynthesizedForASigV4Context(t *testing.T) {
 		Proxy:    newSentinel(),
 		Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+sigv4DefaultContext),
 		Client:   anthropicClient(t, stub),
-	}, modelsRequest("/ctx/work/v1/models"))
+	}, keyedRequest("/ctx/work/v1/models"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
@@ -1021,13 +1027,252 @@ func TestModelListIsSynthesizedForASigV4Context(t *testing.T) {
 
 	list := decodeList(t, rec.Body.Bytes())
 
-	want := []string{"work-atlas", "claude-sonnet-5"}
+	// The keys of the map, which are the ids a caller may actually name — not
+	// the route's own rewrite target, and never a mapped Bedrock id.
+	want := []string{"work-atlas", "claude-haiku-5", "claude-sonnet-5"}
 	if got := ids(t, list); !reflect.DeepEqual(got, want) {
-		t.Fatalf("data ids = %v; want the aliases then the default route's model: %v", got, want)
+		t.Fatalf("data ids = %v; want the aliases then the model map's keys: %v", got, want)
+	}
+
+	if strings.Contains(rec.Body.String(), "arn:aws:bedrock") {
+		t.Fatalf("listing = %s; a Bedrock model id must never be advertised", rec.Body)
 	}
 
 	entry := entryFields(t, list.Data[1])
 	if got := entry["max_input_tokens"]; got != float64(200000) {
 		t.Fatalf("max_input_tokens = %v; want the route's ceiling", got)
+	}
+}
+
+// A model map that cannot be read costs the listing only the entries it would
+// have contributed. The context's own aliases are gateway-local knowledge and
+// still stand, and nothing is invented in the map's place.
+func TestModelListForASigV4ContextSurvivesAnUnreadableMap(t *testing.T) {
+	callerKeyFile(t)
+	t.Setenv("BEDROCK_MODEL_MAP_FILE", filepath.Join(t.TempDir(), "absent.json"))
+
+	logs := newLogSink()
+	stub := newUpstream(t, jsonHandler(http.StatusOK, upstreamList("claude-opus-5")))
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+sigv4DefaultContext),
+		Client:   anthropicClient(t, stub),
+		Logger:   slog.New(logs),
+	}, keyedRequest("/ctx/work/v1/models"))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
+	}
+
+	want := []string{"work-atlas"}
+	if got := ids(t, decodeList(t, rec.Body.Bytes())); !reflect.DeepEqual(got, want) {
+		t.Fatalf("data ids = %v; want the aliases alone: %v", got, want)
+	}
+
+	logs.waitFor(t, "model map unavailable; a sigv4 context lists only its aliases")
+}
+
+// One model of a sigv4 context, asked for by the id a caller may name. The map
+// is the only thing that decides whether it exists, and Anthropic — which will
+// never be asked for it — is never consulted.
+func TestShowModelForASigV4Context(t *testing.T) {
+	callerKeyFile(t)
+	modelMapFile(t, "BEDROCK_MODEL_MAP_FILE", bedrockModelMap)
+
+	tests := []struct {
+		name     string
+		target   string
+		wantCode int
+		wantID   string
+	}{
+		{
+			name:     "an alias of the context",
+			target:   "/ctx/work/v1/models/work-atlas",
+			wantCode: http.StatusOK,
+			wantID:   "work-atlas",
+		},
+		{
+			name:     "a key of the model map",
+			target:   "/ctx/work/v1/models/claude-haiku-5",
+			wantCode: http.StatusOK,
+			wantID:   "claude-haiku-5",
+		},
+		{
+			name:     "a model the map does not claim",
+			target:   "/ctx/work/v1/models/claude-opus-5",
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name:     "a key the map maps to nothing",
+			target:   "/ctx/work/v1/models/claude-unreachable-5",
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name:     "a personal alias this context does not serve",
+			target:   "/ctx/work/v1/models/luna-fast",
+			wantCode: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newUpstream(t, jsonHandler(http.StatusOK,
+				`{"type":"model","id":"claude-opus-5","display_name":"Claude Opus 5",`+
+					`"created_at":"2026-01-01T00:00:00Z"}`))
+
+			rec := serve(t, server.Config{
+				Proxy:    newSentinel(),
+				Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+sigv4DefaultContext),
+				Client:   anthropicClient(t, stub),
+			}, keyedRequest(tc.target))
+
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d; want %d (body %s)", rec.Code, tc.wantCode, rec.Body)
+			}
+
+			if stub.hits() != 0 {
+				t.Fatalf("upstream saw %d fetches; a context that never reaches Anthropic never asks it",
+					stub.hits())
+			}
+
+			if tc.wantCode != http.StatusOK {
+				if !strings.Contains(rec.Body.String(), "not_found_error") {
+					t.Fatalf("body = %s; want an Anthropic not_found_error", rec.Body)
+				}
+
+				return
+			}
+
+			if got := entryFields(t, rec.Body.Bytes())["id"]; got != tc.wantID {
+				t.Fatalf("model id = %v; want %q", got, tc.wantID)
+			}
+
+			if strings.Contains(rec.Body.String(), "arn:aws:bedrock") {
+				t.Fatalf("entry = %s; a Bedrock model id must never be advertised", rec.Body)
+			}
+		})
+	}
+}
+
+// A context whose default route pays with a foreign key is answered the same
+// way: its own model, or nothing. Anthropic is never asked about a model it
+// will never serve.
+func TestShowModelForAnInjectContext(t *testing.T) {
+	callerKeyFile(t)
+
+	tests := []struct {
+		name     string
+		target   string
+		wantCode int
+	}{
+		{
+			name:     "the default route's model",
+			target:   "/ctx/work/v1/models/openai%2Fgpt-5.6-luna",
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "a model it does not serve",
+			target:   "/ctx/work/v1/models/claude-opus-5",
+			wantCode: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newUpstream(t, jsonHandler(http.StatusOK,
+				`{"type":"model","id":"claude-opus-5","created_at":"2026-01-01T00:00:00Z"}`))
+
+			rec := serve(t, server.Config{
+				Proxy:    newSentinel(),
+				Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+injectDefaultContext),
+				Client:   anthropicClient(t, stub),
+			}, keyedRequest(tc.target))
+
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d; want %d (body %s)", rec.Code, tc.wantCode, rec.Body)
+			}
+
+			if stub.hits() != 0 {
+				t.Fatalf("upstream saw %d fetches; want none", stub.hits())
+			}
+		})
+	}
+}
+
+// Naming a context in the path is asking what some other world of this machine
+// serves, which is exactly what the caller key protects. The bare path is not
+// gated: it is what Claude Code sends knowing nothing about patchbay, and it
+// describes only the context that caller was already riding.
+func TestNamedContextModelEndpointsAreGatedOnTheCallerKey(t *testing.T) {
+	callerKeyFile(t)
+
+	tests := []struct {
+		name    string
+		request *http.Request
+		want    int
+	}{
+		{
+			name:    "named context listing without the key",
+			request: modelsRequest("/ctx/work/v1/models"),
+			want:    http.StatusForbidden,
+		},
+		{
+			name:    "named context listing with the key",
+			request: keyedRequest("/ctx/work/v1/models"),
+			want:    http.StatusOK,
+		},
+		{
+			name:    "named context model without the key",
+			request: modelsRequest("/ctx/work/v1/models/work-atlas"),
+			want:    http.StatusForbidden,
+		},
+		{
+			name:    "named context model with the key",
+			request: keyedRequest("/ctx/work/v1/models/work-atlas"),
+			want:    http.StatusOK,
+		},
+		{
+			name:    "the personal context named explicitly is still naming one",
+			request: modelsRequest("/ctx/personal/v1/models"),
+			want:    http.StatusForbidden,
+		},
+		{name: "the bare listing is not gated", request: modelsRequest("/v1/models"), want: http.StatusOK},
+		{name: "a bare alias is not gated", request: modelsRequest("/v1/models/luna-fast"), want: http.StatusOK},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newUpstream(t, jsonHandler(http.StatusOK, upstreamList("claude-opus-5")))
+
+			rec := serve(t, server.Config{
+				Proxy:    newSentinel(),
+				Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+forwardDefaultContext),
+				Client:   anthropicClient(t, stub),
+			}, tc.request)
+
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d; want %d (body %s)", rec.Code, tc.want, rec.Body)
+			}
+		})
+	}
+}
+
+// A caller key this process cannot read at all is a server-side problem, and
+// gets the same 500 the introspection endpoint gives it — never a 403, which
+// would tell the caller to fix something that is not theirs.
+func TestNamedContextModelEndpointsReportAnUnreadableCallerKey(t *testing.T) {
+	t.Setenv(proxy.CallerKeyEnvFile, "")
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, upstreamList("claude-opus-5")))
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+forwardDefaultContext),
+		Client:   anthropicClient(t, stub),
+	}, modelsRequest("/ctx/work/v1/models"))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d; want %d (body %s)", rec.Code, http.StatusInternalServerError, rec.Body)
 	}
 }

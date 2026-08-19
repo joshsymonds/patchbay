@@ -63,6 +63,11 @@ type profileCache struct {
 	creds   Credentials
 	expires time.Time
 	valid   bool
+
+	// generation names the credential currently cached. It rises on every
+	// successful export, so a refusal can say which credential it was refused
+	// for and an invalidation can tell that one from its successor.
+	generation uint64
 }
 
 // NewCredentialSource returns an empty source. Nothing is exported until a
@@ -72,37 +77,49 @@ func NewCredentialSource() *CredentialSource {
 }
 
 // Credentials returns the profile's credentials, exporting them if the cache
-// has none or the cached ones are within the refresh skew of expiring.
-func (s *CredentialSource) Credentials(ctx context.Context, profile string) (Credentials, error) {
+// has none or the cached ones are within the refresh skew of expiring. The
+// generation alongside them names exactly which credential was handed out, and
+// is what a later refusal passes back to Invalidate.
+func (s *CredentialSource) Credentials(ctx context.Context, profile string) (Credentials, uint64, error) {
 	entry := s.entry(profile)
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
 	if entry.valid && time.Now().Before(entry.expires) {
-		return entry.creds, nil
+		return entry.creds, entry.generation, nil
 	}
 
 	creds, err := export(ctx, profile)
 	if err != nil {
-		return Credentials{}, err
+		return Credentials{}, 0, err
 	}
 
 	entry.creds = creds
 	entry.expires = cacheUntil(creds.Expiration)
 	entry.valid = true
+	entry.generation++
 
-	return creds, nil
+	return creds, entry.generation, nil
 }
 
 // Invalidate drops the profile's cached credential, so the next request exports
 // a fresh one. It is what a rejected signature costs: the credential patchbay
 // held is evidently not one AWS accepts any more.
-func (s *CredentialSource) Invalidate(profile string) {
+//
+// generation names the credential the refusal was actually signed with. A
+// credential exported since then is not the one AWS refused, and dropping it
+// would cost every concurrent turn its own aws process for nothing — so a
+// refusal that names an older generation is already answered and does nothing.
+func (s *CredentialSource) Invalidate(profile string, generation uint64) {
 	entry := s.entry(profile)
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+
+	if entry.generation != generation {
+		return
+	}
 
 	entry.valid = false
 }
@@ -116,7 +133,7 @@ func (s *CredentialSource) entry(profile string) *profileCache {
 
 	found, ok := s.profiles[profile]
 	if !ok {
-		found = &profileCache{creds: Credentials{}, expires: time.Time{}, valid: false}
+		found = &profileCache{creds: Credentials{}, expires: time.Time{}, valid: false, generation: 0}
 		s.profiles[profile] = found
 	}
 

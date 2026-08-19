@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
 // maxErrorBodyBytes caps how much of an upstream error body a record keeps. The
@@ -101,7 +103,7 @@ func (r Record) Validate() error {
 	default:
 		return errors.New("ledger record has an invalid credential_class")
 	}
-	if err := validateAttribution(r.Context); err != nil {
+	if err := validateContextName(r.Context); err != nil {
 		return err
 	}
 	if r.Timestamp.IsZero() {
@@ -119,27 +121,22 @@ func (r Record) Validate() error {
 	return nil
 }
 
-// validateAttribution checks a record's context name. An absent one is
+// validateContextName checks a record's context name. An absent one is
 // accepted: records written before contexts existed carry neither attribution
 // field, and a ledger that refused to read its own history would be a worse
 // failure than a missing field. The leniency is read-side only — the pipeline
 // always populates both fields, so nothing new is written this shape.
 //
-// A name that IS present is held to the shape a context name has, so a value
-// that could only have come from somewhere other than a resolved context is
-// refused rather than stored.
-func validateAttribution(name string) error {
+// A name that IS present is held to the registry's own rule, by calling it, so
+// a value that could only have come from somewhere other than a resolved
+// context is refused rather than stored.
+func validateContextName(name string) error {
 	if name == "" {
 		return nil
 	}
 
-	for _, char := range name {
-		lower := char >= 'a' && char <= 'z'
-		digit := char >= '0' && char <= '9'
-
-		if !lower && !digit && char != '-' {
-			return fmt.Errorf("ledger record has an invalid context %q", name)
-		}
+	if err := registry.ValidContextName(name); err != nil {
+		return fmt.Errorf("ledger record has an invalid context %q", name)
 	}
 
 	return nil

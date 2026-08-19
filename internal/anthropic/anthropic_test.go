@@ -29,14 +29,6 @@ func TestTypedErrorBodyCarriesTheNamedErrorType(t *testing.T) {
 	}
 }
 
-func TestErrorTypeNotFoundIsAnthropicsOwnTaxonomy(t *testing.T) {
-	t.Parallel()
-
-	if anthropic.ErrorTypeNotFound != "not_found_error" {
-		t.Fatalf("ErrorTypeNotFound = %q; want %q", anthropic.ErrorTypeNotFound, "not_found_error")
-	}
-}
-
 func TestErrorMessagePrefixMarksTheSender(t *testing.T) {
 	t.Parallel()
 

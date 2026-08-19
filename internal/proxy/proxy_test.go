@@ -5,11 +5,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/joshsymonds/patchbay/internal/proxy"
+	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
 // fidelityBody is the awkward request body D2 must forward untouched: already
@@ -845,5 +848,58 @@ func assertGatewayError(t *testing.T, body []byte) {
 	message, isString := detail["message"].(string)
 	if !isString || !strings.HasPrefix(message, "patchbay: ") {
 		t.Errorf("error.message = %v, want a patchbay-prefixed message", detail["message"])
+	}
+}
+
+// The HTTP surface resolves a request's context once, before anything
+// dispatches on it, and the pipeline forwards by that resolution. A registry
+// file replaced while the request is in flight must not move it: half a request
+// served from one document and half from the next is exactly the race the
+// single resolution closes.
+func TestPipelineForwardsByTheAttachedResolution(t *testing.T) {
+	first := newUpstream(t, jsonHandler(http.StatusOK, `{"id":"msg_first","content":[]}`))
+	second := newUpstream(t, jsonHandler(http.StatusOK, `{"id":"msg_second","content":[]}`))
+
+	writeKeyFile(t, "sk-upstream")
+
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistryFile(t, path, identityRoute(first.server.URL))
+
+	reg := registry.New(path)
+
+	res, err := reg.Resolve(registry.Selection{Name: registry.PersonalContext, Explicit: false}, "")
+	if err != nil {
+		t.Fatalf("Resolve() = %v; want the personal context", err)
+	}
+
+	// The file moves to a different upstream between the resolution and the
+	// forward, exactly as a home-manager rebuild would.
+	writeRegistryFile(t, path, identityRoute(second.server.URL))
+
+	req := messagesRequest(`{"model":"` + echoAlias + `","max_tokens":4}`)
+	req = req.WithContext(registry.WithResolution(req.Context(), res))
+
+	answer := serve(t, proxy.Config{Registry: reg, Host: testHost}, req)
+
+	if answer.Code != http.StatusOK {
+		t.Fatalf("status = %d (%s); want 200", answer.Code, answer.Body.String())
+	}
+
+	if first.hits() != 1 {
+		t.Fatalf("the resolved upstream saw %d requests; want the one this request resolved to", first.hits())
+	}
+
+	if second.hits() != 0 {
+		t.Fatalf("the reloaded upstream saw %d requests; a request never changes documents mid-flight",
+			second.hits())
+	}
+}
+
+// writeRegistryFile writes a registry file holding one personal-context route.
+func writeRegistryFile(t *testing.T, path, route string) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(`{"contexts":{"personal":{"routes":{`+route+`}}}}`), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
 	}
 }

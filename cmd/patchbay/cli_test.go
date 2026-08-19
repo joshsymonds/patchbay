@@ -138,10 +138,23 @@ func sampleDocument() server.Document {
 				DefaultRoute: server.RouteSummary{
 					Auth:            string(registry.AuthSigV4),
 					Upstream:        "https://bedrock-runtime.us-west-2.amazonaws.com",
+					AWSProfile:      "work-bedrock",
+					AWSRegion:       "us-west-2",
 					ModelMapEnvFile: "PATCHBAY_MODEL_MAP",
 					ModelMapFile:    "/run/agenix/bedrock-models.json",
 				},
-				Routes: map[string]server.RouteSummary{},
+				Routes: map[string]server.RouteSummary{
+					"bedrock/opus": {
+						Auth:            string(registry.AuthSigV4),
+						Upstream:        "https://bedrock-runtime.us-west-2.amazonaws.com",
+						Model:           "claude-opus-4-5",
+						MaxInputTokens:  200000,
+						AWSProfile:      "work-bedrock",
+						AWSRegion:       "us-west-2",
+						ModelMapEnvFile: "PATCHBAY_MODEL_MAP",
+						ModelMapFile:    "/run/agenix/bedrock-models.json",
+					},
+				},
 			},
 		},
 	}
@@ -387,7 +400,7 @@ func TestRoutesListsOneContext(t *testing.T) {
 		t.Fatalf("stdout = %q; the routes table names the variable, not the file", got.stdout)
 	}
 
-	// The work context is named explicitly, and has no aliases at all.
+	// The work context is named explicitly, and answers with its own aliases.
 	got = invoke(t, daemon.env(), "routes", "--ctx", "work")
 	if got.code != exitOK {
 		t.Fatalf("routes --ctx work code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
@@ -395,6 +408,18 @@ func TestRoutesListsOneContext(t *testing.T) {
 
 	if strings.Contains(got.stdout, "luna-fast") {
 		t.Fatalf("stdout = %q; want nothing from the personal context", got.stdout)
+	}
+
+	// A signing route pays with AWS credentials the gateway exports for a
+	// profile, so the profile is what its credential source names — there is no
+	// environment variable holding that key, and the model map is not one.
+	bedrock := lineFor(t, got.stdout, "bedrock/opus")
+	if !strings.Contains(bedrock, "aws profile work-bedrock") {
+		t.Fatalf("bedrock/opus row = %q; want it to name the AWS profile it pays with", bedrock)
+	}
+
+	if strings.Contains(bedrock, "PATCHBAY_MODEL_MAP") {
+		t.Fatalf("bedrock/opus row = %q; the model map is not what the route pays with", bedrock)
 	}
 }
 
@@ -707,4 +732,45 @@ func TestProjectToleratesAMalformedSettingsFile(t *testing.T) {
 
 	got.contains(t, "stderr", broken)
 	got.contains(t, "stdout", "context: work")
+}
+
+// A base URL ending at the bare context prefix names no context of its own.
+// Claude Code appends its own endpoint path to it, so the gateway reads the
+// first segment of THAT — "v1" — as the context name and refuses it. The
+// command has to diagnose exactly what the gateway would do, which is why it
+// splits the path with the gateway's own code rather than a second copy of the
+// rule.
+func TestProjectDiagnosesABareContextPrefix(t *testing.T) {
+	callerKeyFile(t, testCallerKey)
+
+	daemon := newFakeDaemon(t, sampleDocument())
+	dir := t.TempDir()
+	projectDir(t, dir, "settings.json", settingsBody("http://"+daemon.addr+"/ctx"))
+
+	env := daemon.env()
+	env[envHome] = t.TempDir()
+
+	got := invoke(t, env, "project", dir)
+	if got.code != exitFailure {
+		t.Fatalf("code = %d; want %d for a base URL that names a context nothing serves", got.code, exitFailure)
+	}
+
+	got.contains(t, "stdout", "context: v1")
+	got.contains(t, "stderr", "v1")
+}
+
+// check validates the registry patchbay actually ships as its example, and says
+// exactly what the documentation says it says.
+func TestCheckValidatesTheShippedExampleRegistry(t *testing.T) {
+	const example = "../../examples/routes.json"
+
+	got := invoke(t, nil, "check", "--registry", example)
+	if got.code != exitOK {
+		t.Fatalf("code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
+	}
+
+	want := "OK " + example + ": 2 contexts (personal, work), 4 routes\n"
+	if got.stdout != want {
+		t.Fatalf("stdout = %q; want %q", got.stdout, want)
+	}
 }

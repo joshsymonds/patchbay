@@ -91,7 +91,7 @@ func bare(t *testing.T, reg *registry.Registry, model string) registry.Route {
 func bareAliases(t *testing.T, reg *registry.Registry) []registry.Route {
 	t.Helper()
 
-	return resolve(t, reg, registry.Selection{}, "").Aliases
+	return resolve(t, reg, registry.Selection{}, "").Aliases()
 }
 
 // assertDefault fails unless resolving model yields exactly the built-in route.
@@ -854,7 +854,7 @@ func TestResolveCarriesTheContextDefaultAndAliases(t *testing.T) {
 			personal.DefaultRoute, registry.DefaultRoute())
 	}
 
-	if got := aliasNames(personal.Aliases); !reflect.DeepEqual(got, []string{"luna-fast"}) {
+	if got := aliasNames(personal.Aliases()); !reflect.DeepEqual(got, []string{"luna-fast"}) {
 		t.Fatalf("personal Aliases = %v; want [luna-fast]", got)
 	}
 
@@ -865,7 +865,7 @@ func TestResolveCarriesTheContextDefaultAndAliases(t *testing.T) {
 		t.Fatalf("work DefaultRoute = %+v; want the declared inject default", work.DefaultRoute)
 	}
 
-	if got := aliasNames(work.Aliases); !reflect.DeepEqual(got, []string{"deepseek-flash-low", "openrouter/sol"}) {
+	if got := aliasNames(work.Aliases()); !reflect.DeepEqual(got, []string{"deepseek-flash-low", "openrouter/sol"}) {
 		t.Fatalf("work Aliases = %v; want the work context's own aliases sorted", got)
 	}
 }

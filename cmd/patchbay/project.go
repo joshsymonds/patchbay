@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/joshsymonds/patchbay/internal/registry"
+	"github.com/joshsymonds/patchbay/internal/server"
 )
 
 // The Claude Code settings chain, most local first. A setting in the local file
@@ -28,10 +29,11 @@ const (
 // Code at patchbay, under the file's own "env" object.
 const baseURLKey = "ANTHROPIC_BASE_URL"
 
-// contextPathPrefix is how a base URL names the context it selects. A URL
-// without one selects the personal context, which is what Claude Code sends
-// when it has never heard of contexts at all.
-const contextPathPrefix = "/ctx/"
+// claudeEndpoint is the path Claude Code appends to whatever base URL it is
+// given. The context a directory ends up in is the one the gateway would read
+// out of THAT path, not out of the base URL alone — which is what makes a base
+// URL ending at the bare "/ctx" select the context "v1".
+const claudeEndpoint = "/v1/messages"
 
 // settingsSource is one file in the chain: where it is, what it had to say
 // about the base URL, and the base URL itself when it set one.
@@ -208,20 +210,8 @@ func (c cli) selectedContext(base, addr string) (string, int) {
 		c.noticef("%s points at %s, which is not the gateway this command asks (%s)", baseURLKey, parsed.Host, addr)
 	}
 
-	return contextFromPath(parsed.Path), exitOK
-}
-
-// contextFromPath reads the context a base URL's path names. A path with no
-// prefix selects the personal context implicitly; a prefix naming nothing
-// selects a context by the empty name, which no gateway serves and which is
-// reported as the refusal it would be.
-func contextFromPath(path string) string {
-	after, found := strings.CutPrefix(path, contextPathPrefix)
-	if !found {
-		return registry.PersonalContext
-	}
-
-	name, _, _ := strings.Cut(after, "/")
-
-	return name
+	// Split by the gateway's own code, on the path a request to this base URL
+	// would actually carry, so this can never diagnose a base URL differently
+	// from the gateway that has to serve it.
+	return server.ContextFromPath(strings.TrimSuffix(parsed.Path, "/") + claudeEndpoint), exitOK
 }

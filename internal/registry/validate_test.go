@@ -617,6 +617,51 @@ func TestValidateSigV4FieldPairing(t *testing.T) {
 			wants: []string{`"probe"`, "sigv4", "model_map_env_file"},
 		},
 		{
+			name:  "sigv4 with a hostile aws_region rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2.example.com/x?",` +
+				`"model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "aws_region", "us-east-2.example.com/x?"},
+		},
+		{
+			name:  "sigv4 with an uppercase aws_region rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"US-EAST-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "aws_region"},
+		},
+		{
+			name:  "sigv4 with a dotted aws_region rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us.east.2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "aws_region"},
+		},
+		{
+			name:  "sigv4 with a spaced aws_profile rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work bedrock","aws_region":"us-east-2",` +
+				`"model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "aws_profile", "work bedrock"},
+		},
+		{
+			name:  "sigv4 with a slashed aws_profile rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"../other","aws_region":"us-east-2",` +
+				`"model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "aws_profile"},
+		},
+		{
+			name:  "sigv4 with an uppercase aws_profile rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"Work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{`"probe"`, "aws_profile"},
+		},
+		{
+			name:  "sigv4 with dots and underscores in aws_profile accepted",
+			alias: "bedrock/dots",
+			route: `{"auth":"sigv4","aws_profile":"work_bedrock.prod-1","aws_region":"us-east-2",` +
+				`"model_map_env_file":"MAP_FILE"}`,
+		},
+		{
 			name:  "sigv4 with a base_url rejected",
 			alias: "probe",
 			route: `{"base_url":"https://bedrock-runtime.us-east-2.amazonaws.com","auth":"sigv4",` +
@@ -693,5 +738,37 @@ func TestSigV4RouteFieldsResolve(t *testing.T) {
 
 	if route.ModelMapEnvFile != "MAP_FILE" {
 		t.Errorf("ModelMapEnvFile = %q; want %q", route.ModelMapEnvFile, "MAP_FILE")
+	}
+}
+
+// The context-name rule is declared once and exported, because the ledger holds
+// a stored context name to exactly the same shape before accepting a record. A
+// second copy of the rule is how the two ends drift.
+func TestValidContextNameIsTheOneSharedRule(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		context string
+		wantErr bool
+	}{
+		{name: "lowercase", context: "personal", wantErr: false},
+		{name: "digits and dashes", context: "work-eu-2", wantErr: false},
+		{name: "uppercase", context: "Work", wantErr: true},
+		{name: "slash", context: "work/eu", wantErr: true},
+		{name: "traversal", context: "..", wantErr: true},
+		{name: "space", context: "work eu", wantErr: true},
+		{name: "underscore", context: "work_eu", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := registry.ValidContextName(tc.context)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ValidContextName(%q) = %v; wantErr %v", tc.context, err, tc.wantErr)
+			}
+		})
 	}
 }

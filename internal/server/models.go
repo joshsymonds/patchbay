@@ -7,6 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
 
 	"github.com/joshsymonds/patchbay/internal/anthropic"
 	"github.com/joshsymonds/patchbay/internal/registry"
@@ -72,9 +75,15 @@ type upstreamEntry struct {
 // listing costs the upstream half and is logged; the caller still gets the
 // aliases, with 200.
 func (gw *gateway) listModels(w http.ResponseWriter, r *http.Request) {
-	res, err := gw.registry.Resolve(registry.SelectionFrom(r.Context()), "")
+	res, err := gw.resolution(r)
 	if err != nil {
 		gw.writeUnknownContext(r.Context(), w, err)
+
+		return
+	}
+
+	if status, keyErr := gw.checkContextKey(r); keyErr != nil {
+		gw.writeError(r.Context(), w, status, keyErr)
 
 		return
 	}
@@ -83,22 +92,24 @@ func (gw *gateway) listModels(w http.ResponseWriter, r *http.Request) {
 		gw.warnRegistry(r.Context(), regErr)
 	}
 
+	aliases := res.Aliases()
+
 	if !answersFromAnthropic(res.DefaultRoute) {
-		gw.writeJSON(r.Context(), w, synthesizedList(res))
+		gw.writeJSON(r.Context(), w, gw.synthesizedList(r, res, aliases))
 
 		return
 	}
 
-	data := make([]any, 0, len(res.Aliases))
-	ids := make([]string, 0, len(res.Aliases))
-	claimed := make(map[string]bool, len(res.Aliases))
+	data := make([]any, 0, len(aliases))
+	ids := make([]string, 0, len(aliases))
+	claimed := make(map[string]bool, len(aliases))
 
 	// The alias page is only ever the first page. A request carrying a
 	// pagination cursor is asking the upstream for a later page, so prepending
 	// the aliases again would repeat them on every page and report an alias as
 	// that page's first_id. Skip them and let the upstream's own page stand.
 	if !r.URL.Query().Has("after_id") {
-		for _, route := range res.Aliases {
+		for _, route := range aliases {
 			data = append(data, aliasEntry(route))
 			ids = append(ids, route.Alias)
 			claimed[route.Alias] = true
@@ -128,44 +139,126 @@ func answersFromAnthropic(route registry.Route) bool {
 }
 
 // synthesizedList is the whole listing for a context that never reaches
-// Anthropic: its aliases, then the model its default route rewrites to. A
-// default route that rewrites nothing has no model id to advertise and
-// contributes no entry, because the gateway will not invent one.
-func synthesizedList(res registry.Resolution) modelList {
-	data := make([]any, 0, len(res.Aliases)+1)
-	ids := make([]string, 0, len(res.Aliases)+1)
-	claimed := make(map[string]bool, len(res.Aliases))
+// Anthropic: its aliases, then every model its default route serves.
+func (gw *gateway) synthesizedList(r *http.Request, res registry.Resolution, aliases []registry.Route) modelList {
+	data := make([]any, 0, len(aliases)+1)
+	ids := make([]string, 0, len(aliases)+1)
+	claimed := make(map[string]bool, len(aliases))
 
-	for _, route := range res.Aliases {
+	for _, route := range aliases {
 		data = append(data, aliasEntry(route))
 		ids = append(ids, route.Alias)
 		claimed[route.Alias] = true
 	}
 
-	if model := res.DefaultRoute.Model; model != "" && !claimed[model] {
-		data = append(data, defaultEntry(res.DefaultRoute))
+	for _, model := range gw.defaultModels(r, res.DefaultRoute) {
+		if claimed[model] {
+			continue
+		}
+
+		data = append(data, routeEntry(res.DefaultRoute, model))
 		ids = append(ids, model)
+		claimed[model] = true
 	}
 
 	return mergedList(data, ids, upstreamListing{Data: nil, HasMore: false, LastID: nil})
 }
 
+// defaultModels is every model id a caller may name and actually reach a
+// context's default route by, in order.
+//
+// A route that rewrites to one model advertises that one; a route that rewrites
+// nothing has no model id to advertise and contributes none, because the gateway
+// will not invent one.
+//
+// A sigv4 route is the interesting case: it serves exactly the models its model
+// map has entries for, and the ids a caller may name are that map's KEYS. The
+// values are Bedrock model ids — the one thing the map file exists to keep out
+// of sight — so they are never listed. A map that cannot be read costs the
+// listing nothing but those entries: the aliases still stand.
+func (gw *gateway) defaultModels(r *http.Request, route registry.Route) []string {
+	if route.Auth != registry.AuthSigV4 {
+		if route.Model == "" {
+			return nil
+		}
+
+		return []string{route.Model}
+	}
+
+	mapping, err := readModelMap(route.ModelMapEnvFile)
+	if err != nil {
+		gw.logger.WarnContext(r.Context(), "model map unavailable; a sigv4 context lists only its aliases",
+			slog.Any("error", err))
+
+		return nil
+	}
+
+	models := make([]string, 0, len(mapping))
+
+	for model, target := range mapping {
+		// An entry mapping to nothing is one the pipeline refuses, so listing it
+		// would advertise a model this context cannot actually reach.
+		if target != "" {
+			models = append(models, model)
+		}
+	}
+
+	slices.Sort(models)
+
+	return models
+}
+
+// readModelMap resolves the double indirection a sigv4 route names its model
+// map with: envName is the name of an environment variable whose value is the
+// path of a JSON file mapping the model ids a caller may name to the Bedrock
+// ones they ride. It is read per request, the same way the pipeline reads it, so
+// a listing describes the file as it stands now.
+func readModelMap(envName string) (map[string]string, error) {
+	path := os.Getenv(envName)
+	if path == "" {
+		return nil, fmt.Errorf("environment variable %s is not set", envName)
+	}
+
+	contents, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("read the model map named by %s: %w", envName, err)
+	}
+
+	var mapping map[string]string
+	if decodeErr := json.Unmarshal(contents, &mapping); decodeErr != nil {
+		return nil, fmt.Errorf("decode the model map named by %s: %w", envName, decodeErr)
+	}
+
+	return mapping, nil
+}
+
 // showModel answers GET /v1/models/{id} for the context the request selected.
-// An alias that context serves is described from the registry; anything else is
-// the upstream's to answer, and its reply — a model, a 404, a rejected key — is
-// relayed exactly as it came back. The upstream's own answer is the honest one,
-// so patchbay never substitutes a guess for it.
+//
+// An alias that context serves is described from the registry. Anything else
+// depends on where the context's default route rides, exactly as the listing
+// does: a context that still answers from Anthropic leaves the rest to the
+// upstream, whose reply — a model, a 404, a rejected key — is relayed exactly as
+// it came back, because the upstream's own answer is the honest one. A context
+// that never reaches Anthropic is answered here or not at all: Anthropic has
+// nothing to say about a model it will never be asked for, and asking it would
+// describe a model this context cannot reach.
 func (gw *gateway) showModel(w http.ResponseWriter, r *http.Request) {
-	res, err := gw.registry.Resolve(registry.SelectionFrom(r.Context()), "")
+	res, err := gw.resolution(r)
 	if err != nil {
 		gw.writeUnknownContext(r.Context(), w, err)
 
 		return
 	}
 
+	if status, keyErr := gw.checkContextKey(r); keyErr != nil {
+		gw.writeError(r.Context(), w, status, keyErr)
+
+		return
+	}
+
 	id := r.PathValue("id")
 
-	for _, route := range res.Aliases {
+	for _, route := range res.Aliases() {
 		if route.Alias == id {
 			gw.writeJSON(r.Context(), w, aliasEntry(route))
 
@@ -173,7 +266,54 @@ func (gw *gateway) showModel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	gw.relayModel(w, r)
+	if answersFromAnthropic(res.DefaultRoute) {
+		gw.relayModel(w, r)
+
+		return
+	}
+
+	if slices.Contains(gw.defaultModels(r, res.DefaultRoute), id) {
+		gw.writeJSON(r.Context(), w, routeEntry(res.DefaultRoute, id))
+
+		return
+	}
+
+	gw.writeTyped(r.Context(), w, http.StatusNotFound, anthropic.ErrorTypeNotFound,
+		fmt.Errorf("context %q serves no model %q", res.Context, id))
+}
+
+// resolution is the one resolution this request made. The HTTP surface resolves
+// the context before anything dispatches on it and attaches the result, so a
+// handler reads that rather than asking the registry a second question it might
+// answer from a different file.
+func (gw *gateway) resolution(r *http.Request) (registry.Resolution, error) {
+	if res, ok := registry.ResolutionFrom(r.Context()); ok {
+		return res, nil
+	}
+
+	res, err := gw.registry.Resolve(registry.SelectionFrom(r.Context()), "")
+	if err != nil {
+		return res, fmt.Errorf("resolve the request context: %w", err)
+	}
+
+	return res, nil
+}
+
+// checkContextKey gates the model endpoints for a request that named a context
+// in its own path, with the same caller key — and the same 403 and 500 — the
+// introspection endpoint is gated on. Naming a context is asking what some other
+// world of this machine's serves, which is the thing that key exists to protect.
+//
+// The bare path is deliberately not gated: it is what Claude Code sends, with no
+// idea patchbay is there, and a /v1/models it cannot answer is a broken client.
+// It describes only the personal context, which is the one the caller was
+// already riding.
+func (gw *gateway) checkContextKey(r *http.Request) (int, error) {
+	if !registry.SelectionFrom(r.Context()).Explicit {
+		return http.StatusOK, nil
+	}
+
+	return gw.checkCallerKey(r)
 }
 
 // relayModel forwards a single-model lookup to Anthropic with the caller's
@@ -369,14 +509,14 @@ func aliasEntry(route registry.Route) modelEntry {
 	}
 }
 
-// defaultEntry renders a context's default route as a listing entry. Its id is
-// the model it rewrites to, which is the only name a caller can ask for and
-// actually reach it by.
-func defaultEntry(route registry.Route) modelEntry {
+// routeEntry renders one model a route serves as a listing entry, under the id
+// a caller may actually name to reach it. The ceilings are the route's own: they
+// are what the request will be held to whichever of its models is asked for.
+func routeEntry(route registry.Route, model string) modelEntry {
 	return modelEntry{
 		Type:           "model",
-		ID:             route.Model,
-		DisplayName:    route.Model,
+		ID:             model,
+		DisplayName:    model,
 		CreatedAt:      epochCreatedAt,
 		MaxInputTokens: route.MaxInputTokens,
 		MaxTokens:      route.MaxOutputTokens,

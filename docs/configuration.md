@@ -114,8 +114,8 @@ violation fails the whole document.
 |---|---|---|---|
 | `base_url` | **required**, and must be exactly `https://api.anthropic.com` | required, `https` (or `http` for loopback) | **forbidden** — the endpoint is derived from `aws_region` |
 | `api_key_env_file` | **forbidden** | **required**, non-empty | **forbidden** |
-| `aws_profile` | forbidden | forbidden | **required**, non-blank |
-| `aws_region` | forbidden | forbidden | **required**, non-blank |
+| `aws_profile` | forbidden | forbidden | **required**, non-blank, and only lowercase letters, digits, dashes, dots and underscores |
+| `aws_region` | forbidden | forbidden | **required**, non-blank, and only lowercase letters, digits and dashes |
 | `model_map_env_file` | forbidden | forbidden | **required**, non-blank |
 | `claude` in the alias or in `model` | allowed | **forbidden** (case-insensitive) | allowed |
 
@@ -172,11 +172,17 @@ would be worse than refusing.
 | Path | Answered by |
 |---|---|
 | `GET`/`HEAD` `/_patchbay/registry` | patchbay, gated on the caller key. Returns the routing document the CLI reads. Another method → 405 with `Allow`; any other path under `/_patchbay/` → 404. |
-| `GET /v1/models` | patchbay: the selected context's aliases, then the models the caller's own credentials can see from Anthropic, minus any id an alias already claims. A context whose default route does not forward to Anthropic gets a listing synthesized entirely from the registry. Never fails — an unreachable upstream costs the upstream half and logs a warning. |
-| `GET /v1/models/{id}` | patchbay when `{id}` is an alias in the selected context; otherwise relayed to Anthropic with the caller's credentials and returned verbatim. |
+| `GET /v1/models` | patchbay: the selected context's aliases, then the models the caller's own credentials can see from Anthropic, minus any id an alias already claims. A context whose default route does not forward to Anthropic gets a listing synthesized entirely from the registry — for a `sigv4` default route that is the KEYS of its model map, never the Bedrock ids they map to. Never fails — an unreachable upstream costs the upstream half and logs a warning. |
+| `GET /v1/models/{id}` | patchbay when `{id}` is an alias in the selected context, or a model the context's non-forwarding default route serves. Otherwise: relayed to Anthropic with the caller's credentials and returned verbatim when the context still forwards there, and 404 `not_found_error` when it does not — a context that never reaches Anthropic is never described by it. |
 | everything else | The proxy pipeline, including `/v1/messages`, `/v1/messages/count_tokens`, these two paths under any other method, and every endpoint patchbay has never heard of. |
 
 Neither model endpoint writes a ledger record: nothing was proxied.
+
+Both model endpoints are gated on the caller key when the path NAMES a context
+(`/ctx/<name>/v1/models`), with the same 403 and 500 `/_patchbay/registry` gives:
+asking what another world of this machine serves is what that key protects. The
+bare path is never gated — it is what Claude Code sends knowing nothing about
+patchbay, and it describes only the context that caller was already riding.
 
 ## Limits
 

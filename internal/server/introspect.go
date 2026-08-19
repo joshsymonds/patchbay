@@ -55,6 +55,8 @@ type RouteSummary struct {
 	Upstream        string `json:"upstream"`
 	Model           string `json:"model,omitempty"`
 	MaxInputTokens  int    `json:"max_input_tokens,omitempty"`
+	AWSProfile      string `json:"aws_profile,omitempty"`
+	AWSRegion       string `json:"aws_region,omitempty"`
 	KeyEnvFile      string `json:"api_key_env_file,omitempty"`
 	KeyFile         string `json:"api_key_file,omitempty"`
 	ModelMapEnvFile string `json:"model_map_env_file,omitempty"`
@@ -123,12 +125,13 @@ func (gw *gateway) document() Document {
 	}
 
 	for _, res := range contexts {
+		aliases := res.Aliases()
 		summary := ContextSummary{
 			DefaultRoute: routeSummary(res.DefaultRoute),
-			Routes:       make(map[string]RouteSummary, len(res.Aliases)),
+			Routes:       make(map[string]RouteSummary, len(aliases)),
 		}
 
-		for _, route := range res.Aliases {
+		for _, route := range aliases {
 			summary.Routes[route.Alias] = routeSummary(route)
 		}
 
@@ -143,12 +146,19 @@ func (gw *gateway) document() Document {
 // currently resolves to — because an operator chasing a misconfiguration needs
 // to know both which variable was consulted and what it pointed at. Neither
 // file is ever opened here.
+//
+// The AWS profile and region a signing route uses are named too. Neither is a
+// secret — a profile is a name in the operator's own ~/.aws config, and the
+// region is already visible in the upstream this reports — and they are the two
+// things a refused signature is diagnosed from.
 func routeSummary(route registry.Route) RouteSummary {
 	summary := RouteSummary{
 		Auth:            string(route.Auth),
 		Upstream:        route.Upstream(),
 		Model:           route.Model,
 		MaxInputTokens:  route.MaxInputTokens,
+		AWSProfile:      route.AWSProfile,
+		AWSRegion:       route.AWSRegion,
 		KeyEnvFile:      route.APIKeyEnvFile,
 		KeyFile:         "",
 		ModelMapEnvFile: route.ModelMapEnvFile,

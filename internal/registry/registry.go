@@ -71,14 +71,58 @@ type Resolution struct {
 	// declared one, otherwise the built-in.
 	DefaultRoute Route
 
-	// Aliases is every route the context defines, sorted by alias. It is the
-	// caller's own copy, so nothing a caller does to it reaches the registry.
-	Aliases []Route
+	// routes is every route the context defines, held as the registry's own map
+	// and never handed out. Aliases builds the caller's copy from it, and only
+	// when something actually reads the list — a proxied turn never does.
+	routes map[string]Route
 }
 
-// selectionKey is the private type of the request-context key a Selection is
-// carried under, so no other package can collide with it.
-type selectionKey struct{}
+// Aliases returns every route the context defines, sorted by alias, as the
+// caller's own copy: nothing a caller does to it, or to the extra_body bytes
+// inside it, reaches the registry.
+//
+// It is built on demand rather than at resolution time because only the model
+// endpoints and the introspection document ever read it. A proxied turn resolves
+// one route and forwards it, and must not pay to clone and sort a list nobody
+// looks at.
+func (res Resolution) Aliases() []Route {
+	aliases := make([]Route, 0, len(res.routes))
+
+	for _, route := range res.routes {
+		// The struct copy still points at the registry's own extra_body bytes,
+		// which every later request on this alias merges from. Cloning them is
+		// what makes the isolation above true rather than nearly true.
+		route.ExtraBody = bytes.Clone(route.ExtraBody)
+		aliases = append(aliases, route)
+	}
+
+	slices.SortFunc(aliases, func(a, b Route) int { return cmp.Compare(a.Alias, b.Alias) })
+
+	return aliases
+}
+
+// Select returns the resolution with Route set to the one serving model — the
+// context's own alias for it, or the default route when no alias claims it.
+//
+// It is how a request that has already resolved its context picks its route
+// without asking the registry a second time: one resolution per request, so a
+// registry file replaced mid-request cannot serve one half of that request from
+// one document and the other half from the next.
+func (res Resolution) Select(model string) Resolution {
+	if route, matched := res.routes[model]; matched {
+		res.Route = route
+	}
+
+	return res
+}
+
+// selectionKey and resolutionKey are the private types of the request-context
+// keys a Selection and a Resolution are carried under, so no other package can
+// collide with them.
+type (
+	selectionKey  struct{}
+	resolutionKey struct{}
+)
 
 // Registry resolves requests against a registry file, reloading it when the
 // file changes. It is safe for concurrent use.
@@ -115,6 +159,22 @@ func SelectionFrom(ctx context.Context) Selection {
 	return Selection{Name: PersonalContext, Explicit: false}
 }
 
+// WithResolution returns ctx carrying res, so the one resolution a request made
+// is the one every handler downstream of it forwards, lists and records by.
+func WithResolution(ctx context.Context, res Resolution) context.Context {
+	return context.WithValue(ctx, resolutionKey{}, res)
+}
+
+// ResolutionFrom returns the resolution ctx carries, and whether it carries
+// one. A request that reached a handler without passing through the surface
+// that resolves — a pipeline driven directly — carries none, and the handler
+// resolves for itself.
+func ResolutionFrom(ctx context.Context) (Resolution, bool) {
+	res, ok := ctx.Value(resolutionKey{}).(Resolution)
+
+	return res, ok
+}
+
 // Resolve returns the route serving model inside the selected context, with
 // that context's own metadata alongside it. Aliases match as whole opaque
 // strings, so a namespaced key like "openrouter/sol" resolves the same way any
@@ -147,13 +207,7 @@ func (r *Registry) Resolve(sel Selection, model string) (Resolution, error) {
 		return Resolution{Context: name}, fmt.Errorf("%w %q", ErrUnknownContext, name)
 	}
 
-	res := resolution(name, found, ok)
-
-	if route, matched := found.Routes[model]; matched {
-		res.Route = route
-	}
-
-	return res, nil
+	return resolution(name, found, ok).Select(model), nil
 }
 
 // Contexts returns every context the registry currently serves, sorted by name,
@@ -240,13 +294,18 @@ func (r *Registry) refresh() {
 // resolution describes one context: the one the file defines under name, or —
 // when found is not a loaded context — the built-in world a bare request rides
 // when the registry has nothing to add.
+//
+// The route map it carries is the loaded document's own. A load builds fresh
+// maps and swaps them in whole, so a map handed out here is never written to
+// again and a Resolution outliving a reload keeps describing the document it
+// was resolved against.
 func resolution(name string, found Context, ok bool) Resolution {
 	if !ok {
 		return Resolution{
 			Context:      name,
 			Route:        DefaultRoute(),
 			DefaultRoute: DefaultRoute(),
-			Aliases:      []Route{},
+			routes:       nil,
 		}
 	}
 
@@ -254,26 +313,8 @@ func resolution(name string, found Context, ok bool) Resolution {
 		Context:      name,
 		Route:        found.DefaultRoute,
 		DefaultRoute: found.DefaultRoute,
-		Aliases:      aliasList(found.Routes),
+		routes:       found.Routes,
 	}
-}
-
-// aliasList returns a context's routes sorted by alias, as the caller's own
-// copy.
-func aliasList(routes map[string]Route) []Route {
-	aliases := make([]Route, 0, len(routes))
-
-	for _, route := range routes {
-		// The struct copy still points at the registry's own extra_body bytes,
-		// which every later request on this alias merges from. Cloning them is
-		// what makes the isolation above true rather than nearly true.
-		route.ExtraBody = bytes.Clone(route.ExtraBody)
-		aliases = append(aliases, route)
-	}
-
-	slices.SortFunc(aliases, func(a, b Route) int { return cmp.Compare(a.Alias, b.Alias) })
-
-	return aliases
 }
 
 // loadContexts reads, parses and validates the registry file. An absent file

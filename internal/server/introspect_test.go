@@ -184,6 +184,33 @@ func assertWorkContext(t *testing.T, summary server.ContextSummary) {
 	if route.ModelMapFile != "/run/agenix/bedrock-models.json" {
 		t.Fatalf("bedrock-opus model_map_file = %q; want the resolved path", route.ModelMapFile)
 	}
+
+	// The profile and the region are what the route pays and signs with, and
+	// they are the two things an operator chasing a Bedrock refusal needs to
+	// see. Neither is a secret: a profile NAME is not a credential.
+	if summary.DefaultRoute.AWSProfile != "prod" || summary.DefaultRoute.AWSRegion != "us-west-2" {
+		t.Fatalf("work default_route = %+v; want its AWS profile and region", summary.DefaultRoute)
+	}
+
+	if route.AWSProfile != "prod" || route.AWSRegion != "us-west-2" {
+		t.Fatalf("bedrock-opus summary = %+v; want its AWS profile and region", route)
+	}
+}
+
+// A route that signs with AWS names no profile or region unless it has one, so
+// nothing that does not sign reports an empty pair.
+func TestIntrospectionOmitsAWSFieldsForRoutesThatDoNotSign(t *testing.T) {
+	callerKeyFile(t)
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newRegistry(t, lunaRoute),
+		Listen:   listenAddr,
+	}, introspectRequest(introspectPath, callerKey))
+
+	if strings.Contains(rec.Body.String(), "aws_profile") || strings.Contains(rec.Body.String(), "aws_region") {
+		t.Fatalf("document = %s; an inject route signs nothing and names no AWS fields", rec.Body)
+	}
 }
 
 // assertNoSecrets fails if a document carries any value that only a secret file
@@ -312,7 +339,15 @@ func TestIntrospectionTellsTheDegradedTruth(t *testing.T) {
 func TestIntrospectionNeverForwardsItsOwnPaths(t *testing.T) {
 	callerKeyFile(t)
 
-	targets := []string{"/_patchbay", "/_patchbay/", "/_patchbay/other", "/_patchbay/registry/extra"}
+	// The prefix is patchbay's own under a context prefix too: a context cannot
+	// put an Anthropic endpoint under it, so "/ctx/<name>/_patchbay/..." is
+	// answered here — or refused for naming a context nobody serves — and is
+	// never forwarded as a request the caller did not make.
+	targets := []string{
+		"/_patchbay", "/_patchbay/", "/_patchbay/other", "/_patchbay/registry/extra",
+		"/ctx/personal/_patchbay/registry/extra", "/ctx/personal/_patchbay/other",
+		"/ctx/bogus/_patchbay/registry",
+	}
 
 	for _, target := range targets {
 		t.Run(target, func(t *testing.T) {
@@ -369,6 +404,45 @@ func TestIntrospectionMethods(t *testing.T) {
 
 			if proxied.hits() != 0 {
 				t.Fatalf("%s %s reached the proxy", tc.method, introspectPath)
+			}
+		})
+	}
+}
+
+// The introspection endpoint is patchbay's own under a context prefix too. The
+// context is resolved and stripped first, so the same document answers — and a
+// context nobody serves is refused before anything else looks at the path.
+func TestIntrospectionAnswersUnderAContextPrefix(t *testing.T) {
+	callerKeyFile(t)
+
+	tests := []struct {
+		name   string
+		target string
+		want   int
+	}{
+		{name: "a context the gateway serves", target: "/ctx/personal" + introspectPath, want: http.StatusOK},
+		{name: "a context it does not", target: "/ctx/bogus" + introspectPath, want: http.StatusNotFound},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proxied := newSentinel()
+			rec := serve(t, server.Config{
+				Proxy:    proxied,
+				Registry: newRegistry(t, lunaRoute),
+				Listen:   listenAddr,
+			}, introspectRequest(tc.target, callerKey))
+
+			if rec.Code != tc.want {
+				t.Fatalf("GET %s status = %d; want %d (body %s)", tc.target, rec.Code, tc.want, rec.Body)
+			}
+
+			if proxied.hits() != 0 {
+				t.Fatalf("GET %s reached the proxy; a /_patchbay path is never forwarded", tc.target)
+			}
+
+			if tc.want == http.StatusOK && decodeDocument(t, rec.Body.Bytes()).Listen != listenAddr {
+				t.Fatalf("document = %s; want the gateway's own routing", rec.Body)
 			}
 		})
 	}

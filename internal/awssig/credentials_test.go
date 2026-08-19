@@ -75,7 +75,7 @@ func callLog(t *testing.T, logPath string) []string {
 func TestCredentialsExportsFromTheProfile(t *testing.T) {
 	logPath := fakeAWS(t, exportBody("2099-01-01T00:00:00Z"))
 
-	creds, err := awssig.NewCredentialSource().Credentials(t.Context(), "work")
+	creds, _, err := awssig.NewCredentialSource().Credentials(t.Context(), "work")
 	if err != nil {
 		t.Fatalf("Credentials() = %v; want the exported credentials", err)
 	}
@@ -119,7 +119,7 @@ func TestCredentialsAreCachedAndRefreshed(t *testing.T) {
 			source := awssig.NewCredentialSource()
 
 			for range 3 {
-				if _, err := source.Credentials(t.Context(), "work"); err != nil {
+				if _, _, err := source.Credentials(t.Context(), "work"); err != nil {
 					t.Fatalf("Credentials() = %v; want the exported credentials", err)
 				}
 			}
@@ -141,7 +141,7 @@ func TestCredentialsRefreshInsideTheSkew(t *testing.T) {
 	source := awssig.NewCredentialSource()
 
 	for range 2 {
-		if _, err := source.Credentials(t.Context(), "work"); err != nil {
+		if _, _, err := source.Credentials(t.Context(), "work"); err != nil {
 			t.Fatalf("Credentials() = %v; want the exported credentials", err)
 		}
 	}
@@ -165,7 +165,7 @@ func TestCredentialsRefreshIsSingleFlight(t *testing.T) {
 		go func() {
 			defer group.Done()
 
-			if _, err := source.Credentials(t.Context(), "work"); err != nil {
+			if _, _, err := source.Credentials(t.Context(), "work"); err != nil {
 				t.Errorf("Credentials() = %v; want the exported credentials", err)
 			}
 		}()
@@ -184,13 +184,14 @@ func TestInvalidateForcesARefresh(t *testing.T) {
 	logPath := fakeAWS(t, exportBody("2099-01-01T00:00:00Z"))
 	source := awssig.NewCredentialSource()
 
-	if _, err := source.Credentials(t.Context(), "work"); err != nil {
+	_, generation, err := source.Credentials(t.Context(), "work")
+	if err != nil {
 		t.Fatalf("Credentials() = %v; want the exported credentials", err)
 	}
 
-	source.Invalidate("work")
+	source.Invalidate("work", generation)
 
-	if _, err := source.Credentials(t.Context(), "work"); err != nil {
+	if _, _, err := source.Credentials(t.Context(), "work"); err != nil {
 		t.Fatalf("Credentials() = %v; want the exported credentials", err)
 	}
 
@@ -206,7 +207,7 @@ func TestCredentialsAreCachedPerProfile(t *testing.T) {
 	source := awssig.NewCredentialSource()
 
 	for _, profile := range []string{"work", "personal", "work"} {
-		if _, err := source.Credentials(t.Context(), profile); err != nil {
+		if _, _, err := source.Credentials(t.Context(), profile); err != nil {
 			t.Fatalf("Credentials(%q) = %v; want the exported credentials", profile, err)
 		}
 	}
@@ -237,7 +238,7 @@ func TestCredentialsFailuresAreSanitized(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeAWS(t, tc.body)
 
-			_, err := awssig.NewCredentialSource().Credentials(t.Context(), "work")
+			_, _, err := awssig.NewCredentialSource().Credentials(t.Context(), "work")
 			if err == nil {
 				t.Fatal("Credentials() = nil; want an error")
 			}
@@ -256,7 +257,82 @@ func TestCredentialsFailuresAreSanitized(t *testing.T) {
 func TestCredentialsWithoutTheAWSBinary(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 
-	if _, err := awssig.NewCredentialSource().Credentials(t.Context(), "work"); err == nil {
+	if _, _, err := awssig.NewCredentialSource().Credentials(t.Context(), "work"); err == nil {
 		t.Fatal("Credentials() = nil; want an error when aws is not on PATH")
+	}
+}
+
+// A 403 invalidates the credential that SIGNED it, not whichever one the cache
+// holds by the time the refusal arrives. Without that, k concurrent turns that
+// all fail on one expired credential each throw away the fresh one the turn
+// before them just exported, and each pays for its own aws process.
+func TestInvalidateIgnoresAStaleGeneration(t *testing.T) {
+	// The export is slow enough that the goroutines below genuinely overlap it,
+	// which is the interleaving a per-request invalidation gets wrong.
+	logPath := fakeAWS(t, "sleep 0.2\n"+exportBody("2099-01-01T00:00:00Z"))
+	source := awssig.NewCredentialSource()
+
+	_, generation, err := source.Credentials(t.Context(), "work")
+	if err != nil {
+		t.Fatalf("Credentials() = %v; want the exported credentials", err)
+	}
+
+	var group sync.WaitGroup
+
+	for range 8 {
+		group.Add(1)
+
+		go func() {
+			defer group.Done()
+
+			// Every one of them was refused while signing with the same, now
+			// stale, credential.
+			source.Invalidate("work", generation)
+
+			if _, _, retryErr := source.Credentials(t.Context(), "work"); retryErr != nil {
+				t.Errorf("Credentials() = %v; want the exported credentials", retryErr)
+			}
+		}()
+	}
+
+	group.Wait()
+
+	if got := len(callLog(t, logPath)); got != 2 {
+		t.Errorf("aws ran %d times; want 2 — one export, then exactly one re-export", got)
+	}
+}
+
+// A generation nothing has refused leaves the cache alone, so a stale
+// invalidation cannot cost a credential that is still good.
+func TestInvalidateLeavesANewerGenerationAlone(t *testing.T) {
+	logPath := fakeAWS(t, exportBody("2099-01-01T00:00:00Z"))
+	source := awssig.NewCredentialSource()
+
+	_, first, err := source.Credentials(t.Context(), "work")
+	if err != nil {
+		t.Fatalf("Credentials() = %v; want the exported credentials", err)
+	}
+
+	source.Invalidate("work", first)
+
+	_, second, refreshErr := source.Credentials(t.Context(), "work")
+	if refreshErr != nil {
+		t.Fatalf("Credentials() = %v; want the exported credentials", refreshErr)
+	}
+
+	if second == first {
+		t.Fatalf("generation = %d after a refresh; want a new one", second)
+	}
+
+	// The refusal that produced `first` arrives late; the credential it names is
+	// gone, and the fresh one must survive it.
+	source.Invalidate("work", first)
+
+	if _, _, reuseErr := source.Credentials(t.Context(), "work"); reuseErr != nil {
+		t.Fatalf("Credentials() = %v; want the cached credentials", reuseErr)
+	}
+
+	if got := len(callLog(t, logPath)); got != 2 {
+		t.Errorf("aws ran %d times; want 2 — a stale invalidation exports nothing", got)
 	}
 }

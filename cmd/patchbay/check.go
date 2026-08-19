@@ -55,7 +55,7 @@ func (c cli) check(args []string) int {
 
 	for _, res := range contexts {
 		names = append(names, res.Context)
-		routes += len(res.Aliases)
+		routes += len(res.Aliases())
 	}
 
 	fmt.Fprintf(c.stdout, "OK %s: %s (%s), %s\n",
