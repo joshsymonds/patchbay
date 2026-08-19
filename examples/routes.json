@@ -1,0 +1,53 @@
+{
+  "contexts": {
+    "personal": {
+      "routes": {
+        "openrouter/kimi-k2": {
+          "auth": "inject",
+          "base_url": "https://openrouter.ai/api",
+          "model": "moonshotai/kimi-k2",
+          "api_key_env_file": "PATCHBAY_OPENROUTER_KEY_FILE",
+          "strip_cache_control": true,
+          "max_input_tokens": 262144,
+          "max_output_tokens": 32000
+        },
+        "openrouter/glm-4.6": {
+          "auth": "inject",
+          "base_url": "https://openrouter.ai/api",
+          "model": "z-ai/glm-4.6",
+          "api_key_env_file": "PATCHBAY_OPENROUTER_KEY_FILE",
+          "strip_cache_control": true,
+          "extra_body": {
+            "temperature": 0.6
+          },
+          "max_input_tokens": 200000,
+          "max_output_tokens": 32000,
+          "capture_bodies": false
+        }
+      }
+    },
+    "work": {
+      "default_route": {
+        "auth": "sigv4",
+        "aws_profile": "work-bedrock",
+        "aws_region": "us-west-2",
+        "model_map_env_file": "PATCHBAY_BEDROCK_MODEL_MAP_FILE"
+      },
+      "routes": {
+        "bedrock/opus": {
+          "auth": "sigv4",
+          "model": "claude-opus-4-5",
+          "aws_profile": "work-bedrock",
+          "aws_region": "us-west-2",
+          "model_map_env_file": "PATCHBAY_BEDROCK_MODEL_MAP_FILE",
+          "max_input_tokens": 200000,
+          "max_output_tokens": 64000
+        },
+        "anthropic-direct": {
+          "auth": "forward",
+          "base_url": "https://api.anthropic.com"
+        }
+      }
+    }
+  }
+}
