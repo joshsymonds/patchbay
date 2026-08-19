@@ -270,8 +270,11 @@ func TestRecordsUpstreamError(t *testing.T) {
 }
 
 // TestRecordsGatewayError records patchbay's own failures too, with the error
-// JSON patchbay returned.
+// JSON patchbay returned. The caller key is provisioned and only the inject
+// key is broken, so the failure recorded is the upstream key's — not a caller
+// rejection, and not whatever PATCHBAY_CALLER_KEY_FILE names outside the test.
 func TestRecordsGatewayError(t *testing.T) {
+	writeCallerKeyFile(t)
 	t.Setenv(keyEnvName, "")
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
