@@ -1,93 +1,76 @@
 # Auth modes
 
-Every route declares exactly one `auth` mode, and that mode decides what pays
-for the request. The three are `forward`, `inject` and `sigv4`.
+Every route declares one `auth` mode.
 
-| | pays with | caller key | path gate | body |
-|---|---|---|---|---|
-| `forward` | the caller's own credentials | not required | none | byte-faithful unless the route rewrites |
-| `inject` | a key patchbay reads from a file | **required** | `/v1/messages`, `/v1/messages/count_tokens` | byte-faithful unless the route rewrites |
-| `sigv4` | AWS credentials exported from a profile | **required** | `/v1/messages` only | always translated for Bedrock |
+| Mode | Upstream credential | Caller key | Accepted paths |
+|---|---|---|---|
+| `forward` | Caller credentials | No | Any |
+| `inject` | Provider key file | Yes | `/v1/messages`, `/v1/messages/count_tokens` |
+| `sigv4` | AWS profile credentials | Yes | `/v1/messages` |
+
+The caller presents `X-Patchbay-Key`; patchbay compares it with the trimmed file
+contents named by `PATCHBAY_CALLER_KEY_FILE`. A missing or wrong value returns
+403. A missing, unreadable, or empty key file returns 500. The gate runs before
+provider-key reads, model-map reads, AWS credential export, or upstream access.
 
 ## `forward`
 
-The default, and the built-in fallback. The caller's `Authorization` and
-`X-Api-Key` headers are left exactly as they arrived, and the request goes to
-`https://api.anthropic.com` — the only upstream validation will accept for this
-mode, because those headers may carry a subscription OAuth token.
+A `forward` route preserves the caller's `Authorization` and `X-Api-Key` headers.
+Validation requires `base_url` to be exactly `https://api.anthropic.com` so those
+credentials cannot be sent to another host.
 
-Byte fidelity is the invariant. On a route that rewrites nothing, the body
-forwarded upstream is the caller's original bytes, never decoded and re-encoded,
-and the response is streamed back flush by flush exactly as it arrived. The
-ledger tee is passive: any failure to capture or record drops the capture, never
-the stream.
+The built-in default is:
 
-What patchbay does touch, on every relayed request in any mode:
+```json
+{
+  "auth": "forward",
+  "base_url": "https://api.anthropic.com"
+}
+```
 
-- hop-by-hop headers (RFC 9110) and everything the message's own `Connection`
-  header names are dropped;
-- `Host`, `Content-Length` and `Accept-Encoding` are dropped, and
-  `Accept-Encoding: identity` is set — byte fidelity is only meaningful over
-  bytes patchbay can hand on unchanged;
-- `X-Patchbay-Key` is stripped, since it is patchbay's own header and no
-  upstream's business;
-- redirects are never followed. The upstream's 3xx is relayed as the answer.
+For `forward` and `inject`, patchbay appends the stripped inbound path and query,
+preserves the method, removes hop-by-hop and proxy-owned headers, sets
+`Accept-Encoding: identity`, never follows redirects, and relays the upstream
+status, headers, and body.
 
-The inbound path and raw query are appended to the route's `base_url` verbatim,
-so a `forward` route relays every endpoint, not just Messages — which is why an
-unconfigured patchbay is a working Anthropic passthrough.
-
-The built-in default route (`forward` to `https://api.anthropic.com`, no
-rewrite, no capture) is a fixed value in the code. It is never read from the
-registry, so no registry failure can remove it, and its path never reaches a
-gate: a request that resolves to it is never refused for want of a caller key.
+An identity route preserves the exact request body bytes. Common route rewrites
+cause JSON decoding and re-encoding; see [configuration.md](configuration.md).
 
 ## `inject`
 
-The route drops the caller's credentials — both `Authorization` and `X-Api-Key`
-are deleted, so an OAuth token never travels alongside an injected key — and
-sets `Authorization: Bearer <key>` from the file the route names.
+An `inject` route removes the caller's `Authorization` and `X-Api-Key`, then sends:
+
+```text
+Authorization: Bearer <route key>
+```
+
+The key uses file indirection:
 
 ```json
 "openrouter/kimi-k2": {
   "auth": "inject",
   "base_url": "https://openrouter.ai/api",
   "model": "moonshotai/kimi-k2",
-  "api_key_env_file": "PATCHBAY_OPENROUTER_KEY_FILE",
-  "strip_cache_control": true
+  "api_key_env_file": "PATCHBAY_OPENROUTER_KEY_FILE"
 }
 ```
 
-`api_key_env_file` is the *name* of an environment variable. Its *value* is a
-path. The file at that path holds the key. The registry never holds a secret or
-even a path, so it can live in `/nix/store` or in git. The file is read per
-request, so rotating the key on disk takes effect on the next turn with nothing
-to restart, and nothing keeps the key in memory afterwards.
+`api_key_env_file` names an environment variable whose value is the key-file
+path. The key file is read on every accepted request, so rotation does not need a
+restart.
 
-Two gates run before the key is read, in this order:
+The request must first match one of the two accepted paths, then pass the caller
+key, then provide a readable provider-key file. Other paths return 404. A key-file
+failure returns 500 without contacting the upstream.
 
-1. **Path.** An inject route relays only `/v1/messages` and
-   `/v1/messages/count_tokens`. Anything else is 404 — the route exists to
-   answer Messages turns, and a stray path must not spend the key on some other
-   endpoint.
-2. **Caller key.** The request must present `X-Patchbay-Key` matching the
-   contents of `$PATCHBAY_CALLER_KEY_FILE`. Missing or mismatched is 403 and
-   the error body never echoes either value; a key file the gateway cannot read
-   is 500.
+Validation rejects `claude` anywhere in an `inject` alias or configured model,
+case-insensitively.
 
-Most foreign upstreams do not understand Anthropic's prompt-cache markers, so
-`strip_cache_control: true` is usually right here. `extra_body`, `model` and
-`max_output_tokens` all apply as described in
-[configuration.md](configuration.md).
+## `sigv4` -- Amazon Bedrock
 
-The alias and the rewrite target may not contain `claude`, case-insensitively.
-A foreign key paying for something that reads as a Claude model is a billing lie
-in the ledger, and validation refuses to write it.
-
-## `sigv4` — Amazon Bedrock
-
-The one mode that does not relay. A `sigv4` route translates the request into
-Bedrock's own shape, signs it with AWS SigV4, and translates the answer back.
+A `sigv4` route translates the Anthropic request, maps the model, exports AWS
+credentials, signs a Bedrock request, and translates streamed responses back to
+Anthropic SSE.
 
 ```json
 "default_route": {
@@ -98,26 +81,19 @@ Bedrock's own shape, signs it with AWS SigV4, and translates the answer back.
 }
 ```
 
-### Endpoint
+The route must not set `base_url`. Its endpoint is:
 
-There is no `base_url`; validation refuses one. The endpoint is derived from the
-region, as `https://bedrock-runtime.<aws_region>.amazonaws.com`, so the URL and
-the signature can never disagree about where the request is going. The final
-target is:
-
-```
-https://bedrock-runtime.us-west-2.amazonaws.com/model/<escaped bedrock id>/invoke
-https://bedrock-runtime.us-west-2.amazonaws.com/model/<escaped bedrock id>/invoke-with-response-stream
+```text
+https://bedrock-runtime.<aws_region>.amazonaws.com
 ```
 
-whichever suffix matches the request's own `"stream"` field. The Bedrock id is
-percent-escaped per RFC 3986, colons and all.
+The outbound request is always `POST`. `stream: true` selects
+`invoke-with-response-stream`; other requests use `invoke`.
 
 ### Model map
 
-The Bedrock model id is never in the registry. `model_map_env_file` names an
-environment variable whose value is the path of a JSON object mapping the model
-the request asks for to the Bedrock id to invoke:
+`model_map_env_file` names an environment variable containing the path to a JSON
+object:
 
 ```json
 {
@@ -126,119 +102,66 @@ the request asks for to the Bedrock id to invoke:
 }
 ```
 
-The lookup key is the route's `model` when it sets one, otherwise the model the
-caller named. The map is read per request, so a rebuild takes effect
-immediately. A model with no entry — or an entry that is the empty string — is
-refused with **400** `invalid_request_error`, naming the model but never the
-mapping. A request that names no model at all is refused the same way.
+The lookup key is the route's configured `model`, or the request model when the
+route does not rewrite it. The map is read on every request. A missing variable,
+unreadable or invalid file, or incompatible value returns 500. A missing or empty
+mapping returns 400. Introspection and `patchbay resolve` never print mapped
+Bedrock identifiers.
 
-The indirection exists so no account-identifying inference-profile id or ARN
-ends up in a registry file you might share or check in. `patchbay resolve` says
-only whether a model is mapped, never to what.
+### AWS credentials
 
-### Credentials
+patchbay runs:
 
-patchbay never reads `~/.aws` itself. It runs:
-
-```
+```text
 AWS_PROFILE=<aws_profile> aws configure export-credentials
 ```
 
-inheriting the rest of the gateway's environment, and parses `AccessKeyId`,
-`SecretAccessKey`, `SessionToken` and `Expiration` out of the result. The AWS
-CLI already knows how to refresh an SSO session; duplicating that is how a
-gateway ends up with its own subtly wrong idea of what a profile means. Every
-argument is a constant and the profile is passed through the environment, so
-nothing patchbay reads can become part of a command line.
+`AccessKeyId` and `SecretAccessKey` are required. `SessionToken` and `Expiration`
+are optional. Credential export has a 10-second timeout. Credentials are cached
+until two minutes before expiration, or for 15 minutes when no expiration is
+reported. Caches and refresh locks are per profile.
 
-- **Timeout**: one export is bounded at 10 s.
-- **Caching**: per profile, until 2 minutes before the credential's stated
-  expiry, or 15 minutes when it states none (which is how a rotated long-lived
-  key pair takes effect without a restart).
-- **Single flight**: the per-profile lock is held across the exec, so a hundred
-  concurrent turns that need a refresh cost exactly one `aws` process. One
-  profile's refresh never blocks another's.
-- **Sanitized failures**: an export failure is reported as one short sentence
-  naming only the profile. The CLI's own output is dropped — it can carry
-  credential material, and everything patchbay reports reaches both a ledger
-  record and a caller-visible error body.
+An export failure returns 502 and tells the operator to run:
 
-An export failure answers **502** with the actionable advice:
-
-```
-patchbay: aws credentials for profile "work-bedrock" are unavailable; run: aws sso login --profile work-bedrock
+```text
+aws sso login --profile <profile>
 ```
 
-Signing covers the host, the method, the canonically-escaped path and query, the
-payload hash, and a fixed set of headers — `accept`, `content-type`,
-`x-amz-date` and `x-amz-security-token` — when present. Signing a fixed set is
-deliberate: a header patchbay does not control must never be able to change the
-signature. Nothing from the AWS SDK is involved; `internal/awssig` is
-stdlib-only, on the grounds that the SDK would be an order of magnitude larger
-than patchbay to sign one request shape against one service.
+CLI output and credential material are not returned to the caller or ledger.
 
-### The 403 retry
+### Request and retry
 
-AWS refuses a signature made with a credential that has since expired, which is
-the ordinary end of an SSO session rather than something worth surfacing. So a
-`sigv4` route gets exactly one retry, and only on 403: the cached credential is
-invalidated, a fresh one is exported, and the request is rebuilt and re-signed.
-A second 403 is patchbay's failure to report, not the caller's — the caller has
-no AWS credential of its own to fix — so it becomes **502**:
+The signer uses service `bedrock`, the route's region, the payload hash, and the
+fixed Bedrock request headers. Caller credentials and `X-Patchbay-Key` are
+removed.
 
-```
-patchbay: bedrock refused the request signed with profile "work-bedrock" twice; run: aws sso login --profile work-bedrock
-```
+A Bedrock 403 triggers one credential refresh and retry. A second 403 becomes a
+502 with the AWS login instruction. No other status is retried by this rule.
 
-### Path gate
+The path gate runs before caller-key validation, body parsing, map access, and AWS
+credential export:
 
-| Path | Answer |
+| Path | Result |
 |---|---|
-| `/v1/messages` | proxied to Bedrock |
-| `/v1/messages/count_tokens` | **501** — Bedrock has no equivalent, and an honest "not implemented" is worth more than a 404 that reads like a broken gateway. Claude Code asks for this endpoint routinely; the 501 is expected and harmless. |
-| anything else | **404** `not_found_error` |
+| `/v1/messages` | Translate and send to Bedrock. |
+| `/v1/messages/count_tokens` | 501; Bedrock has no equivalent here. |
+| Anything else | 404. |
 
-The caller-key gate applies here exactly as it does to `inject`, and it runs
-before any credential is exported or any signature is made.
+After common route rewrites, the body must be a JSON object. Bedrock translation:
 
-### Body translation, exactly
+1. removes `model`;
+2. removes `stream`;
+3. sets `anthropic_version` to `bedrock-2023-05-31`.
 
-The request document is walked as raw JSON values rather than a typed struct, so
-a field this build has never heard of still reaches the model. The translation
-is three operations and no others:
+Other fields are retained. The mapped Bedrock model ID goes in the invocation URL.
 
-1. delete `model` — Bedrock carries it in the URL;
-2. delete `stream` — Bedrock carries it in the URL suffix;
-3. set `anthropic_version` to `bedrock-2023-05-31`.
+### Responses
 
-Everything else the caller wrote — `system`, `messages`, `tools`, `thinking`,
-`max_tokens`, anything — rides along byte-identically. Note that a `sigv4` route
-is never on the identity fast path: the document is always decoded and
-re-encoded, so key order may differ from what the caller sent.
+Non-streamed responses are relayed without JSON translation. AWS event streams
+are decoded and emitted as `text/event-stream` SSE. patchbay validates framing
+and CRCs, decodes each embedded Anthropic event, flushes events as they arrive,
+and emits an Anthropic-shaped error event for Bedrock exceptions or malformed
+stream data.
 
-Outbound headers: the caller's headers minus the ones a proxy owns, with
-`Authorization` and `X-Api-Key` deleted, `Content-Type` and `Accept` set to
-`application/json`, and the SigV4 headers added by the signer.
-
-### Response translation
-
-A non-streamed answer is JSON already in Anthropic's shape and is relayed
-unchanged.
-
-A streamed answer arrives as `application/vnd.amazon.eventstream` — AWS's binary
-framing — and is decoded and re-emitted as the `text/event-stream` SSE that an
-Anthropic client speaks, one event at a time, flushed as it arrives:
-
-- each frame's payload is a one-field object whose `bytes` are the Anthropic
-  event JSON;
-- the SSE event name is the `type` the event JSON names itself, falling back to
-  the frame's `:event-type` header;
-- a frame carrying `:exception-type` becomes an `event: error` with an
-  Anthropic-shaped error body, and ends the stream;
-- a frame carrying neither an event nor an exception is skipped;
-- prelude and message CRCs are verified, and a frame that does not decode ends
-  the turn — the events already written are real, everything after them is not.
-
-The caller's `Content-Type` is rewritten to `text/event-stream`, and the ledger
-summarizes the SSE the caller actually received rather than the framing it
-arrived in.
+Ledger capture and summaries use the translated SSE received by the client, not
+the AWS framing.

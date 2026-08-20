@@ -1,83 +1,67 @@
 # patchbay
 
-A per-host loopback gateway that speaks the Anthropic Messages API, so one
-Claude Code install can talk to several models — and several people's money —
-without ever handing your subscription token to anybody but Anthropic.
+patchbay is a per-host gateway for the Anthropic Messages API. Claude Code sends
+requests to patchbay through `ANTHROPIC_BASE_URL`; patchbay selects a route from
+the request model and the context encoded in the URL.
 
-Point `ANTHROPIC_BASE_URL` at patchbay and set no auth environment variables at
-all. Claude Code keeps its own subscription OAuth login, and every Claude
-request is forwarded to Anthropic with the caller's credentials untouched, byte
-for byte. Ask for a model name that patchbay's registry claims — `openrouter/glm-4.6`,
-`bedrock/opus`, anything you name — and that request is sent to the upstream the
-route names, with a provider key injected or an AWS SigV4 signature applied
-server-side. The key never reaches the client. Which set of routes applies is
-chosen per project by a path prefix on the base URL, so a work checkout can bill
-a company Bedrock account while everything else stays on your personal
-subscription.
+An unmatched model uses the context's default route. The built-in default
+forwards to Anthropic with the caller's credentials. Aliases can instead inject
+a provider key or translate and sign requests for Amazon Bedrock.
 
-It is a single Go binary with no dependencies outside the standard library.
+Contexts give projects separate route sets. A work checkout can use Bedrock while
+unprefixed requests continue to use a personal Claude subscription.
 
-## How it works
+The Go module uses only the standard library. `sigv4` routes also require the AWS
+CLI because patchbay runs `aws configure export-credentials` for the configured
+profile.
 
-```
-Claude Code                 patchbay (127.0.0.1:4100)                upstream
------------                 -------------------------                --------
+## Routing
 
-ANTHROPIC_BASE_URL ───► /v1/messages ─┐
-  (no /ctx prefix)                    │  context: personal
-                                      │
-ANTHROPIC_BASE_URL ───► /ctx/work/... ┤  context: work (prefix stripped)
-  (per project)                       │
-                                      ▼
-                            look up "model" in the
-                            selected context's routes
-                                      │
-        ┌─────────────────────────────┼─────────────────────────────┐
-        ▼                             ▼                             ▼
-   no alias matched              auth: inject                  auth: sigv4
-   → default route          caller key required            caller key required
-        │                    drop caller creds              drop caller creds
-   auth: forward             inject key from file           sign with AWS creds
-   caller's own creds        (env name → path → key)        exported from a profile
-        │                             │                             │
-        ▼                             ▼                             ▼
-  api.anthropic.com            openrouter.ai/…            bedrock-runtime.<region>
-        │                             │                             │
-        └─────────────────────────────┴─────────────────────────────┘
-                                      │
-                       stream back verbatim, flush by flush
-                       + one JSONL ledger record per request
+```text
+Claude Code                    patchbay                       upstream
+
+ANTHROPIC_BASE_URL ----------> select context
+  http://127.0.0.1:4100        bare path: personal
+  .../ctx/work                  /ctx/work: work
+                                      |
+                               resolve model
+                         +------------+------------+
+                         |            |            |
+                      default       inject       sigv4
+                         |            |            |
+                      caller      provider key    AWS
+                       auth          file       credentials
+                         |            |            |
+                         +------------+------------+
+                                      |
+                         relay response and append JSONL ledger
 ```
 
-Request flow, in order:
+For each request, patchbay:
 
-```
-1.  /_patchbay/…            answered by patchbay itself (caller key required)
-2.  /ctx/<name>/…           context selected, prefix stripped; unknown name → 404
-3.  GET /v1/models[/{id}]   answered locally: aliases merged with the account's models
-4.  everything else         resolve the body's "model" in the selected context
-                            → matched alias  → that route
-                            → a foreign route's rewrite target
-                                             → 404, naming the alias to ask for;
-                                               never the default route
-                            → no match       → the context's default route
-                                               (built-in: forward to Anthropic)
-5.  rewrite the body only if the route asks for it, otherwise forward the
-    caller's exact bytes
-6.  apply the route's credentials, send, stream the answer back unchanged
-7.  append one ledger record, off the request path
-```
+1. Selects `personal` for a bare path or the named `/ctx/<context>` context.
+2. Resolves an exact alias, then falls back to the context's default route.
+3. Applies the route's model and body rewrites.
+4. Applies `forward`, `inject`, or `sigv4` authentication.
+5. Relays the response and writes one ledger record asynchronously.
+
+An unavailable explicit context returns 404. A missing or invalid registry still
+leaves the bare personal path with the built-in Anthropic route.
+
+`GET /_patchbay/registry` and explicit-context model endpoints require the caller
+key. Model endpoints on the bare personal path do not. These local endpoints do
+not write ledger records.
 
 ## Quickstart
 
-Build it — stdlib only, no module downloads:
+Build with Go 1.26:
 
 ```console
 $ go build ./cmd/patchbay
 ```
 
-Give patchbay a caller key. It is a local shared secret that gates the routes
-which spend *your* provider keys:
+Create a caller key. This key authorizes routes that spend credentials configured
+on the gateway:
 
 ```console
 $ mkdir -p ~/.config/patchbay
@@ -85,8 +69,7 @@ $ head -c 32 /dev/urandom | base64 > ~/.config/patchbay/caller.key
 $ chmod 600 ~/.config/patchbay/caller.key
 ```
 
-Write a registry at `~/.config/patchbay/routes.json`. The minimum useful one is
-a single foreign alias in the personal context:
+Create `~/.config/patchbay/routes.json`:
 
 ```json
 {
@@ -106,24 +89,15 @@ a single foreign alias in the personal context:
 }
 ```
 
-Nothing in that file is a secret: `api_key_env_file` is the *name* of an
-environment variable, whose *value* is the path of a file holding the key.
+`api_key_env_file` is an environment variable name. The variable contains the
+path to the provider-key file; the registry contains neither the path nor the
+secret. Do not put secrets in `extra_body` or other registry fields.
 
-`base_url` is a root, not an endpoint: the inbound path is appended to it
-verbatim, so `https://openrouter.ai/api` + `/v1/messages` is what gets
-requested. Check your provider's own Anthropic-compatible endpoint and set the
-root that produces it. The upstream does not have to be a cloud — a model
-server on your own network works too ([Local
-models](docs/configuration.md#local-models)), as does a translating proxy in
-front of a chat subscription
-([ChatGPT subscription routes](docs/chatgpt-subscription.md)).
-
-Put the provider key in the file that variable will name, then check the
-registry and run the gateway:
+Write the provider key, validate the registry, and start patchbay:
 
 ```console
 $ install -m600 /dev/null ~/.config/patchbay/openrouter.key
-$ $EDITOR ~/.config/patchbay/openrouter.key      # the OpenRouter key, one line
+$ $EDITOR ~/.config/patchbay/openrouter.key
 
 $ ./patchbay check
 OK /home/you/.config/patchbay/routes.json: 1 context (personal), 1 route
@@ -133,8 +107,7 @@ $ export PATCHBAY_OPENROUTER_KEY_FILE=~/.config/patchbay/openrouter.key
 $ ./patchbay serve
 ```
 
-Point Claude Code at it — in `~/.claude/settings.json` for every project, or
-`.claude/settings.json` for one:
+Configure Claude Code in user settings or a project's local settings:
 
 ```json
 {
@@ -145,30 +118,35 @@ Point Claude Code at it — in `~/.claude/settings.json` for every project, or
 }
 ```
 
-Leave `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` unset. Claude Code keeps
-using its subscription login, patchbay forwards that login to Anthropic
-untouched, and `/model openrouter/glm-4.6` rides the OpenRouter key instead.
+Keep the caller key out of shared project settings. If the project should share a
+context, commit only `ANTHROPIC_BASE_URL` and provide the header from user or local
+settings.
 
-A full example registry using all three auth modes is in
-[examples/routes.json](examples/routes.json). On Nix, the flake exports a
-home-manager module that runs all of this as a service — see
-[docs/nix.md](docs/nix.md). Without Nix, there is a container image and a
-compose example — see [docs/docker.md](docs/docker.md).
+Leave `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` unset when the personal
+default should use the Claude Code subscription login. Claude Code sends its
+stored OAuth credential to patchbay, and patchbay forwards it only on `forward`
+routes.
+
+With this configuration, normal Claude model names use Anthropic while
+`/model openrouter/glm-4.6` uses the OpenRouter route. Third-party gateways may
+accept non-Claude aliases, but [Anthropic does not support](https://code.claude.com/docs/en/llm-gateway)
+non-Claude models behind them.
+
+See [examples/routes.json](examples/routes.json) for all three auth modes.
 
 ## Contexts
 
-A context is a named world: its own aliases, and its own default route for every
-model those aliases do not claim. A request selects one with a path prefix on
-the base URL:
+The URL path selects the context:
 
 | Base URL | Context |
 |---|---|
-| `http://127.0.0.1:4100` | `personal` (implicit — what any Anthropic client sends) |
+| `http://127.0.0.1:4100` | `personal` |
 | `http://127.0.0.1:4100/ctx/work` | `work` |
 
-The prefix is stripped before anything else looks at the path, so the upstream
-sees `/v1/messages` either way. Since Claude Code reads `.claude/settings.json`
-from the project directory, the context is a per-project choice:
+The prefix is removed before the request is sent upstream. Both base URLs send
+`/v1/messages` to the selected route.
+
+A project can select a context in `.claude/settings.json`:
 
 ```json
 {
@@ -178,121 +156,109 @@ from the project directory, the context is a per-project choice:
 }
 ```
 
-Every request from that checkout resolves inside `work` — including plain
-`claude-*` model names, which the `work` context can route to Bedrock on the
-company account while the same model in any other directory stays on your
-subscription. `patchbay project` prints which context a directory ends up in
-and what that context will do.
+Contexts fail closed. If `work` is unavailable, `/ctx/work` returns 404 rather
+than falling back to `personal`.
 
-Contexts fail closed. A named context the current registry cannot produce — an
-unknown name, a broken file, no file at all — is refused with 404 rather than
-served by some other context. Only the bare, unprefixed path has a built-in
-fallback.
+`patchbay project [dir]` shows which Claude Code settings file wins, which context
+it selects, and which routes that context serves.
 
-## The caller key
+## Caller key
 
-`inject` and `sigv4` routes, and the `/_patchbay/registry` introspection
-endpoint, require the header `X-Patchbay-Key` to match the contents of the file
-named by `$PATCHBAY_CALLER_KEY_FILE`. Both sides are hashed and compared in
-constant time.
+`X-Patchbay-Key` must match the trimmed contents of
+`$PATCHBAY_CALLER_KEY_FILE` for:
 
-The reason is asymmetry. A `forward` route spends the caller's own credentials:
-a process that reaches patchbay without any credential of its own gets nothing
-from it. An `inject` or `sigv4` route spends *yours* — a household OpenRouter
-key, an AWS account — and any local process could otherwise ask for it just by
-naming the alias. So those two modes refuse to build the upstream request until
-the caller proves it knows the key, and the check runs before any key is read,
-any credential exported, or any signature made. Missing or mismatched is 403
-(never 401, which Claude Code would read as a prompt to log in again); a caller
-key the gateway itself cannot read is 500.
+- `inject` and `sigv4` routes
+- `GET` and `HEAD /_patchbay/registry`
+- explicit-context `GET /v1/models` requests
+
+patchbay compares SHA-256 digests in constant time and removes the header before
+contacting an upstream. A missing or incorrect value returns 403. An unreadable or
+unconfigured key file returns 500.
+
+A `forward` route does not require this key because it uses only credentials sent
+by the caller. The caller key is not a general authentication layer for the
+gateway.
 
 ## CLI
 
-```
-patchbay serve                        run the gateway until signaled
-patchbay contexts                     list every context the running gateway serves
-patchbay routes [--ctx <name>]        list one context's aliases
-patchbay resolve <context> <model>    show which route one request would ride
-patchbay project [dir]                show which context a directory selects
-patchbay check [--registry <path>]    validate a registry file, no daemon needed
+```text
+patchbay serve                        run the gateway
+patchbay contexts                     list contexts
+patchbay routes [--ctx <name>]        list aliases
+patchbay resolve <context> <model>    show route selection
+patchbay project [dir]                inspect Claude Code settings
+patchbay check [--registry <path>]    validate a registry file
 ```
 
-Everything but `serve` and `check` asks the running gateway over its
-introspection endpoint and needs the caller key. Details and worked output in
-[docs/cli.md](docs/cli.md).
+The inspection commands query the running gateway at `$PATCHBAY_LISTEN` and use
+`$PATCHBAY_CALLER_KEY_FILE`. See [docs/cli.md](docs/cli.md) for output and exit
+codes.
 
 ## Ledger
 
-Every proxied request appends one JSON line to
-`$XDG_STATE_HOME/patchbay/ledger/patchbay-<UTC date>.jsonl`: when, which host,
-which context, what class of credential the client presented, which alias and
-upstream and model, the status, token counts, timings, the shape of the content
-blocks that came back, and the stop reason. It is written off the request path
-and fsynced; a ledger that fails costs the record and nothing else. The schema
-has no field for headers of any kind, so no credential can land in it. See
+Proxy requests produce JSONL records under
+`$XDG_STATE_HOME/patchbay/ledger`, or `~/.local/state/patchbay/ledger` when
+`XDG_STATE_HOME` is unset:
+
+```text
+patchbay-YYYY-MM-DD.jsonl
+```
+
+Records include route selection, status, token counts, timings, response shape,
+and stop reason. Routes with `capture_bodies: true` also store request and
+response bodies. Header fields are not part of the schema, but captured bodies
+may contain sensitive application data.
+
+Ledger writes happen after the client response. A capture or append failure drops
+the record and logs a warning without changing the response. See
 [docs/ledger.md](docs/ledger.md).
 
-## Security model
+## Security
 
-patchbay binds `127.0.0.1:4100` by default, and that default matters: the
-gateway forwards the caller's own Anthropic credentials, so anything that can
-reach the socket can spend them. Do not move it to a routable address.
+Keep the default listener on loopback. Claude Code sends its subscription
+credential to patchbay over HTTP, and the caller key does not gate `forward`
+routes.
 
-The caller key is a gate on patchbay's *own* spending — inject routes, Bedrock
-signing, and the introspection document that enumerates every upstream this
-machine can spend money at. It is not a general authentication layer: the
-forward path is deliberately ungated, because a caller there pays with a
-credential it already had. Anyone who can read the key file can use the foreign
-routes, so it lives outside the store, 0600, owned by you.
+Provider keys and Bedrock model maps use file indirection and are read per
+request. AWS credentials are exported through the AWS CLI and cached until near
+their reported expiration, or for 15 minutes when no expiration is reported.
 
-Secrets reach patchbay by double indirection only: the registry names an
-environment variable, the variable's value is a path, and the file at that path
-holds the key. The registry file itself holds no secret and can be world-
-readable, checked in, or built by Nix into `/nix/store`. Key files are read per
-request, so rotating one takes effect immediately, and nothing is cached in
-memory afterwards. Bedrock model ids live in their own map file for the same
-reason — no account-identifying ARN belongs in a config you might share.
+patchbay also:
 
-A few more guarantees worth knowing:
+- never follows redirects;
+- restricts `forward` routes to `https://api.anthropic.com`;
+- removes caller credentials before `inject` and `sigv4` requests;
+- accepts plain HTTP only for loopback or an `inject` route with `insecure: true`;
+- removes hop-by-hop headers in both directions;
+- returns Anthropic-shaped gateway errors without credential values.
 
-- Redirects are never followed, on any path. A 3xx is relayed to the caller as
-  the upstream's own answer rather than replayed, with credentials, at whatever
-  host it named.
-- A `forward` route may target only `https://api.anthropic.com`; validation
-  rejects any other upstream, so the caller's subscription token cannot be
-  aimed elsewhere.
-- An `inject` route may not carry `claude` in its alias or its rewrite target,
-  so a foreign key can never pay for something that reads in the ledger as a
-  Claude model.
-- `inject` relays only `/v1/messages` and `/v1/messages/count_tokens`; `sigv4`
-  relays only `/v1/messages`. A stray path on either is refused, not spent.
-- Errors patchbay originates are prefixed `patchbay:` inside an Anthropic-shaped
-  error envelope, and never echo a header value.
+The container image does not include the AWS CLI and cannot serve `sigv4` routes
+without modification.
 
 ## Documentation
 
-- [docs/configuration.md](docs/configuration.md) — environment variables, the
-  registry v2 schema field by field, hot reload, failure semantics
-- [docs/auth-modes.md](docs/auth-modes.md) — `forward`, `inject`, `sigv4`, and
-  the full Bedrock story
-- [docs/chatgpt-subscription.md](docs/chatgpt-subscription.md) — fronting a
-  ChatGPT subscription through CLIProxyAPI, and why that is a Terms-of-Use
-  decision before it is a configuration one
-- [docs/nix.md](docs/nix.md) — the flake outputs and the home-manager module,
-  including the one-flag `codexUpstream` deployment
-- [docs/docker.md](docs/docker.md) — the GHCR image and the compose example,
-  for hosts without Nix
-- [docs/ledger.md](docs/ledger.md) — the JSONL record schema
-- [docs/cli.md](docs/cli.md) — every subcommand with real output
+- [Configuration](docs/configuration.md) -- environment, registry fields, reload,
+  endpoints, and limits
+- [Auth modes](docs/auth-modes.md) -- `forward`, `inject`, and `sigv4`
+- [CLI](docs/cli.md) -- commands, output, and introspection
+- [Ledger](docs/ledger.md) -- JSONL schema and reading records
+- [Nix](docs/nix.md) -- flake outputs and Home Manager module
+- [Docker](docs/docker.md) -- image and Compose setup
+- [ChatGPT subscription routes](docs/chatgpt-subscription.md) -- optional
+  CLIProxyAPI integration and account risk
 
 ## Building and testing
 
 ```console
-$ go build ./cmd/patchbay      # the binary
-$ just check                   # nixpkgs pin check, golangci-lint, race + coverage
-$ nix build .#patchbay         # packaged build
+$ go build ./cmd/patchbay
+$ go test ./...
+$ just check
+$ nix build .#patchbay
 ```
+
+`just check` runs lint, race-enabled tests, the coverage gate, and the Nix pin
+check.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT -- see [LICENSE](LICENSE).

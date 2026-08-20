@@ -64,7 +64,7 @@ commands:
   serve                        run the gateway until it is signaled to stop
   contexts                     list every context the running gateway serves
   routes [--ctx <name>]        list one context's aliases (default: personal)
-  resolve <context> <model>    show which route one request would ride
+  resolve <context> <model>    show which route one request would use
   project [dir]                show which context a directory's Claude Code settings select
   check [--registry <path>]    validate a registry file without asking the gateway
 
