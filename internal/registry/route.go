@@ -111,6 +111,42 @@ type Context struct {
 	// Routes are the context's aliases, keyed by the model name that selects
 	// them.
 	Routes map[string]Route
+
+	// foreignTargets are the rewrite targets a fallthrough must never ride,
+	// each keyed to the alias that asks for it. Built once at parse time; see
+	// foreignTargets below for what qualifies.
+	foreignTargets map[string]string
+}
+
+// foreignTargets returns the rewrite targets the context must refuse to serve
+// from its default route: every route's model rewrite, keyed by the first
+// alias (in sorted order) asking for it — minus any target some route serves
+// from the same upstream the default route reaches, since for those a
+// fallthrough arrives at an upstream that genuinely serves the name. That
+// exemption is what keeps a pinning route (one Claude id rewritten to another,
+// forwarded to Anthropic) from confiscating the target id's ordinary
+// fallthrough.
+func foreignTargets(ctx Context) map[string]string {
+	targets := map[string]string{}
+
+	for _, alias := range sortedKeys(ctx.Routes) {
+		route := ctx.Routes[alias]
+		if route.Model == "" || route.Upstream() == ctx.DefaultRoute.Upstream() {
+			continue
+		}
+
+		if _, claimed := targets[route.Model]; !claimed {
+			targets[route.Model] = alias
+		}
+	}
+
+	for _, route := range ctx.Routes {
+		if route.Model != "" && route.Upstream() == ctx.DefaultRoute.Upstream() {
+			delete(targets, route.Model)
+		}
+	}
+
+	return targets
 }
 
 // Upstream is the API root this route actually reaches: the base_url it names,

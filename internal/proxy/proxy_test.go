@@ -471,6 +471,54 @@ func TestUnroutableBodyRidesDefaultRoute(t *testing.T) {
 	}
 }
 
+// TestRewriteTargetIsRefusedNotForwarded is the fallthrough guard: a request
+// naming a foreign route's rewrite target — the shape of a client echoing a
+// response's model id instead of the alias it asked with — is answered 404 in
+// Anthropic's not_found_error shape, naming the alias, and nothing is sent to
+// the default route's upstream.
+func TestRewriteTargetIsRefusedNotForwarded(t *testing.T) {
+	stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
+	recorder := newRecorder()
+
+	reg := newRegistry(t, `"or/flash":{"base_url":"https://openrouter.ai/api",`+
+		`"auth":"inject","api_key_env_file":"`+keyEnvName+`","model":"upstream/flash-1"}`)
+
+	rec := serve(t, proxy.Config{
+		Registry: reg,
+		Recorder: recorder,
+		Client:   anthropicClient(t, stub),
+		Host:     testHost,
+	}, messagesRequest(`{"model":"upstream/flash-1"}`))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"not_found_error"`) {
+		t.Errorf("error body %q is not in the not_found_error shape", body)
+	}
+
+	if !strings.Contains(body, "or/flash") {
+		t.Errorf("error body %q does not name the alias to ask for instead", body)
+	}
+
+	if stub.hits() != 0 {
+		t.Errorf("the default route's upstream received %d requests, want none", stub.hits())
+	}
+
+	got := recorder.wait(t)
+
+	if got.Status != http.StatusNotFound || got.RequestModel != "upstream/flash-1" {
+		t.Errorf("record status/request_model = %d/%q, want %d/%q",
+			got.Status, got.RequestModel, http.StatusNotFound, "upstream/flash-1")
+	}
+
+	if err := got.Validate(); err != nil {
+		t.Errorf("record does not validate: %v", err)
+	}
+}
+
 // TestOversizedRequestBodyFails caps what a caller can make the gateway hold in
 // memory: past the request ceiling the request is refused as too large and the
 // upstream is never contacted. A body this size names no model, so the route it

@@ -43,6 +43,15 @@ const PersonalContext = "personal"
 // file is missing or broken. It is never softened into a fallback.
 var ErrUnknownContext = errors.New("unknown context")
 
+// ErrRewriteTarget is returned when a request names a model that is no alias
+// but is some route's rewrite target — the name that route asks of its own
+// upstream, which only that upstream serves. Falling through would send the
+// conversation, on the default route's credentials, to an upstream the
+// registry says does not serve the name; the caller meant the alias and is
+// told so instead. The observed shape is a client that echoes a response's
+// model id back as its next request's model.
+var ErrRewriteTarget = errors.New("model is a rewrite target, not a route")
+
 // Selection is the context one request chose, and whether it said so. The zero
 // value is what a bare, unprefixed path selects: the personal context, with the
 // built-in default route standing behind it if the registry cannot answer.
@@ -75,6 +84,10 @@ type Resolution struct {
 	// and never handed out. Aliases builds the caller's copy from it, and only
 	// when something actually reads the list — a proxied turn never does.
 	routes map[string]Route
+
+	// foreignTargets is the context's map of rewrite targets no fallthrough may
+	// ride, computed at parse time and held the same way routes is.
+	foreignTargets map[string]string
 }
 
 // Aliases returns every route the context defines, sorted by alias, as the
@@ -104,16 +117,30 @@ func (res Resolution) Aliases() []Route {
 // Select returns the resolution with Route set to the one serving model — the
 // context's own alias for it, or the default route when no alias claims it.
 //
+// One kind of model is refused rather than served: a rewrite target only
+// foreign upstreams serve. Handing that to the default route would send the
+// request somewhere the registry itself says does not serve the name, so
+// Select returns ErrRewriteTarget naming the alias to ask for instead. An
+// alias always wins first — a key that shadows another route's target is still
+// an alias.
+//
 // It is how a request that has already resolved its context picks its route
 // without asking the registry a second time: one resolution per request, so a
 // registry file replaced mid-request cannot serve one half of that request from
 // one document and the other half from the next.
-func (res Resolution) Select(model string) Resolution {
+func (res Resolution) Select(model string) (Resolution, error) {
 	if route, matched := res.routes[model]; matched {
 		res.Route = route
+
+		return res, nil
 	}
 
-	return res
+	if alias, foreign := res.foreignTargets[model]; foreign {
+		return res, fmt.Errorf("%w: %q is what alias %q asks of its upstream; request the alias instead",
+			ErrRewriteTarget, model, alias)
+	}
+
+	return res, nil
 }
 
 // selectionKey and resolutionKey are the private types of the request-context
@@ -185,12 +212,14 @@ func ResolutionFrom(ctx context.Context) (Resolution, bool) {
 // Resolve re-reads the registry file when it has changed since the last call,
 // so it always answers from the file as it stands now.
 //
-// It fails only one way: an explicitly named context the current file cannot
-// produce returns ErrUnknownContext, and the caller must refuse the request
-// rather than serve it from somewhere else. A bare selection never fails — a
-// missing, unparsable or invalid registry file costs it only the foreign
-// aliases, and the built-in default route always survives. The health of the
-// file itself is observed through Err.
+// It fails two ways, and the caller must refuse the request on either rather
+// than serve it from somewhere else: an explicitly named context the current
+// file cannot produce returns ErrUnknownContext, and a model that is a foreign
+// route's rewrite target returns ErrRewriteTarget — see Select. A bare
+// selection of an ordinary model never fails — a missing, unparsable or
+// invalid registry file costs it only the foreign aliases, and the built-in
+// default route always survives. The health of the file itself is observed
+// through Err.
 func (r *Registry) Resolve(sel Selection, model string) (Resolution, error) {
 	r.refresh()
 
@@ -207,7 +236,7 @@ func (r *Registry) Resolve(sel Selection, model string) (Resolution, error) {
 		return Resolution{Context: name}, fmt.Errorf("%w %q", ErrUnknownContext, name)
 	}
 
-	return resolution(name, found, ok).Select(model), nil
+	return resolution(name, found, ok).Select(model)
 }
 
 // Contexts returns every context the registry currently serves, sorted by name,
@@ -302,18 +331,20 @@ func (r *Registry) refresh() {
 func resolution(name string, found Context, ok bool) Resolution {
 	if !ok {
 		return Resolution{
-			Context:      name,
-			Route:        DefaultRoute(),
-			DefaultRoute: DefaultRoute(),
-			routes:       nil,
+			Context:        name,
+			Route:          DefaultRoute(),
+			DefaultRoute:   DefaultRoute(),
+			routes:         nil,
+			foreignTargets: nil,
 		}
 	}
 
 	return Resolution{
-		Context:      name,
-		Route:        found.DefaultRoute,
-		DefaultRoute: found.DefaultRoute,
-		routes:       found.Routes,
+		Context:        name,
+		Route:          found.DefaultRoute,
+		DefaultRoute:   found.DefaultRoute,
+		routes:         found.Routes,
+		foreignTargets: found.foreignTargets,
 	}
 }
 

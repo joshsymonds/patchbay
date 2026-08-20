@@ -114,6 +114,11 @@ func parseContext(name string, raw json.RawMessage) (Context, error) {
 		}
 	}
 
+	// Both the default route and the aliases are settled now, so the rewrite
+	// targets no fallthrough may ride can be computed once instead of on every
+	// request.
+	parsed.foreignTargets = foreignTargets(parsed)
+
 	return parsed, nil
 }
 

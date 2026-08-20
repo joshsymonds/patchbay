@@ -406,7 +406,12 @@ func TestTheSurfaceResolvesOncePerRequest(t *testing.T) {
 			return
 		}
 
-		resolved <- res.Select("luna-fast").Route
+		selected, selectErr := res.Select("luna-fast")
+		if selectErr != nil {
+			t.Errorf("Select(%q) = %v; want no error for an alias", "luna-fast", selectErr)
+		}
+
+		resolved <- selected.Route
 	})
 
 	serve(t, server.Config{

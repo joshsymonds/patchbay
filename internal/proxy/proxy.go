@@ -173,15 +173,24 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	res, resErr := p.resolve(r.Context(), sel, requestModel)
 	if resErr != nil {
-		// Only a pipeline driven with no surface in front of it can reach here:
-		// through the gateway, the context was resolved before the request was
-		// routed and that resolution is the one used. It fails closed all the
-		// same: a named context is never served by another. The record carries
-		// the built-in route the way every other refusal does — nothing was sent
-		// anywhere, and a record the ledger would drop for want of an upstream is
-		// a refusal nobody can audit.
+		// Two refusals land here. A model that is a foreign route's rewrite
+		// target is refused for any caller, in the not-found shape the real
+		// Anthropic API answers an unknown model with, so the client that
+		// echoed a rewritten model id gets an error it already knows how to
+		// read. An unresolvable named context can only arrive from a pipeline
+		// driven with no surface in front of it — through the gateway the
+		// context was resolved before the request was routed — and it fails
+		// closed all the same: a named context is never served by another.
+		// Either way the record carries the built-in route the way every other
+		// refusal does — nothing was sent anywhere, and a record the ledger
+		// would drop for want of an upstream is a refusal nobody can audit.
+		errType := ""
+		if errors.Is(resErr, registry.ErrRewriteTarget) {
+			errType = anthropic.ErrorTypeNotFound
+		}
+
 		p.abort(r.Context(), w, newExchange(registry.DefaultRoute(), res.Context, class, requestModel, start),
-			&gatewayError{status: http.StatusNotFound, err: resErr})
+			&gatewayError{status: http.StatusNotFound, errType: errType, err: resErr})
 
 		return
 	}
@@ -237,7 +246,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.record(exch, capt)
 }
 
-// resolve picks the route serving model inside the request's own context.
+// resolve picks the route serving model inside the request's own context. A
+// model the context refuses to serve — a foreign route's rewrite target —
+// comes back as the selection's own error, on either path.
 //
 // The HTTP surface resolves the context once, before anything dispatches on the
 // request, and attaches the resolution; consuming that is what keeps one request
@@ -250,12 +261,21 @@ func (p *Proxy) resolve(
 	model string,
 ) (registry.Resolution, error) {
 	if res, ok := registry.ResolutionFrom(ctx); ok {
-		return res.Select(model), nil
+		selected, err := res.Select(model)
+		if err != nil {
+			return selected, fmt.Errorf("route the request model: %w", err)
+		}
+
+		return selected, nil
 	}
 
 	res, err := p.registry.Resolve(sel, model)
 	if err != nil {
-		return res, fmt.Errorf("resolve the request context: %w", err)
+		if errors.Is(err, registry.ErrUnknownContext) {
+			return res, fmt.Errorf("resolve the request context: %w", err)
+		}
+
+		return res, fmt.Errorf("route the request model: %w", err)
 	}
 
 	return res, nil

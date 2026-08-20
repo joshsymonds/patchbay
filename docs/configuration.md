@@ -83,6 +83,19 @@ nothing to patchbay. An alias may deliberately shadow a real Anthropic model id;
 that is how you pin `claude-sonnet-4-5` to a different upstream inside one
 context.
 
+A rewrite target is not an alias. A request naming the model a route rewrites
+*to* — `deepseek/deepseek-v4-flash-0731` instead of the alias that rewrites to
+it — is refused with a **404** in Anthropic's `not_found_error` shape, naming
+the alias to ask for, rather than falling through: the default route's upstream
+does not serve that name, and falling through would send the conversation, on
+the default route's credentials, exactly where it was routed away from. The
+observed shape is a client echoing a response's `model` field back as its next
+request's model. The refusal only covers targets no route serves from the
+upstream the default route reaches — a pinning route that rewrites one Claude
+id to another leaves the target's own fallthrough intact, and a context whose
+default route points at the same server its aliases do (the [local
+models](#local-models) shape) keeps serving that server's model ids bare.
+
 ### Route fields
 
 | Field | Type | Meaning |
@@ -190,6 +203,7 @@ patchbay degrades on everything except the socket it was asked to bind.
 | Registry file broken (parse or validation) | Same as missing, plus an error log naming the file, the context or alias, and the rule it broke. Re-logged on `/v1/models` requests, since a rebuild can break it long after startup. |
 | Request names a context (`/ctx/<name>/…`) that cannot be produced | **404**, in Anthropic's `not_found_error` shape, naming the context. Never falls back to another context or to the built-in route. This includes `/ctx`, `/ctx/`, and `/ctx//x`, which name no context at all. |
 | Request names no context | Always resolves. The built-in default route — plain forward to Anthropic, no rewrite, no capture — is a fixed value that is never read from the registry, so no registry failure can take it away. |
+| Request names a model that is a foreign route's rewrite target | **404**, in Anthropic's `not_found_error` shape, naming the alias to ask for instead. Never falls through to the default route — see [Context names](#context-names). |
 | Ledger directory cannot be created or opened | The gateway serves without recording, and logs it once at startup. |
 | Hostname unavailable | Records are rejected by ledger validation and logged as dropped; serving is unaffected. |
 | Listen address cannot be bound | Fatal. This is the one thing that stops the gateway. |

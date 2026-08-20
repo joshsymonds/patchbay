@@ -57,6 +57,9 @@ Request flow, in order:
 3.  GET /v1/models[/{id}]   answered locally: aliases merged with the account's models
 4.  everything else         resolve the body's "model" in the selected context
                             → matched alias  → that route
+                            → a foreign route's rewrite target
+                                             → 404, naming the alias to ask for;
+                                               never the default route
                             → no match       → the context's default route
                                                (built-in: forward to Anthropic)
 5.  rewrite the body only if the route asks for it, otherwise forward the

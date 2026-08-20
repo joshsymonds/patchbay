@@ -350,6 +350,81 @@ func TestResolveAliasShadowsAClaudeModelID(t *testing.T) {
 	}
 }
 
+func TestResolveRefusesAForeignRewriteTarget(t *testing.T) {
+	t.Parallel()
+
+	// deepseekRoute rewrites to a model only openrouter serves. Asking for that
+	// rewrite target by name — the shape of a client echoing a response's model
+	// id — must be refused, never handed to the built-in forward to Anthropic.
+	reg := newRegistry(t, personalDoc(deepseekRoute))
+
+	_, err := reg.Resolve(registry.Selection{}, "deepseek/deepseek-v4-flash-0731")
+	if !errors.Is(err, registry.ErrRewriteTarget) {
+		t.Fatalf("Resolve(target) error = %v; want ErrRewriteTarget", err)
+	}
+
+	if !strings.Contains(err.Error(), `"deepseek-flash-low"`) {
+		t.Errorf("error %q does not name the alias to ask for instead", err)
+	}
+}
+
+func TestAnAliasShadowingARewriteTargetStillResolves(t *testing.T) {
+	t.Parallel()
+
+	// One route rewrites to a name another route is keyed under. The alias
+	// match must win: a key is a route, whatever some other route rewrites to.
+	reg := newRegistry(t, personalDoc(
+		`"a/one":{"base_url":"https://openrouter.ai/api","model":"upstream/x",`+
+			`"auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"},`+
+			`"upstream/x":{"base_url":"https://openrouter.ai/api",`+
+			`"auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"}`))
+
+	if got := bare(t, reg, "upstream/x"); got.Alias != "upstream/x" {
+		t.Fatalf("Resolve(%q).Alias = %q; want the shadowing alias itself", "upstream/x", got.Alias)
+	}
+}
+
+func TestARewriteTargetOnTheDefaultUpstreamStillFallsThrough(t *testing.T) {
+	t.Parallel()
+
+	// A pinning route rewrites one Claude id to another, forwarded to Anthropic
+	// — the same upstream the built-in default route reaches, which genuinely
+	// serves the target. The target id's own fallthrough must survive.
+	reg := newRegistry(t, personalDoc(`"claude-sonnet-5":{`+
+		`"base_url":"https://api.anthropic.com","model":"claude-opus-5","auth":"forward"}`))
+
+	assertDefault(t, reg, "claude-opus-5")
+}
+
+func TestARewriteTargetSharedWithTheDefaultUpstreamIsExempt(t *testing.T) {
+	t.Parallel()
+
+	// Two routes rewrite to the same target, one from a foreign upstream and
+	// one from the upstream the default route reaches. The second proves a
+	// fallthrough arrives somewhere that serves the name, so it is not refused.
+	reg := newRegistry(t, personalDoc(
+		`"a/one":{"base_url":"https://openrouter.ai/api","model":"upstream/x",`+
+			`"auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"},`+
+			`"b/two":{"base_url":"https://api.anthropic.com","model":"upstream/x",`+
+			`"auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"}`))
+
+	assertDefault(t, reg, "upstream/x")
+}
+
+func TestARewriteTargetOfADeclaredDefaultUpstreamIsExempt(t *testing.T) {
+	t.Parallel()
+
+	// A context whose declared default route reaches the same upstream a
+	// rewriting alias does — the local-models shape, where fallthrough and
+	// alias land on one server. The target must keep falling through.
+	reg := newRegistry(t, contextDoc(`"work":{`+injectDefault+`,"routes":{`+lunaRoute+`}}`))
+
+	res := resolve(t, reg, registry.Selection{Name: "work", Explicit: true}, "openai/gpt-5.6-luna")
+	if res.Route.Alias != "" {
+		t.Fatalf("Resolve(target).Alias = %q; want the declared default route", res.Route.Alias)
+	}
+}
+
 // aliasNames returns the Alias field of every route in order, so a listing's
 // order is compared without printing whole routes.
 func aliasNames(routes []registry.Route) []string {
