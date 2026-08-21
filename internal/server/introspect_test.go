@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/registry"
 	"github.com/joshsymonds/patchbay/internal/server"
@@ -211,6 +212,75 @@ func TestIntrospectionOmitsAWSFieldsForRoutesThatDoNotSign(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "aws_profile") || strings.Contains(rec.Body.String(), "aws_region") {
 		t.Fatalf("document = %s; an inject route signs nothing and names no AWS fields", rec.Body)
 	}
+}
+
+func TestIntrospectionReportsBillingPolicyAndExplicitClass(t *testing.T) {
+	callerKeyFile(t)
+
+	keyPath := filepath.Join(t.TempDir(), "upstream.key")
+	if err := os.WriteFile(keyPath, []byte(upstreamKey), 0o600); err != nil {
+		t.Fatalf("write upstream key: %v", err)
+	}
+
+	t.Setenv(keyEnvName, keyPath)
+
+	const injectPrefix = `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+		`"api_key_env_file":"` + keyEnvName + `"`
+
+	reg := newContextRegistry(t,
+		`"personal":{"routes":{`+
+			`"paid":`+injectPrefix+`,"billing":"subscription"},`+
+			`"legacy":`+injectPrefix+`}}},`+
+			`"work":{"routes":{`+bedrockRoute+`}}`)
+
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: reg,
+		Listen:   listenAddr,
+	}, introspectRequest(introspectPath, callerKey))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s status = %d; want %d (body %q)", introspectPath, rec.Code, http.StatusOK, rec.Body)
+	}
+
+	doc := decodeDocument(t, rec.Body.Bytes())
+	personal := doc.Contexts["personal"]
+
+	if personal.DefaultRoute.BillingPolicy != billing.PolicyCallerDerived.String() ||
+		personal.DefaultRoute.BillingClass != "" {
+		t.Fatalf("personal default billing = policy %q, class %q; want %q and no explicit class",
+			personal.DefaultRoute.BillingPolicy, personal.DefaultRoute.BillingClass,
+			billing.PolicyCallerDerived)
+	}
+
+	paid := personal.Routes["paid"]
+	if paid.BillingPolicy != billing.PolicyExplicit.String() ||
+		paid.BillingClass != billing.ClassSubscription.String() {
+		t.Fatalf("paid billing = policy %q, class %q; want %q and %q",
+			paid.BillingPolicy, paid.BillingClass, billing.PolicyExplicit, billing.ClassSubscription)
+	}
+
+	legacy := personal.Routes["legacy"]
+	if legacy.BillingPolicy != billing.PolicyExplicit.String() || legacy.BillingClass != "" {
+		t.Fatalf("legacy billing = policy %q, class %q; want %q and omitted class",
+			legacy.BillingPolicy, legacy.BillingClass, billing.PolicyExplicit)
+	}
+
+	bedrock := doc.Contexts["work"].Routes["bedrock-opus"]
+	if bedrock.BillingPolicy != billing.PolicySigV4Metered.String() || bedrock.BillingClass != "" {
+		t.Fatalf("bedrock billing = policy %q, class %q; want %q and no explicit class",
+			bedrock.BillingPolicy, bedrock.BillingClass, billing.PolicySigV4Metered)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"billing_policy":"credential_derived"`) ||
+		!strings.Contains(body, `"billing_policy":"explicit"`) ||
+		!strings.Contains(body, `"billing_policy":"sigv4_metered"`) ||
+		!strings.Contains(body, `"billing_class":"subscription"`) {
+		t.Fatalf("document = %s; want billing policy and explicit class fields", body)
+	}
+
+	assertNoSecrets(t, body)
 }
 
 // assertNoSecrets fails if a document carries any value that only a secret file

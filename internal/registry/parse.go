@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"sort"
+
+	"github.com/joshsymonds/patchbay/internal/billing"
 )
 
 // Wire field names of a route object. They double as the vocabulary of every
@@ -24,6 +26,7 @@ const (
 	fieldAWSProfile        = "aws_profile"
 	fieldAWSRegion         = "aws_region"
 	fieldModelMapEnvFile   = "model_map_env_file"
+	fieldBilling           = "billing"
 	fieldExtraBody         = "extra_body"
 	fieldInsecure          = "insecure"
 	fieldMaxInputTokens    = "max_input_tokens"
@@ -198,6 +201,8 @@ func assignField(route *Route, name string, value json.RawMessage) error {
 		return decodeField(&route.AWSRegion, name, value)
 	case fieldModelMapEnvFile:
 		return decodeField(&route.ModelMapEnvFile, name, value)
+	case fieldBilling:
+		return decodeBillingClass(route, value)
 	case fieldExtraBody:
 		route.ExtraBody = bytes.Clone(value)
 
@@ -215,6 +220,25 @@ func assignField(route *Route, name string, value json.RawMessage) error {
 	default:
 		return fmt.Errorf("unknown field %q", name)
 	}
+}
+
+// decodeBillingClass parses the explicit billing class and records that the
+// field was present. A blank value is present and invalid, not an omission.
+func decodeBillingClass(route *Route, value json.RawMessage) error {
+	var raw string
+	if err := decodeField(&raw, fieldBilling, value); err != nil {
+		return err
+	}
+
+	class, err := billing.ParseClass(raw)
+	if err != nil {
+		return fmt.Errorf("field %q: %w", fieldBilling, err)
+	}
+
+	route.BillingClass = class
+	route.BillingClassSet = true
+
+	return nil
 }
 
 // decodeField decodes a single JSON value, naming the wire field on failure.

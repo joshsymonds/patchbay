@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/joshsymonds/patchbay/internal/anthropic"
+	"github.com/joshsymonds/patchbay/internal/billing"
 )
 
 // AuthMode selects how patchbay authenticates a proxied request upstream.
@@ -68,6 +69,13 @@ type Route struct {
 	// never a Bedrock id itself, which is why none of them appears in the
 	// registry. Sigv4 routes only.
 	ModelMapEnvFile string
+
+	// BillingClass is the explicit billing class an inject route declares.
+	// BillingClassSet distinguishes a temporarily omitted declaration from a
+	// present value. Forward and sigv4 routes derive their policy from Auth and
+	// never set either field.
+	BillingClass    billing.Class
+	BillingClassSet bool
 
 	// ExtraBody is merged into the request JSON at forward time. It is nil when
 	// the route sets no extra body. Treat it as read-only: every Resolve of the
@@ -147,6 +155,23 @@ func foreignTargets(ctx Context) map[string]string {
 	}
 
 	return targets
+}
+
+// BillingPolicy reports how this route determines billing. Forwarded caller
+// credentials determine their own class, sigv4 is always AWS-metered, and an
+// inject route uses its explicit class — including during the temporary period
+// where that class may still be omitted.
+func (r Route) BillingPolicy() billing.Policy {
+	switch r.Auth {
+	case AuthForward:
+		return billing.PolicyCallerDerived
+	case AuthInject:
+		return billing.PolicyExplicit
+	case AuthSigV4:
+		return billing.PolicySigV4Metered
+	default:
+		return ""
+	}
 }
 
 // Upstream is the API root this route actually reaches: the base_url it names,

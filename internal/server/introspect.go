@@ -52,6 +52,8 @@ type ContextSummary struct {
 // does not set are omitted rather than reported as an empty answer.
 type RouteSummary struct {
 	Auth            string `json:"auth"`
+	BillingPolicy   string `json:"billing_policy"`
+	BillingClass    string `json:"billing_class,omitempty"`
 	Upstream        string `json:"upstream"`
 	Model           string `json:"model,omitempty"`
 	MaxInputTokens  int    `json:"max_input_tokens,omitempty"`
@@ -154,6 +156,7 @@ func (gw *gateway) document() Document {
 func routeSummary(route registry.Route) RouteSummary {
 	summary := RouteSummary{
 		Auth:            string(route.Auth),
+		BillingPolicy:   route.BillingPolicy().String(),
 		Upstream:        route.Upstream(),
 		Model:           route.Model,
 		MaxInputTokens:  route.MaxInputTokens,
@@ -163,6 +166,10 @@ func routeSummary(route registry.Route) RouteSummary {
 		KeyFile:         "",
 		ModelMapEnvFile: route.ModelMapEnvFile,
 		ModelMapFile:    "",
+	}
+
+	if route.BillingClassSet {
+		summary.BillingClass = route.BillingClass.String()
 	}
 
 	if route.APIKeyEnvFile != "" {

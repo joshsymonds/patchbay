@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
@@ -1054,4 +1055,108 @@ func TestReloadAddsAndRemovesWholeContexts(t *testing.T) {
 
 	// Removing a context never costs the bare path its default route.
 	assertDefault(t, reg, "claude-sonnet-5")
+}
+
+func TestBillingClassParsingPreservesValueAndPresence(t *testing.T) {
+	t.Parallel()
+
+	const routePrefix = `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+		`"api_key_env_file":"KEY_FILE"`
+
+	reg := newRegistry(t, personalDoc(
+		`"subscription":`+routePrefix+`,"billing":"subscription"},`+
+			`"metered":`+routePrefix+`,"billing":"metered"},`+
+			`"self-hosted":`+routePrefix+`,"billing":"self_hosted"},`+
+			`"omitted":`+routePrefix+`}`))
+
+	if err := reg.Err(); err != nil {
+		t.Fatalf("Err() = %v; want nil for valid billing classes", err)
+	}
+
+	tests := []struct {
+		alias   string
+		want    billing.Class
+		present bool
+	}{
+		{alias: "subscription", want: billing.ClassSubscription, present: true},
+		{alias: "metered", want: billing.ClassMetered, present: true},
+		{alias: "self-hosted", want: billing.ClassSelfHosted, present: true},
+		{alias: "omitted", want: "", present: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.alias, func(t *testing.T) {
+			t.Parallel()
+
+			route := bare(t, reg, tc.alias)
+			if route.BillingClass != tc.want || route.BillingClassSet != tc.present {
+				t.Fatalf("Resolve(%q) billing = %q, present %v; want %q, present %v",
+					tc.alias, route.BillingClass, route.BillingClassSet, tc.want, tc.present)
+			}
+		})
+	}
+
+	aliases := bareAliases(t, reg)
+	for _, route := range aliases {
+		if route.Alias == "subscription" &&
+			(route.BillingClass != billing.ClassSubscription || !route.BillingClassSet) {
+			t.Fatalf("Aliases subscription billing = %q, present %v; want %q, present true",
+				route.BillingClass, route.BillingClassSet, billing.ClassSubscription)
+		}
+	}
+}
+
+func TestRouteBillingPolicyDependsOnlyOnAuthMode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		route registry.Route
+		want  billing.Policy
+	}{
+		{
+			name:  "forward credentials derive billing",
+			route: registry.Route{Auth: registry.AuthForward},
+			want:  billing.PolicyCallerDerived,
+		},
+		{
+			name:  "sigv4 is metered",
+			route: registry.Route{Auth: registry.AuthSigV4},
+			want:  billing.PolicySigV4Metered,
+		},
+		{
+			name: "inject with an explicit class",
+			route: registry.Route{
+				Auth:            registry.AuthInject,
+				BillingClass:    billing.ClassSubscription,
+				BillingClassSet: true,
+			},
+			want: billing.PolicyExplicit,
+		},
+		{
+			name:  "inject with temporarily omitted class",
+			route: registry.Route{Auth: registry.AuthInject},
+			want:  billing.PolicyExplicit,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tc.route.BillingPolicy(); got != tc.want {
+				t.Fatalf("BillingPolicy() = %q; want %q", got, tc.want)
+			}
+		})
+	}
+
+	builtIn := registry.DefaultRoute()
+	if builtIn.BillingClassSet || builtIn.BillingClass != "" {
+		t.Fatalf("DefaultRoute billing = %q, present %v; want no explicit class",
+			builtIn.BillingClass, builtIn.BillingClassSet)
+	}
+
+	if got := builtIn.BillingPolicy(); got != billing.PolicyCallerDerived {
+		t.Fatalf("DefaultRoute BillingPolicy() = %q; want %q", got, billing.PolicyCallerDerived)
+	}
 }

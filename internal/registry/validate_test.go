@@ -815,3 +815,83 @@ func TestValidContextNameIsTheOneSharedRule(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateBillingClassPairing(t *testing.T) {
+	t.Parallel()
+
+	runValidationCases(t, []validationCase{
+		{
+			name:  "inject subscription accepted",
+			alias: "subscription",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","billing":"subscription"}`,
+		},
+		{
+			name:  "inject metered accepted",
+			alias: "metered",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","billing":"metered"}`,
+		},
+		{
+			name:  "inject self hosted accepted",
+			alias: "self-hosted",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","billing":"self_hosted"}`,
+		},
+		{
+			name:  "inject billing temporarily omitted",
+			alias: "omitted",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE"}`,
+		},
+		{
+			name:  "forward with an explicit class rejected",
+			alias: "probe",
+			route: `{"base_url":"https://api.anthropic.com","auth":"forward","billing":"subscription"}`,
+			wants: []string{`"probe"`, "forward", "billing"},
+		},
+		{
+			name:  "sigv4 with an explicit class rejected",
+			alias: "probe",
+			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
+				`"model_map_env_file":"MAP_FILE","billing":"metered"}`,
+			wants: []string{`"probe"`, "sigv4", "billing"},
+		},
+	})
+}
+
+func TestBillingFieldRejectsInvalidValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []validationCase{
+		{
+			name:  "unknown class",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","billing":"prepaid"}`,
+			wants: []string{`"probe"`, "billing", "prepaid"},
+		},
+		{
+			name:  "explicit blank",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","billing":""}`,
+			wants: []string{`"probe"`, "billing"},
+		},
+		{
+			name:  "wrong json type",
+			alias: "probe",
+			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","billing":5}`,
+			wants: []string{`"probe"`, "billing"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			assertRejected(t, fixture(tc.alias, tc.route), tc.alias, tc.wants)
+		})
+	}
+}

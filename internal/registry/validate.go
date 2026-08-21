@@ -144,6 +144,10 @@ func validateRoute(route Route) error {
 			fieldAuth, route.Auth, AuthForward, AuthInject, AuthSigV4)
 	}
 
+	if err := validateBilling(route); err != nil {
+		return err
+	}
+
 	// A sigv4 route names no base_url at all — validateSigV4 refuses one — because
 	// its endpoint comes from the region it signs for.
 	if route.Auth != AuthSigV4 {
@@ -157,6 +161,26 @@ func validateRoute(route Route) error {
 	}
 
 	return validateExtraBody(route.ExtraBody)
+}
+
+// validateBilling enforces where an explicit class may appear. Inject routes
+// may temporarily omit it while existing registries migrate; forward and sigv4
+// routes derive their policy from their credentials and never declare a class.
+func validateBilling(route Route) error {
+	if !route.BillingClassSet {
+		return nil
+	}
+
+	if !route.BillingClass.Valid() {
+		return fmt.Errorf("%s %q is not a valid billing class", fieldBilling, route.BillingClass)
+	}
+
+	if route.Auth != AuthInject {
+		return fmt.Errorf("%s routes must not set %s; their billing policy is %q",
+			route.Auth, fieldBilling, route.BillingPolicy())
+	}
+
+	return nil
 }
 
 // validateTokenCeilings rejects a negative token ceiling. A negative
