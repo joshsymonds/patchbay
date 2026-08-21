@@ -77,7 +77,7 @@ type eventTypeProbe struct {
 // whichever one the cache holds by the time the refusal lands.
 func (p *Proxy) bedrockRequest(
 	r *http.Request,
-	route registry.Route,
+	seat registry.Seat,
 	body []byte,
 ) (*http.Request, uint64, *gatewayError) {
 	if gwErr := bedrockPathGate(r.URL.Path); gwErr != nil {
@@ -97,12 +97,12 @@ func (p *Proxy) bedrockRequest(
 		return nil, 0, docErr
 	}
 
-	model := route.Model
+	model := seat.Model
 	if model == "" {
 		model = documentModel(document)
 	}
 
-	target, gwErr := bedrockTarget(route, model, documentWantsStream(document))
+	target, gwErr := bedrockTarget(seat, model, documentWantsStream(document))
 	if gwErr != nil {
 		return nil, 0, gwErr
 	}
@@ -112,7 +112,12 @@ func (p *Proxy) bedrockRequest(
 		return nil, 0, translateErr
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(translated))
+	req, err := http.NewRequestWithContext(
+		r.Context(),
+		http.MethodPost,
+		target,
+		bytes.NewReader(translated),
+	)
 	if err != nil {
 		return nil, 0, &gatewayError{
 			status:  http.StatusInternalServerError,
@@ -121,40 +126,59 @@ func (p *Proxy) bedrockRequest(
 		}
 	}
 
-	copyHeader(req.Header, r.Header,
-		droppedHeaders(r.Header, headerHost, headerContentLength, headerAcceptEncoding, CallerKeyHeader))
+	copyHeader(
+		req.Header,
+		r.Header,
+		droppedHeaders(
+			r.Header,
+			headerHost,
+			headerContentLength,
+			headerAcceptEncoding,
+			CallerKeyHeader,
+		),
+	)
 	req.Header.Del(anthropic.HeaderAuthorization)
 	req.Header.Del(anthropic.HeaderClientKey)
 	req.Header.Set(headerAcceptEncoding, encodingIdentity)
 	req.Header.Set(anthropic.HeaderContentType, jsonContentType)
 	req.Header.Set("Accept", jsonContentType)
 
-	generation, signErr := p.signBedrock(r.Context(), req, route, translated)
+	generation, signErr := p.signBedrock(r.Context(), req, seat, translated)
 
 	return req, generation, signErr
 }
 
-// signBedrock exports the route's AWS credentials and signs req with them,
+// signBedrock exports the seat's AWS credentials and signs req with them,
 // reporting which generation of the profile's credentials it signed with.
 func (p *Proxy) signBedrock(
 	ctx context.Context,
 	req *http.Request,
-	route registry.Route,
+	seat registry.Seat,
 	payload []byte,
 ) (uint64, *gatewayError) {
-	creds, generation, err := p.credentials.Credentials(ctx, route.AWSProfile)
+	creds, generation, err := p.credentials.Credentials(ctx, seat.AWSProfile)
 	if err != nil {
 		// The source's own error is already sanitized; the advice is what the
 		// operator can act on, and neither says anything about a credential.
 		return 0, &gatewayError{
 			status:  http.StatusBadGateway,
 			errType: "",
-			err: fmt.Errorf("aws credentials for profile %q are unavailable; run: aws sso login --profile %s",
-				route.AWSProfile, route.AWSProfile),
+			err: fmt.Errorf(
+				"aws credentials for profile %q are unavailable; run: aws sso login --profile %s",
+				seat.AWSProfile,
+				seat.AWSProfile,
+			),
 		}
 	}
 
-	if signErr := awssig.Sign(req, creds, bedrockService, route.AWSRegion, payload, time.Now()); signErr != nil {
+	if signErr := awssig.Sign(
+		req,
+		creds,
+		bedrockService,
+		seat.AWSRegion,
+		payload,
+		time.Now(),
+	); signErr != nil {
 		return 0, &gatewayError{
 			status:  http.StatusBadGateway,
 			errType: "",
@@ -165,7 +189,7 @@ func (p *Proxy) signBedrock(
 	return generation, nil
 }
 
-// bedrockPathGate refuses every endpoint a Bedrock route cannot answer.
+// bedrockPathGate refuses every endpoint a Bedrock seat cannot answer.
 // count_tokens is called out by name because Claude Code asks for it routinely
 // and Bedrock has no equivalent: an honest 501 is worth more than a 404 that
 // reads like a broken gateway.
@@ -177,20 +201,20 @@ func bedrockPathGate(path string) *gatewayError {
 		return &gatewayError{
 			status:  http.StatusNotImplemented,
 			errType: "",
-			err:     errors.New("count_tokens is not supported for Bedrock routes"),
+			err:     errors.New("count_tokens is not supported for Bedrock Seats"),
 		}
 	default:
 		return &gatewayError{
 			status:  http.StatusNotFound,
 			errType: anthropic.ErrorTypeNotFound,
-			err:     fmt.Errorf("a Bedrock route only relays %s, not %s", messagesPath, path),
+			err:     fmt.Errorf("a Bedrock seat only relays %s, not %s", messagesPath, path),
 		}
 	}
 }
 
-// bedrockTarget resolves the model through the route's map file and returns the
+// bedrockTarget resolves the model through the seat's map file and returns the
 // invocation URL for it, streamed or not.
-func bedrockTarget(route registry.Route, model string, streamed bool) (string, *gatewayError) {
+func bedrockTarget(seat registry.Seat, model string, streamed bool) (string, *gatewayError) {
 	if model == "" {
 		return "", &gatewayError{
 			status:  http.StatusBadRequest,
@@ -199,12 +223,12 @@ func bedrockTarget(route registry.Route, model string, streamed bool) (string, *
 		}
 	}
 
-	mapping, err := readModelMap(route.ModelMapEnvFile)
+	mapping, err := readModelMap(seat.ModelMapEnvFile)
 	if err != nil {
 		return "", &gatewayError{
 			status:  http.StatusInternalServerError,
 			errType: "",
-			err:     fmt.Errorf("route %q has an unusable model map: %w", route.Alias, err),
+			err:     fmt.Errorf("the selected Seat has an unusable model map: %w", err),
 		}
 	}
 
@@ -213,7 +237,7 @@ func bedrockTarget(route registry.Route, model string, streamed bool) (string, *
 		return "", &gatewayError{
 			status:  http.StatusBadRequest,
 			errType: anthropic.ErrorTypeInvalidRequest,
-			err:     fmt.Errorf("model %q is not available on this Bedrock route", model),
+			err:     fmt.Errorf("model %q is not available on this Bedrock seat", model),
 		}
 	}
 
@@ -222,11 +246,15 @@ func bedrockTarget(route registry.Route, model string, streamed bool) (string, *
 		suffix = invokeStreamPath
 	}
 
-	return registry.BedrockEndpoint(route.AWSRegion) + invokePath + awssig.EscapePathSegment(bedrockModel) + suffix,
+	return registry.BedrockEndpoint(
+			seat.AWSRegion,
+		) + invokePath + awssig.EscapePathSegment(
+			bedrockModel,
+		) + suffix,
 		nil
 }
 
-// readModelMap resolves the double indirection a sigv4 route uses for its model
+// readModelMap resolves the double indirection a sigv4 seat uses for its model
 // map: envName is the name of an environment variable whose value is the path of
 // a JSON file mapping Anthropic model ids to Bedrock ones. The file is read per
 // request, so a rebuild that changes it takes effect immediately, and no Bedrock
@@ -259,7 +287,7 @@ func bedrockDocument(body []byte) (map[string]json.RawMessage, *gatewayError) {
 		return nil, &gatewayError{
 			status:  http.StatusBadRequest,
 			errType: anthropic.ErrorTypeInvalidRequest,
-			err:     errors.New("a Bedrock route needs a JSON object body"),
+			err:     errors.New("a Bedrock seat needs a JSON object body"),
 		}
 	}
 
@@ -325,19 +353,26 @@ func translateBedrockDocument(document map[string]json.RawMessage) ([]byte, *gat
 
 // isBedrockStream reports whether resp is an event-stream Bedrock answer, which
 // is the only response patchbay translates rather than relays.
-func isBedrockStream(route registry.Route, resp *http.Response) bool {
-	if route.Auth != registry.AuthSigV4 {
+func isBedrockStream(seat registry.Seat, resp *http.Response) bool {
+	if seat.AuthMode != registry.AuthSigV4 {
 		return false
 	}
 
-	return strings.Contains(strings.ToLower(resp.Header.Get(anthropic.HeaderContentType)), bedrockStreamType)
+	return strings.Contains(
+		strings.ToLower(resp.Header.Get(anthropic.HeaderContentType)),
+		bedrockStreamType,
+	)
 }
 
 // streamBedrock translates a Bedrock event stream into the Anthropic SSE the
 // caller's client speaks, flushing every event as it arrives, and tees the
 // translated bytes into the capture the record is summarized from — the SSE, not
 // the framing, because that is what the caller actually received.
-func (p *Proxy) streamBedrock(ctx context.Context, w http.ResponseWriter, resp *http.Response) *capture {
+func (p *Proxy) streamBedrock(
+	ctx context.Context,
+	w http.ResponseWriter,
+	resp *http.Response,
+) *capture {
 	copyHeader(w.Header(), resp.Header,
 		droppedHeaders(resp.Header, headerContentLength, anthropic.HeaderContentType))
 	w.Header().Set(anthropic.HeaderContentType, eventStreamType)

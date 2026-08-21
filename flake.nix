@@ -50,6 +50,20 @@
           default = patchbay;
         });
 
+      # Evaluation coverage for the home-manager module, in two halves: the
+      # option types it declares, and the wiring an enabled `services.patchbay`
+      # generates — the registry document, the CLIProxyAPI config, and the two
+      # systemd user units. It is a check rather than a package because almost
+      # nothing is built from it: evaluating the module with a value the registry
+      # would refuse fails here instead, and the generated documents are realized
+      # only so their contents can be read. Run by `just check`.
+      checks = forAllSystems (system: {
+        hm-module-options = import ./nix/hm-module-test.nix self {
+          inherit (nixpkgs) lib;
+          pkgs = import nixpkgs { inherit system; };
+        };
+      });
+
       # The supported deployment: `services.patchbay` as a home-manager module,
       # running the gateway (and, opted in, the Codex-subscription upstream) as
       # systemd user services. Documented in docs/nix.md.

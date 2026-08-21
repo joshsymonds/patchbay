@@ -9,8 +9,8 @@ ghcr.io/joshsymonds/patchbay:latest
 It is a distroless Linux image for amd64 and arm64. It has no shell or package
 manager and runs as UID/GID 65532.
 
-The image cannot serve `sigv4` routes because it does not include the AWS CLI.
-Use it for `forward` and `inject` routes. Use a native install or the
+The image cannot serve `sigv4` Seats because it does not include the AWS CLI. Use
+it for `forward` and `inject` Seats. Use a native install or the
 [Nix module](nix.md) for Bedrock.
 
 ## Compose setup
@@ -22,7 +22,8 @@ $ cp -R examples/docker ./patchbay-docker
 $ cd patchbay-docker
 ```
 
-Edit `routes.json`, then create every bind-mounted file before starting Compose:
+Edit the strict `routes.json`, then create every bind-mounted file before
+starting Compose:
 
 ```console
 $ head -c 32 /dev/urandom | base64 > caller.key
@@ -30,8 +31,8 @@ $ $EDITOR openrouter.key
 $ printf '%s\n' 'patchbay-local' > chatgpt.key
 ```
 
-Remove the ChatGPT route, key variable, and key mount if you will not use the
-optional `codex` profile. A missing bind-mount source may be created as a
+Remove the ChatGPT Seat and binding, key variable, and key mount if you will not
+use the optional `codex` profile. A missing bind-mount source may be created as a
 directory and hide the expected file.
 
 On native Linux, make the files readable by container group 65532:
@@ -53,6 +54,9 @@ $ docker compose up -d patchbay
 $ docker compose logs -f patchbay
 ```
 
+Initial registry failure is fatal, so `patchbay` will not bind its listener until
+the mounted JSON is strict and valid.
+
 The image sets these runtime values:
 
 | Purpose | Value |
@@ -68,8 +72,8 @@ ports:
   - "127.0.0.1:4100:4100"
 ```
 
-Do not replace this with a public bind. Forward routes can spend caller
-credentials, and inject routes can spend gateway credentials when the caller key
+Do not replace this with a public bind. Forward Seats can spend caller
+credentials, and inject Seats can spend gateway credentials when the caller key
 is known.
 
 ## Claude Code
@@ -86,7 +90,7 @@ Configure the host client:
 ```
 
 Leave `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` unset to keep using the
-Claude Code subscription login.
+Claude Code subscription login through a `forward` default Seat.
 
 ## Inspection
 
@@ -96,7 +100,8 @@ A host `patchbay` binary can query the containerized gateway:
 $ export PATCHBAY_LISTEN=127.0.0.1:4100
 $ export PATCHBAY_CALLER_KEY_FILE="$PWD/caller.key"
 $ patchbay contexts
-$ patchbay routes --ctx personal
+$ patchbay seats
+$ patchbay bindings --ctx personal
 $ patchbay resolve personal openrouter/kimi-k2
 ```
 
@@ -108,11 +113,11 @@ $ curl -fsS \
     http://127.0.0.1:4100/_patchbay/registry | jq .
 ```
 
-Patchbay has no ledger-tail command. Copy a snapshot and inspect the JSONL files:
+Patchbay has no ledger-tail command. Copy a snapshot and inspect v2 JSONL files:
 
 ```console
 $ docker compose cp patchbay:/var/lib/patchbay/ledger ./patchbay-ledger
-$ jq -c . ./patchbay-ledger/patchbay-*.jsonl
+$ jq -c . ./patchbay-ledger/patchbay-v2-*.jsonl
 ```
 
 Use `docker compose logs -f patchbay` for service logs.
@@ -136,7 +141,7 @@ $ docker compose logs -f cli-proxy-api patchbay
 ```
 
 OAuth state persists in the `codex-auth` volume. CLIProxyAPI has no published host
-port. Its route uses plain HTTP on the private Compose network and therefore sets
+port. Its Seat uses plain HTTP on the private Compose network and therefore sets
 `insecure: true`; do not attach untrusted containers to that network.
 
 The CLIProxyAPI image does not contain `curl`, `wget`, or `jq`. Query its models

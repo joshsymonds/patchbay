@@ -18,9 +18,17 @@ default:
 
 # Run the full quality gate. The nixpkgs pin check runs first: it gates
 # everything on devenv.lock and flake.lock agreeing on one nixpkgs rev. Then
-# lint, then race+coverage.
-check: && lint cover
+# lint, then race+coverage, then the home-manager module's option types and the
+# wiring an enabled `services.patchbay` generates.
+check: && lint cover nix-module
     ./scripts/check-nix-pin.sh
+
+# Evaluate the home-manager module (nix/hm-module-test.nix): the option types it
+# declares, plus the registry, CLIProxyAPI config and systemd user units an
+# enabled `services.patchbay` generates. The flake only sees git-tracked files,
+# so `git add` anything new under nix/ before running this.
+nix-module:
+    nix build --no-link ".#checks.$(nix eval --impure --raw --expr builtins.currentSystem).hm-module-options"
 
 # Source the cached devenv env, regenerating if missing or stale. The snapshot
 # is invalidated by any env-defining file: the nixpkgs input (devenv.yaml), the

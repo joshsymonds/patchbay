@@ -1,8 +1,8 @@
 // Package proxy forwards Anthropic Messages API requests to the upstream a
-// route names, tees the response into the ledger, and hands the caller the
+// seat names, tees the response into the ledger, and hands the caller the
 // upstream's bytes unchanged.
 //
-// Byte fidelity is the invariant the whole package is built around. On a route
+// Byte fidelity is the invariant the whole package is built around. On a seat
 // that rewrites nothing, the request body forwarded upstream is the caller's
 // original bytes — never decoded and re-encoded — and the response is streamed
 // back flush by flush exactly as it arrived. The ledger tee is passive: any
@@ -32,7 +32,7 @@ import (
 // written and flushed as it arrives, so this bounds latency, not throughput.
 const streamChunkBytes = 32768
 
-// The Messages endpoints an inject route is allowed to relay. An inject route
+// The Messages endpoints an inject seat is allowed to relay. An inject seat
 // pays with a foreign key, so it exists to answer Messages turns and nothing
 // else; a stray path on it must not spend that key on some other endpoint.
 // messagesCountPath deliberately avoids the word "token" in its name: a const
@@ -88,7 +88,7 @@ type Recorder interface {
 
 // Config is everything the pipeline needs from its host process.
 type Config struct {
-	// Registry resolves an inbound model name to its route. Required.
+	// Registry resolves an inbound model name to its seat. Required.
 	Registry *registry.Registry
 
 	// Recorder receives one record per request. A nil Recorder records nothing
@@ -117,7 +117,7 @@ type Proxy struct {
 	host     string
 	logger   *slog.Logger
 
-	// credentials exports and caches the AWS credentials sigv4 routes sign with,
+	// credentials exports and caches the AWS credentials sigv4 Seats sign with,
 	// one cache per profile shared by every request that rides one.
 	credentials *awssig.CredentialSource
 
@@ -148,136 +148,110 @@ func New(cfg Config) *Proxy {
 	}
 }
 
-// ServeHTTP runs one request through the pipeline: read it, resolve its route,
-// forward it, stream the answer back and tee a record into the ledger.
+// ServeHTTP resolves one immutable Context snapshot, selects a Seat, forwards,
+// streams the answer, and records the v2 resolution.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-
-	// The context a request selected is decided by the HTTP surface, which
-	// strips the prefix that named it before the pipeline sees the path. A
-	// request that named none selects the personal context.
 	sel := registry.SelectionFrom(r.Context())
 	class := credentialClass(r.Header)
+	observation := observeSubagent(r.Header)
+
+	ctxRes, ctxErr := p.contextResolution(r.Context(), sel)
+	if ctxErr != nil {
+		status := http.StatusNotFound
+		errType := anthropic.ErrorTypeNotFound
+		if errors.Is(ctxErr, registry.ErrInvalid) {
+			status = http.StatusServiceUnavailable
+			errType = anthropic.ErrorTypeAPI
+		}
+		p.abort(r.Context(), w, newExchange(ctxRes.Context, class, "", observation, start),
+			&gatewayError{status: status, errType: errType, err: ctxErr})
+		return
+	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, requestLimitBytes))
 	if err != nil {
-		p.abort(r.Context(), w, newExchange(registry.DefaultRoute(), sel.Name, class, "", start), &gatewayError{
-			status: readFailureStatus(err),
-			err:    fmt.Errorf("read request body: %w", err),
-		})
-
+		p.abort(
+			r.Context(),
+			w,
+			newExchange(ctxRes.Context, class, "", observation, start),
+			&gatewayError{
+				status: readFailureStatus(err), err: fmt.Errorf("read request body: %w", err),
+			},
+		)
 		return
 	}
 
 	requestModel := extractModel(body)
-
-	res, resErr := p.resolve(r.Context(), sel, requestModel)
+	res, resErr := ctxRes.Select(requestModel, observation)
 	if resErr != nil {
-		// Two refusals land here. A model that is a foreign route's rewrite
-		// target is refused for any caller, in the not-found shape the real
-		// Anthropic API answers an unknown model with, so the client that
-		// echoed a rewritten model id gets an error it already knows how to
-		// read. An unresolvable named context can only arrive from a pipeline
-		// driven with no surface in front of it — through the gateway the
-		// context was resolved before the request was routed — and it fails
-		// closed all the same: a named context is never served by another.
-		// Either way the record carries the built-in route the way every other
-		// refusal does — nothing was sent anywhere, and a record the ledger
-		// would drop for want of an upstream is a refusal nobody can audit.
-		errType := ""
-		if errors.Is(resErr, registry.ErrRewriteTarget) {
-			errType = anthropic.ErrorTypeNotFound
-		}
-
-		p.abort(r.Context(), w, newExchange(registry.DefaultRoute(), res.Context, class, requestModel, start),
-			&gatewayError{status: http.StatusNotFound, errType: errType, err: resErr})
-
+		p.abort(
+			r.Context(),
+			w,
+			newExchange(ctxRes.Context, class, requestModel, observation, start),
+			&gatewayError{status: http.StatusNotFound, errType: anthropic.ErrorTypeNotFound,
+				err: fmt.Errorf("select the request model: %w", resErr)},
+		)
 		return
 	}
 
-	route := res.Route
-	exch := newExchange(route, res.Context, class, requestModel, start)
-
-	upstreamBody, bodyErr := forwardBody(body, route)
+	seat := res.Seat
+	exch := newSelectedExchange(res, class, requestModel, start)
+	upstreamBody, bodyErr := forwardBody(body, seat)
 	if bodyErr != nil {
 		p.abort(r.Context(), w, exch, bodyErr)
-
 		return
 	}
-
-	if route.CaptureBodies {
+	if seat.CaptureBodies {
 		exch.requestBody = string(upstreamBody)
 	}
 
-	req, generation, reqErr := p.upstreamRequest(r, route, upstreamBody)
+	req, generation, reqErr := p.upstreamRequest(r, seat, upstreamBody)
 	if reqErr != nil {
 		p.abort(r.Context(), w, exch, reqErr)
-
 		return
 	}
-
 	sent := time.Now()
-
-	resp, sendErr := p.send(r, route, upstreamBody, req, generation)
+	resp, sendErr := p.send(r, seat, upstreamBody, req, generation)
 	if sendErr != nil {
 		p.abort(r.Context(), w, exch, sendErr)
-
 		return
 	}
-
 	defer resp.Body.Close()
 
 	exch.upstreamMS = millis(time.Since(sent))
 	exch.status = resp.StatusCode
 	exch.contentType = resp.Header.Get(anthropic.HeaderContentType)
-
 	var capt *capture
-
-	if isBedrockStream(route, resp) {
-		// The caller is handed Anthropic SSE, so that — not the event-stream
-		// framing it arrived in — is what the record is summarized from.
+	if isBedrockStream(seat, resp) {
 		exch.contentType = eventStreamType
 		capt = p.streamBedrock(r.Context(), w, resp)
 	} else {
 		capt = p.stream(r.Context(), w, resp)
 	}
 	exch.durationMS = millis(time.Since(start))
-
 	p.record(exch, capt)
 }
 
-// resolve picks the route serving model inside the request's own context. A
-// model the context refuses to serve — a foreign route's rewrite target —
-// comes back as the selection's own error, on either path.
-//
-// The HTTP surface resolves the context once, before anything dispatches on the
-// request, and attaches the resolution; consuming that is what keeps one request
-// on one registry document even when the file is replaced while the request is
-// in flight. A pipeline driven directly, with no surface in front of it,
-// resolves for itself.
-func (p *Proxy) resolve(
+func (p *Proxy) contextResolution(
 	ctx context.Context,
 	sel registry.Selection,
-	model string,
 ) (registry.Resolution, error) {
+	if err := registry.ResolutionErrorFrom(ctx); err != nil {
+		return registry.Resolution{
+				Context: sel.Name,
+			}, fmt.Errorf(
+				"use attached Context resolution: %w",
+				err,
+			)
+	}
 	if res, ok := registry.ResolutionFrom(ctx); ok {
-		selected, err := res.Select(model)
-		if err != nil {
-			return selected, fmt.Errorf("route the request model: %w", err)
-		}
-
-		return selected, nil
+		return res, nil
 	}
-
-	res, err := p.registry.Resolve(sel, model)
+	res, err := p.registry.Resolve(sel, "", nil)
 	if err != nil {
-		if errors.Is(err, registry.ErrUnknownContext) {
-			return res, fmt.Errorf("resolve the request context: %w", err)
-		}
-
-		return res, fmt.Errorf("route the request model: %w", err)
+		return res, fmt.Errorf("resolve the request context: %w", err)
 	}
-
 	return res, nil
 }
 
@@ -307,21 +281,34 @@ func (p *Proxy) Drain(ctx context.Context) {
 // abort answers a failure patchbay originated, in Anthropic's error shape, and
 // records it. An upstream's own error never comes through here: it is streamed
 // back untouched.
-func (p *Proxy) abort(ctx context.Context, w http.ResponseWriter, exch *exchange, gwErr *gatewayError) {
+func (p *Proxy) abort(
+	ctx context.Context,
+	w http.ResponseWriter,
+	exch *exchange,
+	gwErr *gatewayError,
+) {
 	body := anthropic.TypedErrorBody(gwErr.anthropicType(), gwErr)
 
 	w.Header().Set(anthropic.HeaderContentType, "application/json")
 	w.WriteHeader(gwErr.status)
 
 	if _, writeErr := w.Write(body); writeErr != nil {
-		p.logger.WarnContext(ctx, "client went away before the error reached it", slog.Any("error", writeErr))
+		p.logger.WarnContext(
+			ctx,
+			"client went away before the error reached it",
+			slog.Any("error", writeErr),
+		)
 	}
 
 	exch.status = gwErr.status
 	exch.errorBody = string(body)
 	exch.durationMS = millis(time.Since(exch.start))
 
-	p.logger.WarnContext(ctx, "gateway error", slog.String("alias", exch.route.Alias),
+	seatID := ""
+	if exch.resolution != nil {
+		seatID = exch.resolution.SeatID
+	}
+	p.logger.WarnContext(ctx, "gateway error", slog.String("seat", seatID),
 		slog.Int("status", gwErr.status), slog.Any("error", gwErr.err))
 
 	p.record(exch, nil)
@@ -420,7 +407,7 @@ func (p *Proxy) appendRecord(exch *exchange, capt *capture) {
 
 // send performs the upstream request and hands back its response.
 //
-// A sigv4 route gets one retry, and only on a 403: AWS refuses a signature made
+// A sigv4 seat gets one retry, and only on a 403: AWS refuses a signature made
 // with a credential that has since expired, which is the ordinary end of an SSO
 // session rather than a failure worth surfacing. The credential that signed the
 // refused request — named by generation, not by whatever the cache holds now —
@@ -429,7 +416,7 @@ func (p *Proxy) appendRecord(exch *exchange, capt *capture) {
 // relayed 403 would only read as a broken gateway.
 func (p *Proxy) send(
 	r *http.Request,
-	route registry.Route,
+	seat registry.Seat,
 	body []byte,
 	req *http.Request,
 	generation uint64,
@@ -443,14 +430,14 @@ func (p *Proxy) send(
 		}
 	}
 
-	if route.Auth != registry.AuthSigV4 || resp.StatusCode != http.StatusForbidden {
+	if seat.AuthMode != registry.AuthSigV4 || resp.StatusCode != http.StatusForbidden {
 		return resp, nil
 	}
 
 	p.discard(r.Context(), resp)
-	p.credentials.Invalidate(route.AWSProfile, generation)
+	p.credentials.Invalidate(seat.AWSProfile, generation)
 
-	retry, _, buildErr := p.upstreamRequest(r, route, body)
+	retry, _, buildErr := p.upstreamRequest(r, seat, body)
 	if buildErr != nil {
 		return nil, buildErr
 	}
@@ -470,8 +457,11 @@ func (p *Proxy) send(
 		return nil, &gatewayError{
 			status:  http.StatusBadGateway,
 			errType: "",
-			err: fmt.Errorf("bedrock refused the request signed with profile %q twice; run: aws sso login --profile %s",
-				route.AWSProfile, route.AWSProfile),
+			err: fmt.Errorf(
+				"bedrock refused the request signed with profile %q twice; run: aws sso login --profile %s",
+				seat.AWSProfile,
+				seat.AWSProfile,
+			),
 		}
 	}
 
@@ -486,7 +476,12 @@ func (p *Proxy) send(
 func (p *Proxy) discard(ctx context.Context, resp *http.Response) {
 	// A body that overruns the ceiling is simply abandoned: the connection is
 	// torn down rather than pooled, which is the cheaper of the two failures.
-	if _, err := io.CopyN(io.Discard, resp.Body, drainLimitBytes); err != nil && !errors.Is(err, io.EOF) {
+	if _, err := io.CopyN(
+		io.Discard,
+		resp.Body,
+		drainLimitBytes,
+	); err != nil &&
+		!errors.Is(err, io.EOF) {
 		p.logger.WarnContext(ctx, "draining a refused response failed", slog.Any("error", err))
 	}
 
@@ -495,34 +490,34 @@ func (p *Proxy) discard(ctx context.Context, resp *http.Response) {
 	}
 }
 
-// upstreamRequest builds the request to send upstream: the route's base URL
+// upstreamRequest builds the request to send upstream: the seat's base URL
 // carrying the inbound path and raw query verbatim, the caller's headers minus
-// the ones a proxy owns, and the route's credentials.
+// the ones a proxy owns, and the seat's credentials.
 // It also reports the AWS credential generation a sigv4 request was signed
-// with; every other route signs nothing and reports zero.
+// with; every other seat signs nothing and reports zero.
 func (p *Proxy) upstreamRequest(
 	r *http.Request,
-	route registry.Route,
+	seat registry.Seat,
 	body []byte,
 ) (*http.Request, uint64, *gatewayError) {
-	// A sigv4 route sends a translated, signed request to an endpoint its region
+	// A sigv4 seat sends a translated, signed request to an endpoint its region
 	// derives, so it shares none of the relay path below.
-	if route.Auth == registry.AuthSigV4 {
-		return p.bedrockRequest(r, route, body)
+	if seat.AuthMode == registry.AuthSigV4 {
+		return p.bedrockRequest(r, seat, body)
 	}
 
-	// Both gates below live only inside the AuthInject branch, so a forward or
-	// default route never reaches either. DefaultRoute() is AuthForward, so a
-	// registry that fails to resolve falls to a route that is never checked —
-	// the default route can never fail closed. The caller-key check reads the
-	// inbound request, before copyHeader strips X-Patchbay-Key from the upstream
-	// copy below, so it sees the header the caller actually sent.
-	if route.Auth == registry.AuthInject {
+	// Both gates below live only inside the AuthInject branch. Registry and
+	// Context failures abort before any Seat reaches this point. The caller-key
+	// check reads the inbound request before copyHeader strips X-Patchbay-Key from
+	// the upstream copy, so it sees the header the caller actually sent.
+	if seat.AuthMode == registry.AuthInject {
 		if !isInjectMessagesPath(r.URL.Path) {
 			return nil, 0, &gatewayError{
 				status: http.StatusNotFound,
-				err: fmt.Errorf("route %q injects a key and only relays the Messages endpoints, not %s",
-					route.Alias, r.URL.Path),
+				err: fmt.Errorf(
+					"the selected Seat injects a key and only relays the Messages endpoints, not %s",
+					r.URL.Path,
+				),
 			}
 		}
 
@@ -531,7 +526,7 @@ func (p *Proxy) upstreamRequest(
 		}
 	}
 
-	target := strings.TrimSuffix(route.BaseURL, "/") + r.URL.EscapedPath()
+	target := strings.TrimSuffix(seat.Upstream, "/") + r.URL.EscapedPath()
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
@@ -544,11 +539,20 @@ func (p *Proxy) upstreamRequest(
 		}
 	}
 
-	copyHeader(req.Header, r.Header,
-		droppedHeaders(r.Header, headerHost, headerContentLength, headerAcceptEncoding, CallerKeyHeader))
+	copyHeader(
+		req.Header,
+		r.Header,
+		droppedHeaders(
+			r.Header,
+			headerHost,
+			headerContentLength,
+			headerAcceptEncoding,
+			CallerKeyHeader,
+		),
+	)
 	req.Header.Set(headerAcceptEncoding, encodingIdentity)
 
-	if authErr := applyAuth(req, route); authErr != nil {
+	if authErr := applyAuth(req, seat); authErr != nil {
 		return nil, 0, authErr
 	}
 
@@ -556,7 +560,7 @@ func (p *Proxy) upstreamRequest(
 }
 
 // isInjectMessagesPath reports whether path is one of the Messages endpoints an
-// inject route may relay.
+// inject seat may relay.
 func isInjectMessagesPath(path string) bool {
 	return path == messagesPath || path == messagesCountPath
 }

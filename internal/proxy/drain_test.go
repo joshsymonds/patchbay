@@ -26,13 +26,13 @@ func blockedRecord(t *testing.T, recorder *stubRecorder) *proxy.Proxy {
 	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","id":"msg_1"}`))
 
 	pxy := proxy.New(proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: recorder,
 		Client:   anthropicClient(t, stub),
 		Host:     testHost,
 	})
 
-	pxy.ServeHTTP(httptest.NewRecorder(), messagesRequest(`{"model":"`+echoAlias+`"}`))
+	pxy.ServeHTTP(httptest.NewRecorder(), messagesRequest(`{"model":"`+echoSelector+`"}`))
 
 	<-recorder.started
 

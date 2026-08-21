@@ -9,219 +9,335 @@ import (
 	"sort"
 )
 
-// Wire field names of a route object. They double as the vocabulary of every
-// parse and validation error, so an operator reading a log sees the JSON key
-// that needs fixing. fieldKeyEnvFile deliberately omits "API": a const spelled
-// fieldAPIKeyEnvFile trips gosec's hardcoded-credential heuristic (G101).
 const (
+	fieldDefaultContext    = "default_context"
+	fieldSeats             = "seats"
 	fieldContexts          = "contexts"
-	fieldRoutes            = "routes"
-	fieldDefaultRoute      = "default_route"
-	fieldBaseURL           = "base_url"
+	fieldDefaultSeat       = "default_seat"
+	fieldModels            = "models"
+	fieldSubagents         = "subagents"
+	fieldUpstream          = "upstream"
 	fieldModel             = "model"
-	fieldAuth              = "auth"
+	fieldAuthMode          = "auth_mode"
 	fieldKeyEnvFile        = "api_key_env_file"
 	fieldAWSProfile        = "aws_profile"
 	fieldAWSRegion         = "aws_region"
 	fieldModelMapEnvFile   = "model_map_env_file"
 	fieldExtraBody         = "extra_body"
-	fieldInsecure          = "insecure"
 	fieldMaxInputTokens    = "max_input_tokens"
 	fieldMaxOutputTokens   = "max_output_tokens"
+	fieldInsecure          = "insecure"
 	fieldStripCacheControl = "strip_cache_control"
 	fieldCaptureBodies     = "capture_bodies"
 )
 
-// registryFile is the top level of a registry document.
-type registryFile struct {
-	Contexts map[string]json.RawMessage `json:"contexts"`
+type document struct {
+	DefaultContext string
+	Seats          map[string]Seat
+	Contexts       map[string]Context
 }
 
-// parseRegistry strictly decodes a registry document into contexts keyed by
-// name. Unknown fields, trailing data and empty alias keys are all rejected: a
-// registry patchbay does not fully understand is not one it will honor. That
-// strictness is also what makes a document of some other shape — an older one
-// keyed by "routes", or a newer one this build has never seen — fail whole
-// rather than half-apply.
-//
-// Alias keys are unconstrained. Directory-style names such as "openrouter/sol"
-// are the convention, but they are matched whole and never parsed, so no
-// character is special and none is disallowed. Context names are the opposite:
-// they ride in a URL path, and validateContexts holds them to that.
-func parseRegistry(data []byte) (map[string]Context, error) {
-	var file registryFile
-
+func parseRegistry(data []byte) (document, error) {
+	var raw json.RawMessage
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-
-	if err := dec.Decode(&file); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+	if err := dec.Decode(&raw); err != nil {
+		return document{}, fmt.Errorf("decode: %w", err)
 	}
-
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, errors.New("unexpected trailing data after the registry document")
+		return document{}, errors.New("unexpected trailing data after the registry document")
 	}
 
-	names := sortedKeys(file.Contexts)
-	contexts := make(map[string]Context, len(names))
+	fields, objectErr := object(raw, "registry document")
+	if objectErr != nil {
+		return document{}, objectErr
+	}
+	required := []string{fieldDefaultContext, fieldSeats, fieldContexts}
+	if fieldsErr := exactFields(fields, required, required); fieldsErr != nil {
+		return document{}, fieldsErr
+	}
 
-	for _, name := range names {
-		parsed, err := parseContext(name, file.Contexts[name])
-		if err != nil {
-			return nil, fmt.Errorf("context %q: %w", name, err)
+	var out document
+	if decodeErr := decodeField(
+		&out.DefaultContext,
+		fieldDefaultContext,
+		fields[fieldDefaultContext],
+	); decodeErr != nil {
+		return document{}, decodeErr
+	}
+	seats, seatsErr := parseSeats(fields[fieldSeats])
+	if seatsErr != nil {
+		return document{}, seatsErr
+	}
+	out.Seats = seats
+	contexts, contextsErr := parseContexts(fields[fieldContexts])
+	if contextsErr != nil {
+		return document{}, contextsErr
+	}
+	out.Contexts = contexts
+	return out, nil
+}
+
+func parseSeats(raw json.RawMessage) (map[string]Seat, error) {
+	entries, err := object(raw, fieldSeats)
+	if err != nil {
+		return nil, err
+	}
+	seats := make(map[string]Seat, len(entries))
+	for _, id := range sortedKeys(entries) {
+		seat, parseErr := parseSeat(entries[id])
+		if parseErr != nil {
+			return nil, fmt.Errorf("seat %q: %w", id, parseErr)
 		}
+		seats[id] = seat
+	}
+	return seats, nil
+}
 
-		contexts[name] = parsed
+func parseSeat(raw json.RawMessage) (Seat, error) {
+	fields, objectErr := object(raw, "seat")
+	if objectErr != nil {
+		return Seat{}, objectErr
+	}
+	allowed := []string{
+		fieldUpstream,
+		fieldModel,
+		fieldAuthMode,
+		fieldKeyEnvFile,
+		fieldAWSProfile,
+		fieldAWSRegion,
+		fieldModelMapEnvFile,
+		fieldExtraBody,
+		fieldMaxInputTokens,
+		fieldMaxOutputTokens,
+		fieldInsecure,
+		fieldStripCacheControl,
+		fieldCaptureBodies,
+	}
+	if fieldsErr := exactFields(fields, allowed, nil); fieldsErr != nil {
+		return Seat{}, fieldsErr
 	}
 
+	var seat Seat
+	decoders := seatFieldDecoders(&seat)
+	for _, name := range sortedKeys(fields) {
+		if decodeErr := decoders[name](fields[name]); decodeErr != nil {
+			return Seat{}, decodeErr
+		}
+	}
+	return seat, nil
+}
+
+func seatFieldDecoders(seat *Seat) map[string]func(json.RawMessage) error {
+	return map[string]func(json.RawMessage) error{
+		fieldUpstream:        func(raw json.RawMessage) error { return decodeField(&seat.Upstream, fieldUpstream, raw) },
+		fieldModel:           func(raw json.RawMessage) error { return decodeField(&seat.Model, fieldModel, raw) },
+		fieldAuthMode:        func(raw json.RawMessage) error { return decodeField(&seat.AuthMode, fieldAuthMode, raw) },
+		fieldKeyEnvFile:      func(raw json.RawMessage) error { return decodeField(&seat.APIKeyEnvFile, fieldKeyEnvFile, raw) },
+		fieldAWSProfile:      func(raw json.RawMessage) error { return decodeField(&seat.AWSProfile, fieldAWSProfile, raw) },
+		fieldAWSRegion:       func(raw json.RawMessage) error { return decodeField(&seat.AWSRegion, fieldAWSRegion, raw) },
+		fieldModelMapEnvFile: func(raw json.RawMessage) error { return decodeField(&seat.ModelMapEnvFile, fieldModelMapEnvFile, raw) },
+		fieldExtraBody:       func(raw json.RawMessage) error { return decodeExtraBody(&seat.ExtraBody, raw) },
+		fieldMaxInputTokens:  func(raw json.RawMessage) error { return decodeField(&seat.MaxInputTokens, fieldMaxInputTokens, raw) },
+		fieldMaxOutputTokens: func(raw json.RawMessage) error { return decodeField(&seat.MaxOutputTokens, fieldMaxOutputTokens, raw) },
+		fieldInsecure:        func(raw json.RawMessage) error { return decodeField(&seat.Insecure, fieldInsecure, raw) },
+		fieldStripCacheControl: func(raw json.RawMessage) error {
+			return decodeField(&seat.StripCacheControl, fieldStripCacheControl, raw)
+		},
+		fieldCaptureBodies: func(raw json.RawMessage) error { return decodeField(&seat.CaptureBodies, fieldCaptureBodies, raw) },
+	}
+}
+
+func decodeExtraBody(target *json.RawMessage, raw json.RawMessage) error {
+	if isNull(raw) {
+		return fmt.Errorf("%s must be a JSON object, not null", fieldExtraBody)
+	}
+	*target = bytes.Clone(raw)
+	return nil
+}
+
+func parseContexts(raw json.RawMessage) (map[string]Context, error) {
+	entries, err := object(raw, fieldContexts)
+	if err != nil {
+		return nil, err
+	}
+	contexts := make(map[string]Context, len(entries))
+	for _, id := range sortedKeys(entries) {
+		ctx, parseErr := parseContext(entries[id])
+		if parseErr != nil {
+			return nil, fmt.Errorf("context %q: %w", id, parseErr)
+		}
+		contexts[id] = ctx
+	}
 	return contexts, nil
 }
 
-// parseContext decodes one context object: its optional default route and its
-// aliases. Every key is matched explicitly, so an unknown or misspelled field
-// is named in the error rather than ignored.
-func parseContext(name string, raw json.RawMessage) (Context, error) {
-	var fields map[string]json.RawMessage
-
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return Context{}, fmt.Errorf("decode context: %w", err)
+func parseContext(raw json.RawMessage) (Context, error) {
+	fields, objectErr := object(raw, "context")
+	if objectErr != nil {
+		return Context{}, objectErr
 	}
-
-	// A context that declares no default route rides the built-in one, which is
-	// exactly what a bare Claude model got before contexts existed.
-	parsed := Context{Name: name, DefaultRoute: DefaultRoute(), Routes: map[string]Route{}}
-
-	for _, field := range sortedKeys(fields) {
-		switch field {
-		case fieldDefaultRoute:
-			// The default route answers for models no alias claims, so it has no
-			// alias of its own to be found under.
-			route, err := parseRoute("", fields[field])
-			if err != nil {
-				return Context{}, fmt.Errorf("%s: %w", fieldDefaultRoute, err)
-			}
-
-			parsed.DefaultRoute = route
-		case fieldRoutes:
-			routes, err := parseRoutes(fields[field])
-			if err != nil {
-				return Context{}, err
-			}
-
-			parsed.Routes = routes
-		default:
-			return Context{}, fmt.Errorf("unknown field %q", field)
+	if fieldsErr := exactFields(
+		fields,
+		[]string{fieldDefaultSeat, fieldModels, fieldSubagents},
+		[]string{fieldDefaultSeat, fieldModels},
+	); fieldsErr != nil {
+		return Context{}, fieldsErr
+	}
+	var ctx Context
+	if decodeErr := decodeField(
+		&ctx.DefaultSeat,
+		fieldDefaultSeat,
+		fields[fieldDefaultSeat],
+	); decodeErr != nil {
+		return Context{}, decodeErr
+	}
+	models, modelsErr := parseBindings(fieldModels, fields[fieldModels])
+	if modelsErr != nil {
+		return Context{}, modelsErr
+	}
+	ctx.Models = models
+	if rawSubagents, ok := fields[fieldSubagents]; ok {
+		if isNull(rawSubagents) {
+			return Context{}, errors.New("subagents must be an object, not null")
 		}
+		parsed, parseErr := parseSubagents(rawSubagents)
+		if parseErr != nil {
+			return Context{}, fmt.Errorf("subagents: %w", parseErr)
+		}
+		ctx.Subagents = &parsed
 	}
-
-	// Both the default route and the aliases are settled now, so the rewrite
-	// targets no fallthrough may ride can be computed once instead of on every
-	// request.
-	parsed.foreignTargets = foreignTargets(parsed)
-
-	return parsed, nil
+	return ctx, nil
 }
 
-// parseRoutes decodes a context's routes object into routes keyed by alias.
-func parseRoutes(raw json.RawMessage) (map[string]Route, error) {
-	var entries map[string]json.RawMessage
+func parseSubagents(raw json.RawMessage) (Subagents, error) {
+	fields, objectErr := object(raw, fieldSubagents)
+	if objectErr != nil {
+		return Subagents{}, objectErr
+	}
+	if fieldsErr := exactFields(
+		fields,
+		[]string{fieldDefaultSeat, fieldModels},
+		[]string{fieldDefaultSeat, fieldModels},
+	); fieldsErr != nil {
+		return Subagents{}, fieldsErr
+	}
+	var out Subagents
+	if decodeErr := decodeField(
+		&out.DefaultSeat,
+		fieldDefaultSeat,
+		fields[fieldDefaultSeat],
+	); decodeErr != nil {
+		return Subagents{}, decodeErr
+	}
+	models, modelsErr := parseBindings(fieldModels, fields[fieldModels])
+	if modelsErr != nil {
+		return Subagents{}, modelsErr
+	}
+	out.Models = models
+	return out, nil
+}
 
-	if err := json.Unmarshal(raw, &entries); err != nil {
-		return nil, fmt.Errorf("field %q: %w", fieldRoutes, err)
+func parseBindings(name string, raw json.RawMessage) (map[string]string, error) {
+	entries, objectErr := object(raw, name)
+	if objectErr != nil {
+		return nil, objectErr
+	}
+	bindings := make(map[string]string, len(entries))
+	for _, selector := range sortedKeys(entries) {
+		var seatID string
+		decodeErr := decodeField(
+			&seatID,
+			name+" selector "+fmt.Sprintf("%q", selector),
+			entries[selector],
+		)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		bindings[selector] = seatID
+	}
+	return bindings, nil
+}
+
+// object decodes one JSON object into its members, refusing a repeated member
+// name outright.
+//
+// encoding/json keeps the last value of a repeated name, so a document that
+// says a thing twice loads as whatever came second — the reviewed value
+// silently shadowed by one further down the file. Every object the registry
+// grammar owns is read through here, so the refusal reaches the root, the seats
+// and contexts maps, each Seat and Context, each binding map and the subagents
+// object alike.
+func object(raw json.RawMessage, name string) (map[string]json.RawMessage, error) {
+	if isNull(raw) {
+		return nil, fmt.Errorf("%s must be an object, not null", name)
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, fmt.Errorf("%s must be an object", name)
 	}
 
-	routes := make(map[string]Route, len(entries))
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if _, err := decoder.Token(); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", name, err)
+	}
 
-	for _, alias := range sortedKeys(entries) {
-		if alias == "" {
-			return nil, errors.New("empty alias key")
-		}
-
-		route, err := parseRoute(alias, entries[alias])
+	fields := map[string]json.RawMessage{}
+	for decoder.More() {
+		token, err := decoder.Token()
 		if err != nil {
-			return nil, fmt.Errorf("alias %q: %w", alias, err)
+			return nil, fmt.Errorf("decode %s: %w", name, err)
 		}
-
-		routes[alias] = route
+		member, ok := token.(string)
+		if !ok {
+			return nil, fmt.Errorf("decode %s: member name %v is not a string", name, token)
+		}
+		if _, repeated := fields[member]; repeated {
+			return nil, fmt.Errorf("%s has a duplicate member %q", name, member)
+		}
+		var value json.RawMessage
+		if decodeErr := decoder.Decode(&value); decodeErr != nil {
+			return nil, fmt.Errorf("decode %s: %w", name, decodeErr)
+		}
+		fields[member] = value
 	}
-
-	return routes, nil
+	if _, err := decoder.Token(); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", name, err)
+	}
+	return fields, nil
 }
 
-// sortedKeys returns a map's keys in order, so a document with several problems
-// always reports the same one.
+func exactFields(fields map[string]json.RawMessage, allowed, required []string) error {
+	allow := make(map[string]bool, len(allowed))
+	for _, name := range allowed {
+		allow[name] = true
+	}
+	for _, name := range sortedKeys(fields) {
+		if !allow[name] {
+			return fmt.Errorf("unknown field %q", name)
+		}
+	}
+	for _, name := range required {
+		if _, ok := fields[name]; !ok {
+			return fmt.Errorf("missing required field %q", name)
+		}
+	}
+	return nil
+}
+
+func isNull(raw json.RawMessage) bool { return bytes.Equal(bytes.TrimSpace(raw), []byte("null")) }
+
+func decodeField[Val any](target *Val, name string, value json.RawMessage) error {
+	if err := json.Unmarshal(value, target); err != nil {
+		return fmt.Errorf("field %q: %w", name, err)
+	}
+	return nil
+}
+
 func sortedKeys[Val any](values map[string]Val) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)
 	}
-
 	sort.Strings(keys)
-
 	return keys
-}
-
-// parseRoute decodes one route object. Every key is matched explicitly so an
-// unknown or misspelled field is named in the error rather than ignored.
-func parseRoute(alias string, raw json.RawMessage) (Route, error) {
-	var fields map[string]json.RawMessage
-
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return Route{}, fmt.Errorf("decode route: %w", err)
-	}
-
-	route := Route{Alias: alias}
-
-	for _, name := range sortedKeys(fields) {
-		if err := assignField(&route, name, fields[name]); err != nil {
-			return Route{}, err
-		}
-	}
-
-	return route, nil
-}
-
-// assignField decodes one wire field into its Route field.
-func assignField(route *Route, name string, value json.RawMessage) error {
-	switch name {
-	case fieldBaseURL:
-		return decodeField(&route.BaseURL, name, value)
-	case fieldModel:
-		return decodeField(&route.Model, name, value)
-	case fieldAuth:
-		return decodeField(&route.Auth, name, value)
-	case fieldKeyEnvFile:
-		return decodeField(&route.APIKeyEnvFile, name, value)
-	case fieldAWSProfile:
-		return decodeField(&route.AWSProfile, name, value)
-	case fieldAWSRegion:
-		return decodeField(&route.AWSRegion, name, value)
-	case fieldModelMapEnvFile:
-		return decodeField(&route.ModelMapEnvFile, name, value)
-	case fieldExtraBody:
-		route.ExtraBody = bytes.Clone(value)
-
-		return nil
-	case fieldInsecure:
-		return decodeField(&route.Insecure, name, value)
-	case fieldMaxInputTokens:
-		return decodeField(&route.MaxInputTokens, name, value)
-	case fieldMaxOutputTokens:
-		return decodeField(&route.MaxOutputTokens, name, value)
-	case fieldStripCacheControl:
-		return decodeField(&route.StripCacheControl, name, value)
-	case fieldCaptureBodies:
-		return decodeField(&route.CaptureBodies, name, value)
-	default:
-		return fmt.Errorf("unknown field %q", name)
-	}
-}
-
-// decodeField decodes a single JSON value, naming the wire field on failure.
-func decodeField[Val any](target *Val, name string, value json.RawMessage) error {
-	if err := json.Unmarshal(value, target); err != nil {
-		return fmt.Errorf("field %q: %w", name, err)
-	}
-
-	return nil
 }

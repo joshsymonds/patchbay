@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +18,7 @@ import (
 
 // fidelityBody is the awkward request body D2 must forward untouched: already
 // escaped JSON, a lone backslash, multi-byte runes and a cache_control key that
-// an identity route has no business removing.
+// an identity Seat has no business removing.
 const fidelityBody = `{"model":"local/echo","max_tokens":1024,"stream":true,` +
 	`"system":[{"type":"text","text":"héllo \"quoted\" \\ backslash",` +
 	`"cache_control":{"type":"ephemeral"}}],` +
@@ -97,18 +98,18 @@ func pathologicalSplits(payload string) []int {
 	return splits
 }
 
-// TestIdentityRoutePreservesBytesBothWays is the byte-fidelity invariant: on an
-// identity route the request arrives upstream as the exact bytes the client
+// TestIdentitySeatPreservesBytesBothWays is the byte-fidelity invariant: on an
+// identity Seat the request arrives upstream as the exact bytes the client
 // sent, and the response reaches the client as the exact bytes the upstream
 // wrote, however awkwardly the upstream chunked them.
-func TestIdentityRoutePreservesBytesBothWays(t *testing.T) {
+func TestIdentitySeatPreservesBytesBothWays(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
 	payload := sseTurn()
 	stub := newUpstream(t, sseHandler(t, payload, pathologicalSplits(payload)))
 
 	gateway := httptest.NewServer(proxy.New(proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Host:     testHost,
 	}))
 	t.Cleanup(gateway.Close)
@@ -170,7 +171,7 @@ func TestForwardPreservesPathQueryAndHeaders(t *testing.T) {
 	req.Header.Set("Te", "trailers")
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Host:     testHost,
 	}, req)
 
@@ -188,7 +189,9 @@ func TestForwardPreservesPathQueryAndHeaders(t *testing.T) {
 		t.Errorf("upstream raw query = %q, want %q", call.rawQuery, "beta=true&x=%20a+b")
 	}
 
-	if got := call.header.Get("Anthropic-Beta"); got != "oauth-2025-04-20,interleaved-thinking-2025-05-14" {
+	if got := call.header.Get(
+		"Anthropic-Beta",
+	); got != "oauth-2025-04-20,interleaved-thinking-2025-05-14" {
 		t.Errorf("anthropic-beta = %q, want it byte-identical", got)
 	}
 
@@ -211,7 +214,7 @@ func TestForwardPreservesPathQueryAndHeaders(t *testing.T) {
 	}
 }
 
-// TestInjectReplacesCallerCredentials proves an inject route never leaks the
+// TestInjectReplacesCallerCredentials proves an inject Seat never leaks the
 // caller's own credentials to a foreign upstream, and pays with the key read
 // through the environment-variable-names-a-file indirection.
 func TestInjectReplacesCallerCredentials(t *testing.T) {
@@ -224,7 +227,7 @@ func TestInjectReplacesCallerCredentials(t *testing.T) {
 	req.Header.Set("X-Api-Key", "caller-api-key")
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Host:     testHost,
 	}, req)
 
@@ -243,7 +246,7 @@ func TestInjectReplacesCallerCredentials(t *testing.T) {
 	}
 }
 
-// TestForwardPassesCallerCredentials proves the default route hands the
+// TestForwardPassesCallerCredentials proves the default Seat hands the
 // caller's own subscription credentials to Anthropic untouched.
 func TestForwardPassesCallerCredentials(t *testing.T) {
 	stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
@@ -304,7 +307,7 @@ func TestUpstreamErrorPassesThroughUnmodified(t *testing.T) {
 			})
 
 			rec := serve(t, proxy.Config{
-				Registry: newRegistry(t, identityRoute(stub.url())),
+				Registry: newRegistry(t, identitySeat(stub.url())),
 				Host:     testHost,
 			}, messagesRequest(fidelityBody))
 
@@ -323,7 +326,7 @@ func TestUpstreamErrorPassesThroughUnmodified(t *testing.T) {
 	}
 }
 
-// TestMissingKeyFails proves an inject route fails closed: every way of failing
+// TestMissingKeyFails proves an inject Seat fails closed: every way of failing
 // to read the key returns a gateway error and the upstream is never contacted.
 func TestMissingKeyFails(t *testing.T) {
 	for _, testCase := range []struct {
@@ -356,7 +359,7 @@ func TestMissingKeyFails(t *testing.T) {
 			stub := newUpstream(t, jsonHandler(http.StatusOK, `{}`))
 
 			rec := serve(t, proxy.Config{
-				Registry: newRegistry(t, identityRoute(stub.url())),
+				Registry: newRegistry(t, identitySeat(stub.url())),
 				Host:     testHost,
 			}, messagesRequest(fidelityBody))
 
@@ -374,7 +377,7 @@ func TestMissingKeyFails(t *testing.T) {
 }
 
 // TestUnreachableUpstreamReturns502 reports a connection failure as a gateway
-// error, never as a silent fallback to another route.
+// error, never as a silent fallback to another Seat.
 func TestUnreachableUpstreamReturns502(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
@@ -384,12 +387,17 @@ func TestUnreachableUpstreamReturns502(t *testing.T) {
 	stub.server.Close()
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(dead)),
+		Registry: newRegistry(t, identitySeat(dead)),
 		Host:     testHost,
 	}, messagesRequest(fidelityBody))
 
 	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusBadGateway, rec.Body.String())
+		t.Fatalf(
+			"status = %d, want %d (body %q)",
+			rec.Code,
+			http.StatusBadGateway,
+			rec.Body.String(),
+		)
 	}
 
 	assertGatewayError(t, rec.Body.Bytes())
@@ -409,7 +417,7 @@ func TestUnreadableRequestBodyFails(t *testing.T) {
 	req.Body = io.NopCloser(&failingReader{})
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: recorder,
 		Host:     testHost,
 	}, req)
@@ -426,8 +434,8 @@ func TestUnreadableRequestBodyFails(t *testing.T) {
 
 	got := recorder.wait(t)
 
-	if got.Model != noModel || got.RequestModel != noModel {
-		t.Errorf("model/request_model = %q/%q, want %q for both", got.Model, got.RequestModel, noModel)
+	if got.Selection != nil || got.Seat != "" || got.Model != nil || got.RequestModel != nil {
+		t.Errorf("pre-selection read failure recorded selected fields: %+v", got)
 	}
 
 	if err := got.Validate(); err != nil {
@@ -435,18 +443,18 @@ func TestUnreadableRequestBodyFails(t *testing.T) {
 	}
 }
 
-// TestUnroutableBodyRidesDefaultRoute proves model extraction never fails the
-// request: a body that is not JSON at all still forwards, on the default route,
+// TestUnroutableBodyRidesDefaultSeat proves model extraction never fails the
+// request: a body that is not JSON at all still forwards, on the default Seat,
 // and still produces a record the ledger will accept — a request that named no
 // model is recorded as naming none, not as an empty field Append would reject.
-func TestUnroutableBodyRidesDefaultRoute(t *testing.T) {
+func TestUnroutableBodyRidesDefaultSeat(t *testing.T) {
 	stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
 	recorder := newRecorder()
 
 	req := messagesRequest("not json at all")
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute("http://127.0.0.1:1")),
+		Registry: newRegistry(t, identitySeat("http://127.0.0.1:1")),
 		Recorder: recorder,
 		Client:   anthropicClient(t, stub),
 		Host:     testHost,
@@ -462,8 +470,12 @@ func TestUnroutableBodyRidesDefaultRoute(t *testing.T) {
 
 	got := recorder.wait(t)
 
-	if got.Model != noModel || got.RequestModel != noModel {
-		t.Errorf("model/request_model = %q/%q, want %q for both", got.Model, got.RequestModel, noModel)
+	if got.Model != nil || got.RequestModel != nil {
+		t.Errorf(
+			"model/request_model = %s/%s, want an absent model for both",
+			shownModel(got.Model),
+			shownModel(got.RequestModel),
+		)
 	}
 
 	if err := got.Validate(); err != nil {
@@ -472,16 +484,16 @@ func TestUnroutableBodyRidesDefaultRoute(t *testing.T) {
 }
 
 // TestRewriteTargetIsRefusedNotForwarded is the fallthrough guard: a request
-// naming a foreign route's rewrite target — the shape of a client echoing a
-// response's model id instead of the alias it asked with — is answered 404 in
-// Anthropic's not_found_error shape, naming the alias, and nothing is sent to
-// the default route's upstream.
+// naming a foreign Seat's rewrite target — the shape of a client echoing a
+// response's model id instead of the selector it asked with — is answered 404 in
+// Anthropic's not_found_error shape, naming the selector, and nothing is sent to
+// the default Seat's upstream.
 func TestRewriteTargetIsRefusedNotForwarded(t *testing.T) {
 	stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
 	recorder := newRecorder()
 
-	reg := newRegistry(t, `"or/flash":{"base_url":"https://openrouter.ai/api",`+
-		`"auth":"inject","api_key_env_file":"`+keyEnvName+`","model":"upstream/flash-1"}`)
+	reg := newRegistry(t, `"or/flash":{"upstream":"https://openrouter.ai/api",`+
+		`"auth_mode":"inject","api_key_env_file":"`+keyEnvName+`","model":"upstream/flash-1"}`)
 
 	rec := serve(t, proxy.Config{
 		Registry: reg,
@@ -500,18 +512,22 @@ func TestRewriteTargetIsRefusedNotForwarded(t *testing.T) {
 	}
 
 	if !strings.Contains(body, "or/flash") {
-		t.Errorf("error body %q does not name the alias to ask for instead", body)
+		t.Errorf("error body %q does not name the selector to ask for instead", body)
 	}
 
 	if stub.hits() != 0 {
-		t.Errorf("the default route's upstream received %d requests, want none", stub.hits())
+		t.Errorf("the default Seat's upstream received %d requests, want none", stub.hits())
 	}
 
 	got := recorder.wait(t)
 
-	if got.Status != http.StatusNotFound || got.RequestModel != "upstream/flash-1" {
-		t.Errorf("record status/request_model = %d/%q, want %d/%q",
-			got.Status, got.RequestModel, http.StatusNotFound, "upstream/flash-1")
+	if got.Status != http.StatusNotFound || !modelIs(got.RequestModel, "upstream/flash-1") {
+		t.Errorf("record status/request_model = %d/%s, want %d/%q",
+			got.Status, shownModel(got.RequestModel), http.StatusNotFound, "upstream/flash-1")
+	}
+	if got.Selection != nil || got.Seat != "" || got.Upstream != "" || got.Model != nil ||
+		got.AuthMode != "" || got.ConfigSource != "" {
+		t.Errorf("rewrite-target refusal populated selection-dependent fields: %+v", got)
 	}
 
 	if err := got.Validate(); err != nil {
@@ -521,7 +537,7 @@ func TestRewriteTargetIsRefusedNotForwarded(t *testing.T) {
 
 // TestOversizedRequestBodyFails caps what a caller can make the gateway hold in
 // memory: past the request ceiling the request is refused as too large and the
-// upstream is never contacted. A body this size names no model, so the route it
+// upstream is never contacted. A body this size names no model, so the Seat it
 // would have ridden is the default one — pinned to a local stub here.
 func TestOversizedRequestBodyFails(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
@@ -535,7 +551,7 @@ func TestOversizedRequestBodyFails(t *testing.T) {
 	req.Body = io.NopCloser(&oversizedReader{remaining: oversizeBytes})
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute("http://127.0.0.1:1")),
+		Registry: newRegistry(t, identitySeat("http://127.0.0.1:1")),
 		Client:   anthropicClient(t, stub),
 		Host:     testHost,
 	}, req)
@@ -568,7 +584,7 @@ func TestResponseHopByHopHeadersAreDropped(t *testing.T) {
 	})
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Host:     testHost,
 	}, messagesRequest(fidelityBody))
 
@@ -601,7 +617,7 @@ func TestConcurrentRequestsAreIndependent(t *testing.T) {
 	stub := newUpstream(t, sseHandler(t, payload, pathologicalSplits(payload)))
 
 	gateway := proxy.New(proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: newRecorder(),
 		Host:     testHost,
 	})
@@ -632,62 +648,86 @@ func TestConcurrentRequestsAreIndependent(t *testing.T) {
 	group.Wait()
 }
 
-// TestInjectRouteRelaysOnlyMessagesEndpoints proves an inject route, which pays
+// TestInjectSeatRelaysOnlyMessagesEndpoints proves an inject Seat, which pays
 // with a foreign key, refuses any path but the Messages endpoints: a stray
 // GET /v1/key on it is a patchbay 404 that never spends the key, while
-// /v1/messages on the same route still forwards.
-func TestInjectRouteRelaysOnlyMessagesEndpoints(t *testing.T) {
+// /v1/messages on the same Seat still forwards.
+func TestInjectSeatRelaysOnlyMessagesEndpoints(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
 
-	// A non-Messages path on the inject route is refused before the key is spent.
-	blocked := httptest.NewRequest(http.MethodGet, "/v1/key", strings.NewReader(`{"model":"local/echo"}`))
+	// A non-Messages path on the inject Seat is refused before the key is spent.
+	blocked := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/key",
+		strings.NewReader(`{"model":"local/echo"}`),
+	)
 	blocked.Header.Set("Content-Type", jsonType)
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Host:     testHost,
 	}, blocked)
 
 	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d for a non-Messages path on an inject route (body %q)",
+		t.Fatalf("status = %d, want %d for a non-Messages path on an inject Seat (body %q)",
 			rec.Code, http.StatusNotFound, rec.Body.String())
 	}
 
 	assertGatewayError(t, rec.Body.Bytes())
 
-	if stub.hits() != 0 {
-		t.Errorf("upstream received %d requests, want 0 — the inject key must not be spent", stub.hits())
+	// The refusal names the path it would not relay and no Seat at all: a Seat ID
+	// is the operator's private name for a registry row, and a fabricated one
+	// reads to everybody as a Seat that exists.
+	body := rec.Body.String()
+	if !strings.Contains(
+		body,
+		"the selected Seat injects a key and only relays the Messages endpoints, not /v1/key",
+	) {
+		t.Errorf("refusal %q does not name the selected Seat and the path it refused", body)
+	}
+	if strings.Contains(body, `selected\"`) || strings.Contains(body, `"selected"`) {
+		t.Errorf("refusal %q quotes a fabricated Seat ID", body)
 	}
 
-	// The Messages endpoint on the same route still forwards.
+	if stub.hits() != 0 {
+		t.Errorf(
+			"upstream received %d requests, want 0 — the inject key must not be spent",
+			stub.hits(),
+		)
+	}
+
+	// The Messages endpoint on the same Seat still forwards.
 	rec = serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Host:     testHost,
 	}, messagesRequest(`{"model":"local/echo"}`))
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d — /v1/messages still forwards on an inject route (body %q)",
+		t.Fatalf("status = %d, want %d — /v1/messages still forwards on an inject Seat (body %q)",
 			rec.Code, http.StatusOK, rec.Body.String())
 	}
 
 	if stub.hits() != 1 {
-		t.Errorf("upstream received %d requests, want 1 for the forwarded Messages call", stub.hits())
+		t.Errorf(
+			"upstream received %d requests, want 1 for the forwarded Messages call",
+			stub.hits(),
+		)
 	}
 }
 
-// TestInjectRouteAcceptsCallerKeyAndStripsIt proves the caller gate's happy
+// TestInjectSeatAcceptsCallerKeyAndStripsIt proves the caller gate's happy
 // path: a request presenting the shared secret in X-Patchbay-Key is injected
 // and forwarded, and the header — patchbay's own, never the upstream's — never
 // reaches the upstream.
-func TestInjectRouteAcceptsCallerKeyAndStripsIt(t *testing.T) {
+func TestInjectSeatAcceptsCallerKeyAndStripsIt(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Host:     testHost,
 	}, messagesRequest(fidelityBody))
 
@@ -700,12 +740,12 @@ func TestInjectRouteAcceptsCallerKeyAndStripsIt(t *testing.T) {
 	}
 }
 
-// TestInjectRouteRefusesMissingOrWrongCallerKey proves the gate fails closed on
+// TestInjectSeatRefusesMissingOrWrongCallerKey proves the gate fails closed on
 // a caller that cannot prove the secret: a wrong key and an absent header both
 // get a 403 (never 401, which Claude Code would treat as a re-login prompt),
 // the foreign key is never spent, and neither the presented nor the expected
 // secret leaks into the error body the ledger persists.
-func TestInjectRouteRefusesMissingOrWrongCallerKey(t *testing.T) {
+func TestInjectSeatRefusesMissingOrWrongCallerKey(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string
 		presented string
@@ -721,7 +761,11 @@ func TestInjectRouteRefusesMissingOrWrongCallerKey(t *testing.T) {
 			stub := newUpstream(t, jsonHandler(http.StatusOK, `{}`))
 			recorder := newRecorder()
 
-			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(fidelityBody))
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/v1/messages",
+				strings.NewReader(fidelityBody),
+			)
 			req.Header.Set("Content-Type", jsonType)
 
 			if testCase.setHeader {
@@ -729,19 +773,27 @@ func TestInjectRouteRefusesMissingOrWrongCallerKey(t *testing.T) {
 			}
 
 			rec := serve(t, proxy.Config{
-				Registry: newRegistry(t, identityRoute(stub.url())),
+				Registry: newRegistry(t, identitySeat(stub.url())),
 				Recorder: recorder,
 				Host:     testHost,
 			}, req)
 
 			if rec.Code != http.StatusForbidden {
-				t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusForbidden, rec.Body.String())
+				t.Fatalf(
+					"status = %d, want %d (body %q)",
+					rec.Code,
+					http.StatusForbidden,
+					rec.Body.String(),
+				)
 			}
 
 			assertGatewayError(t, rec.Body.Bytes())
 
 			if stub.hits() != 0 {
-				t.Errorf("upstream received %d requests, want 0 — the inject key must not be spent", stub.hits())
+				t.Errorf(
+					"upstream received %d requests, want 0 — the inject key must not be spent",
+					stub.hits(),
+				)
 			}
 
 			got := recorder.wait(t)
@@ -763,10 +815,10 @@ func TestInjectRouteRefusesMissingOrWrongCallerKey(t *testing.T) {
 	}
 }
 
-// TestInjectRouteFailsClosedWhenCallerKeyUnavailable proves a server-side
+// TestInjectSeatFailsClosedWhenCallerKeyUnavailable proves a server-side
 // problem reading the expected caller key refuses the inject request with a 500
 // rather than injecting the household key for a caller that proved nothing.
-func TestInjectRouteFailsClosedWhenCallerKeyUnavailable(t *testing.T) {
+func TestInjectSeatFailsClosedWhenCallerKeyUnavailable(t *testing.T) {
 	for _, testCase := range []struct {
 		name  string
 		setup func(t *testing.T)
@@ -794,28 +846,36 @@ func TestInjectRouteFailsClosedWhenCallerKeyUnavailable(t *testing.T) {
 			stub := newUpstream(t, jsonHandler(http.StatusOK, `{}`))
 
 			rec := serve(t, proxy.Config{
-				Registry: newRegistry(t, identityRoute(stub.url())),
+				Registry: newRegistry(t, identitySeat(stub.url())),
 				Host:     testHost,
 			}, messagesRequest(fidelityBody))
 
 			if rec.Code != http.StatusInternalServerError {
-				t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusInternalServerError, rec.Body.String())
+				t.Fatalf(
+					"status = %d, want %d (body %q)",
+					rec.Code,
+					http.StatusInternalServerError,
+					rec.Body.String(),
+				)
 			}
 
 			assertGatewayError(t, rec.Body.Bytes())
 
 			if stub.hits() != 0 {
-				t.Errorf("upstream received %d requests, want 0 — the inject key must not be spent", stub.hits())
+				t.Errorf(
+					"upstream received %d requests, want 0 — the inject key must not be spent",
+					stub.hits(),
+				)
 			}
 		})
 	}
 }
 
-// TestForwardRouteSkipsCallerKeyAndStripsIt proves the gate is unreachable on a
-// forward route: the caller-key header is never required — a request without
+// TestForwardSeatSkipsCallerKeyAndStripsIt proves the gate is unreachable on a
+// forward Seat: the caller-key header is never required — a request without
 // any caller key file provisioned still forwards — yet the header, being
 // patchbay's own, is still stripped from the upstream request.
-func TestForwardRouteSkipsCallerKeyAndStripsIt(t *testing.T) {
+func TestForwardSeatSkipsCallerKeyAndStripsIt(t *testing.T) {
 	stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
 
 	req := messagesRequest(`{"model":"claude-sonnet-5","max_tokens":16}`)
@@ -832,7 +892,11 @@ func TestForwardRouteSkipsCallerKeyAndStripsIt(t *testing.T) {
 	}
 
 	if got := stub.call(t).header.Get(callerKeyHeader); got != "" {
-		t.Errorf("upstream saw %s = %q, want it stripped on the forward route too", callerKeyHeader, got)
+		t.Errorf(
+			"upstream saw %s = %q, want it stripped on the forward Seat too",
+			callerKeyHeader,
+			got,
+		)
 	}
 }
 
@@ -911,20 +975,23 @@ func TestPipelineForwardsByTheAttachedResolution(t *testing.T) {
 	writeKeyFile(t, "sk-upstream")
 
 	path := filepath.Join(t.TempDir(), "registry.json")
-	writeRegistryFile(t, path, identityRoute(first.server.URL))
+	writeRegistryFile(t, path, identitySeat(first.server.URL))
 
-	reg := registry.New(path)
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
 
-	res, err := reg.Resolve(registry.Selection{Name: registry.PersonalContext, Explicit: false}, "")
+	res, err := reg.Resolve(registry.Selection{}, "", nil)
 	if err != nil {
 		t.Fatalf("Resolve() = %v; want the personal context", err)
 	}
 
 	// The file moves to a different upstream between the resolution and the
 	// forward, exactly as a home-manager rebuild would.
-	writeRegistryFile(t, path, identityRoute(second.server.URL))
+	writeRegistryFile(t, path, identitySeat(second.server.URL))
 
-	req := messagesRequest(`{"model":"` + echoAlias + `","max_tokens":4}`)
+	req := messagesRequest(`{"model":"` + echoSelector + `","max_tokens":4}`)
 	req = req.WithContext(registry.WithResolution(req.Context(), res))
 
 	answer := serve(t, proxy.Config{Registry: reg, Host: testHost}, req)
@@ -934,20 +1001,47 @@ func TestPipelineForwardsByTheAttachedResolution(t *testing.T) {
 	}
 
 	if first.hits() != 1 {
-		t.Fatalf("the resolved upstream saw %d requests; want the one this request resolved to", first.hits())
+		t.Fatalf(
+			"the resolved upstream saw %d requests; want the one this request resolved to",
+			first.hits(),
+		)
 	}
 
 	if second.hits() != 0 {
-		t.Fatalf("the reloaded upstream saw %d requests; a request never changes documents mid-flight",
-			second.hits())
+		t.Fatalf(
+			"the reloaded upstream saw %d requests; a request never changes documents mid-flight",
+			second.hits(),
+		)
 	}
 }
 
-// writeRegistryFile writes a registry file holding one personal-context route.
-func writeRegistryFile(t *testing.T, path, route string) {
+func writeRegistryFile(t *testing.T, path, entry string) {
 	t.Helper()
-
-	if err := os.WriteFile(path, []byte(`{"contexts":{"personal":{"routes":{`+route+`}}}}`), 0o600); err != nil {
+	var seats map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(`{`+entry+`}`), &seats); err != nil {
+		t.Fatal(err)
+	}
+	seat := seats[echoSelector]
+	doc := map[string]any{
+		"default_context": "personal",
+		"seats": map[string]json.RawMessage{
+			"anthropic": json.RawMessage(
+				`{"upstream":"https://api.anthropic.com","auth_mode":"forward"}`,
+			),
+			"echo": seat,
+		},
+		"contexts": map[string]any{
+			"personal": map[string]any{
+				"default_seat": "anthropic",
+				"models":       map[string]string{echoSelector: "echo"},
+			},
+		},
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatalf("write registry: %v", err)
 	}
 }

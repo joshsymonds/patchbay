@@ -3,10 +3,12 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 
+	"github.com/joshsymonds/patchbay/internal/anthropic"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
@@ -20,7 +22,7 @@ const (
 // extractModel reads the top-level model name from a request body with a
 // partial decode of its own copy. It never touches the bytes that get
 // forwarded, and it never fails: a body that is not a JSON object, or one whose
-// model is not a string, simply names no model and rides the default route.
+// model is not a string, simply names no model and rides the default seat.
 func extractModel(body []byte) string {
 	var probe struct {
 		Model string `json:"model"`
@@ -33,71 +35,82 @@ func extractModel(body []byte) string {
 	return probe.Model
 }
 
-// isIdentity reports whether a route forwards the request body unchanged. This
+// isIdentity reports whether a seat forwards the request body unchanged. This
 // is the byte-fidelity case: nothing about the document is rewritten, so the
 // original bytes are what travel upstream.
-func isIdentity(route registry.Route) bool {
-	return route.Model == "" &&
-		len(route.ExtraBody) == 0 &&
-		!route.StripCacheControl &&
-		route.MaxOutputTokens == 0
+func isIdentity(seat registry.Seat) bool {
+	return seat.Model == "" &&
+		len(seat.ExtraBody) == 0 &&
+		!seat.StripCacheControl &&
+		seat.MaxOutputTokens == 0
 }
 
-// forwardBody returns the bytes to send upstream. On an identity route that is
+// forwardBody returns the bytes to send upstream. On an identity seat that is
 // the caller's original body, returned as it arrived. Otherwise the document is
 // decoded, rewritten and re-encoded.
-func forwardBody(body []byte, route registry.Route) ([]byte, *gatewayError) {
-	if isIdentity(route) {
+func forwardBody(body []byte, seat registry.Seat) ([]byte, *gatewayError) {
+	if isIdentity(seat) {
 		return body, nil
 	}
 
+	// Both refusals below are the caller's body being refused on its own face
+	// rather than anything the gateway failed at, so they say so in Anthropic's
+	// taxonomy: a client reads that type to tell a request worth fixing from a
+	// gateway worth retrying.
 	var document map[string]json.RawMessage
 	if err := json.Unmarshal(body, &document); err != nil {
 		return nil, &gatewayError{
-			status: http.StatusBadRequest,
-			err:    fmt.Errorf("route %q rewrites the request, which is not a JSON object: %w", route.Alias, err),
+			status:  http.StatusBadRequest,
+			errType: anthropic.ErrorTypeInvalidRequest,
+			err: fmt.Errorf(
+				"the selected Seat rewrites the request, which is not a JSON object: %w",
+				err,
+			),
 		}
 	}
 
 	// JSON null decodes into a nil map without an error, and writing a rewrite
 	// into a nil map panics. It is not an object, so it is refused as one.
 	//
-	// This is defense in depth: no request reaches it through ServeHTTP today,
-	// because a null body names no model, an empty alias is rejected at parse,
-	// and so a null body always resolves to the identity default route, which
-	// returns above without decoding anything. The guard is what keeps that from
-	// being a panic the first time some route does rewrite one.
+	// A caller can reach this. A null body names no model, so it rides its
+	// Context's default_seat — and nothing stops that Seat from rewriting: the
+	// registry admits an inject or sigv4 default_seat with a model of its own,
+	// and then the identity branch above does not return. The guard is what
+	// stands between such a Context and a panic on the request path.
 	if document == nil {
 		return nil, &gatewayError{
-			status: http.StatusBadRequest,
-			err:    fmt.Errorf("route %q rewrites the request, which is JSON null rather than an object", route.Alias),
+			status:  http.StatusBadRequest,
+			errType: anthropic.ErrorTypeInvalidRequest,
+			err: errors.New(
+				"the selected Seat rewrites the request, which is JSON null rather than an object",
+			),
 		}
 	}
 
-	if route.Model != "" {
-		rewritten, err := json.Marshal(route.Model)
+	if seat.Model != "" {
+		rewritten, err := json.Marshal(seat.Model)
 		if err != nil {
 			return nil, &gatewayError{
 				status: http.StatusInternalServerError,
-				err:    fmt.Errorf("encode route model: %w", err),
+				err:    fmt.Errorf("encode seat model: %w", err),
 			}
 		}
 
 		document[fieldModel] = rewritten
 	}
 
-	if err := mergeExtraBody(document, route.ExtraBody); err != nil {
+	if err := mergeExtraBody(document, seat.ExtraBody); err != nil {
 		return nil, &gatewayError{
 			status: http.StatusInternalServerError,
-			err:    fmt.Errorf("route %q has an unusable extra_body: %w", route.Alias, err),
+			err:    fmt.Errorf("the selected Seat has an unusable extra_body: %w", err),
 		}
 	}
 
-	if route.StripCacheControl {
+	if seat.StripCacheControl {
 		stripCacheControl(document)
 	}
 
-	clampMaxTokens(document, route.MaxOutputTokens)
+	clampMaxTokens(document, seat.MaxOutputTokens)
 
 	rewritten, err := json.Marshal(document)
 	if err != nil {
@@ -110,10 +123,11 @@ func forwardBody(body []byte, route registry.Route) ([]byte, *gatewayError) {
 	return rewritten, nil
 }
 
-// mergeExtraBody merges the route's extra_body over the document's top-level
-// keys, so a route's own settings win over whatever the caller sent. The
-// route's bytes are shared by every request on that alias, so they are decoded
-// into fresh values and never written to.
+// mergeExtraBody merges the seat's extra_body over the document's top-level
+// keys, so a seat's own settings win over whatever the caller sent. The Seat's
+// bytes belong to the Resolution that selected it and describe the registry as
+// configured, so they are decoded into fresh values and never written to: what
+// this request merges is its own to keep.
 func mergeExtraBody(document map[string]json.RawMessage, extraBody json.RawMessage) error {
 	if len(extraBody) == 0 {
 		return nil
@@ -202,10 +216,10 @@ func firstToken(value json.RawMessage) byte {
 	return trimmed[0]
 }
 
-// clampMaxTokens lowers the request's max_tokens to the route's ceiling when it
+// clampMaxTokens lowers the request's max_tokens to the seat's ceiling when it
 // asks for more. JSON has one number type, so the value is read as one: 1e5 is
 // the same request as 100000 and is held to the ceiling the same way. A request
-// already under the ceiling, an absent max_tokens and a route with no ceiling
+// already under the ceiling, an absent max_tokens and a seat with no ceiling
 // are all left exactly as they are.
 func clampMaxTokens(document map[string]json.RawMessage, ceiling int) {
 	if ceiling <= 0 {

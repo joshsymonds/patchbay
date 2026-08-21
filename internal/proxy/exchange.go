@@ -10,22 +10,12 @@ import (
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
-// modelNone stands in for a model name the request never gave — a body the
-// gateway could not read, or one that named nothing. The ledger refuses a
-// record with an empty model, so without a stand-in the whole record would be
-// dropped: a request that named no model is worth recording as exactly that.
-const modelNone = "(none)"
-
-// bearerScheme is the credential scheme a subscription OAuth token arrives
-// under. Matching it is how the inbound credential is classified without ever
-// reading the token itself.
 const bearerScheme = "bearer "
 
-// exchange accumulates everything one request contributes to its ledger record.
-// It belongs to a single request and is never shared.
 type exchange struct {
-	route           registry.Route
+	resolution      *registry.Resolution
 	context         string
+	subagent        *registry.SubagentObservation
 	credentialClass string
 	requestModel    string
 	start           time.Time
@@ -37,123 +27,138 @@ type exchange struct {
 	errorBody       string
 }
 
-// newExchange starts recording a request that arrived at start in the named
-// context under credentialClass, asking for requestModel and resolved to route.
-func newExchange(route registry.Route, ctxName, credentialClass, requestModel string, start time.Time) *exchange {
+func newExchange(
+	context, credentialClass, requestModel string,
+	subagent *registry.SubagentObservation,
+	start time.Time,
+) *exchange {
 	return &exchange{
-		route:           route,
-		context:         ctxName,
+		context:         context,
+		credentialClass: credentialClass,
+		requestModel:    requestModel,
+		subagent:        subagent,
+		start:           start,
+	}
+}
+
+func newSelectedExchange(
+	res registry.Resolution,
+	credentialClass, requestModel string,
+	start time.Time,
+) *exchange {
+	cloned := res
+	return &exchange{
+		resolution:      &cloned,
+		context:         res.Context,
+		subagent:        res.Subagent,
 		credentialClass: credentialClass,
 		requestModel:    requestModel,
 		start:           start,
-		status:          0,
-		contentType:     "",
-		upstreamMS:      0,
-		durationMS:      0,
-		requestBody:     "",
-		errorBody:       "",
 	}
 }
 
-// credentialClass classifies the credential the client presented, without ever
-// reading its value: an OAuth bearer is what a Claude Code subscription session
-// sends, x-api-key is what a console key sends, and a request with neither pays
-// for nothing itself. Only the classification is ever recorded.
 func credentialClass(header http.Header) string {
-	if authorization := header.Get(anthropic.HeaderAuthorization); authorization != "" {
-		if strings.HasPrefix(strings.ToLower(authorization), bearerScheme) {
-			return ledger.CredentialOAuth
-		}
+	if authorization := header.Get(
+		anthropic.HeaderAuthorization,
+	); authorization != "" &&
+		strings.HasPrefix(strings.ToLower(authorization), bearerScheme) {
+		return ledger.CredentialOAuth
 	}
-
 	if header.Get(anthropic.HeaderClientKey) != "" {
 		return ledger.CredentialAPIKey
 	}
-
 	return ledger.CredentialNone
 }
 
-// record builds the ledger record for the finished exchange. capt is the
-// captured response, or nil when there was nothing to capture; a dropped
-// capture costs the summary and nothing else, because the record is written
-// either way.
 func (e *exchange) record(host string, capt *capture) ledger.Record {
 	rec := ledger.Record{
 		Timestamp:       e.start,
 		Host:            host,
 		Context:         e.context,
 		CredentialClass: e.credentialClass,
-
-		Alias:         e.route.Alias,
-		Upstream:      e.route.Upstream(),
-		Model:         namedModel(e.upstreamModel()),
-		RequestModel:  namedModel(e.requestModel),
-		AuthMode:      string(e.route.Auth),
-		Status:        e.status,
-		InputTokens:   0,
-		OutputTokens:  0,
-		DurationMS:    e.durationMS,
-		UpstreamMS:    e.upstreamMS,
-		BlockShape:    ledger.BlockShape(nil),
-		DropSignature: false,
-		StopReason:    "",
-		ErrorBody:     e.errorBody,
-		RequestBody:   e.requestBody,
-		ResponseBody:  "",
+		RequestModel:    optionalModel(e.requestModel),
+		Status:          e.status,
+		DurationMS:      e.durationMS,
+		UpstreamMS:      e.upstreamMS,
+		BlockShape:      ledger.BlockShape(nil),
+		ErrorBody:       e.errorBody,
+		RequestBody:     e.requestBody,
 	}
-
+	if e.subagent != nil {
+		rec.Subagent = &ledger.Subagent{
+			AgentID:       e.subagent.AgentID,
+			ParentAgentID: e.subagent.ParentAgentID,
+		}
+	}
+	if e.resolution != nil {
+		res := e.resolution
+		rec.Selection = &ledger.Selection{
+			Kind:  string(res.Match.Kind),
+			Model: cloneString(res.Match.Model),
+		}
+		rec.Seat = res.SeatID
+		rec.Upstream = res.Seat.EffectiveUpstream()
+		rec.Model = optionalModel(upstreamModel(res.Seat, e.requestModel))
+		rec.AuthMode = string(res.Seat.AuthMode)
+		rec.ConfigSource = res.Seat.CredentialSource()
+	} else {
+		// Nothing selected, so the Context is whatever the caller's path named:
+		// arbitrary text of any length, which is exactly why the record is worth
+		// keeping and exactly why the ledger will not store all of it. A name it
+		// cannot represent costs the name and not the request, so it is dropped
+		// here rather than left to fail the append.
+		rec.Context = ledger.SanitizeRequestedContext(e.context)
+	}
 	captured := capt.bytes()
 	if len(captured) == 0 {
 		return rec
 	}
-
-	if e.route.CaptureBodies {
+	if e.resolution != nil && e.resolution.Seat.CaptureBodies {
 		rec.ResponseBody = string(captured)
 	}
-
 	if !isSuccess(e.status) {
 		rec.ErrorBody = string(captured)
-
 		return rec
 	}
-
 	sum := summarize(captured, e.contentType)
 	rec.BlockShape = ledger.BlockShape(sum.blockTypes)
 	rec.DropSignature = ledger.HasDropSignature(rec.BlockShape)
 	rec.InputTokens = sum.inputTokens
 	rec.OutputTokens = sum.outputTokens
 	rec.StopReason = sum.stopReason
-
 	return rec
 }
 
-// upstreamModel is the model actually sent upstream: the route's rewrite target
-// when it has one, otherwise the model the caller asked for.
-func (e *exchange) upstreamModel() string {
-	if e.route.Model != "" {
-		return e.route.Model
+func upstreamModel(seat registry.Seat, requested string) string {
+	if seat.Model != "" {
+		return seat.Model
 	}
-
-	return e.requestModel
+	return requested
 }
 
-// namedModel returns model, or the stand-in when the request named none. Blank
-// counts as none: that is the ledger's own test for a missing field, and a
-// record it would refuse is a record lost.
-func namedModel(model string) string {
-	if strings.TrimSpace(model) == "" {
-		return modelNone
+// optionalModel is the nullable model a record stores. Exactly one value is
+// absent — the empty string, meaning a request that named no model or a Seat
+// that rewrites to none — and it becomes nil, which the ledger writes as JSON
+// null.
+//
+// Nothing else is absent. A selector is an opaque exact string the registry
+// bound and the request named byte for byte, so one made of spaces, or one an
+// operator called "(none)", is a model that exists and is stored as it was
+// written. No literal stands in for absence, so none can be mistaken for it.
+func optionalModel(model string) *string {
+	if model == "" {
+		return nil
 	}
-
-	return model
+	return &model
 }
-
-// isSuccess reports whether a status is a 2xx.
+func cloneString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
 func isSuccess(status int) bool {
 	return status >= http.StatusOK && status < http.StatusMultipleChoices
 }
-
-// millis converts a measured duration to whole milliseconds.
-func millis(elapsed time.Duration) int64 {
-	return elapsed.Milliseconds()
-}
+func millis(elapsed time.Duration) int64 { return elapsed.Milliseconds() }

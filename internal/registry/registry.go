@@ -1,374 +1,369 @@
-// Package registry resolves an inbound request to the route that serves it.
-//
-// Every request rides exactly one Route, chosen inside exactly one Context. A
-// context is a named world of its own: its aliases, and the default route every
-// model those aliases do not claim rides. Requests select a context by URL path
-// prefix, and bare paths — everything Claude Code sends without knowing
-// contexts exist — select the personal one.
-//
-// The contexts come from a JSON registry file managed declaratively by
-// home-manager, which may well be a symlink into /nix/store; the file is
-// re-read whenever its modification time or symlink target changes, so a
-// rebuild takes effect on the next request with nothing to restart.
-//
-// The file is honored all-or-nothing. One route that breaks a validation rule
-// invalidates the whole document, and a document that fails to parse or
-// validate contributes no contexts at all. What it can never do is break the
-// bare path: a request that named no context still resolves to the built-in
-// DefaultRoute, and Err reports why the rest went away. A request that DID name
-// a context gets the opposite bargain — it fails closed with ErrUnknownContext
-// rather than being served by a world it did not ask for.
+// Package registry loads global Seats and resolves Context Seat bindings.
 package registry
 
 import (
 	"bytes"
-	"cmp"
-	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 )
 
-// PersonalContext is the context a request with no path prefix resolves
-// against. Claude Code addresses patchbay as a plain Anthropic endpoint, so the
-// unprefixed path has to mean something, and it means this.
-const PersonalContext = "personal"
+// loadAttempts bounds how many times one acquisition starts over when the file
+// is replaced underneath the read. Three is enough for the writers that
+// actually do this — an editor's write-and-rename, a home-manager generation
+// swap — and small enough that a file being rewritten in a loop costs a bounded
+// refusal rather than a request that never returns.
+const loadAttempts = 3
 
-// ErrUnknownContext is returned when a request names a context the currently
-// loaded registry cannot produce — an unknown name, or any name at all when the
-// file is missing or broken. It is never softened into a fallback.
-var ErrUnknownContext = errors.New("unknown context")
-
-// ErrRewriteTarget is returned when a request names a model that is no alias
-// but is some route's rewrite target — the name that route asks of its own
-// upstream, which only that upstream serves. Falling through would send the
-// conversation, on the default route's credentials, to an upstream the
-// registry says does not serve the name; the caller meant the alias and is
-// told so instead. The observed shape is a client that echoes a response's
-// model id back as its next request's model.
-var ErrRewriteTarget = errors.New("model is a rewrite target, not a route")
-
-// Selection is the context one request chose, and whether it said so. The zero
-// value is what a bare, unprefixed path selects: the personal context, with the
-// built-in default route standing behind it if the registry cannot answer.
-type Selection struct {
-	// Name is the context the request named.
-	Name string
-
-	// Explicit reports whether the name came from the request's own path. An
-	// explicit name that cannot be resolved fails closed; an implicit one falls
-	// back to the built-in default route.
-	Explicit bool
-}
-
-// Resolution is everything one request's context and model resolve to: the
-// route that serves it, and the context metadata the model endpoints describe
-// that same context with. Both come from one lookup so a listing can never
-// describe a context differently from how the pipeline forwards it.
-type Resolution struct {
-	// Context is the resolved context's name.
-	Context string
-
-	// Route is the route serving the model that was resolved.
-	Route Route
-
-	// DefaultRoute is the context's effective default route: its own if it
-	// declared one, otherwise the built-in.
-	DefaultRoute Route
-
-	// routes is every route the context defines, held as the registry's own map
-	// and never handed out. Aliases builds the caller's copy from it, and only
-	// when something actually reads the list — a proxied turn never does.
-	routes map[string]Route
-
-	// foreignTargets is the context's map of rewrite targets no fallthrough may
-	// ride, computed at parse time and held the same way routes is.
-	foreignTargets map[string]string
-}
-
-// Aliases returns every route the context defines, sorted by alias, as the
-// caller's own copy: nothing a caller does to it, or to the extra_body bytes
-// inside it, reaches the registry.
-//
-// It is built on demand rather than at resolution time because only the model
-// endpoints and the introspection document ever read it. A proxied turn resolves
-// one route and forwards it, and must not pay to clone and sort a list nobody
-// looks at.
-func (res Resolution) Aliases() []Route {
-	aliases := make([]Route, 0, len(res.routes))
-
-	for _, route := range res.routes {
-		// The struct copy still points at the registry's own extra_body bytes,
-		// which every later request on this alias merges from. Cloning them is
-		// what makes the isolation above true rather than nearly true.
-		route.ExtraBody = bytes.Clone(route.ExtraBody)
-		aliases = append(aliases, route)
-	}
-
-	slices.SortFunc(aliases, func(a, b Route) int { return cmp.Compare(a.Alias, b.Alias) })
-
-	return aliases
-}
-
-// Select returns the resolution with Route set to the one serving model — the
-// context's own alias for it, or the default route when no alias claims it.
-//
-// One kind of model is refused rather than served: a rewrite target only
-// foreign upstreams serve. Handing that to the default route would send the
-// request somewhere the registry itself says does not serve the name, so
-// Select returns ErrRewriteTarget naming the alias to ask for instead. An
-// alias always wins first — a key that shadows another route's target is still
-// an alias.
-//
-// It is how a request that has already resolved its context picks its route
-// without asking the registry a second time: one resolution per request, so a
-// registry file replaced mid-request cannot serve one half of that request from
-// one document and the other half from the next.
-func (res Resolution) Select(model string) (Resolution, error) {
-	if route, matched := res.routes[model]; matched {
-		res.Route = route
-
-		return res, nil
-	}
-
-	if alias, foreign := res.foreignTargets[model]; foreign {
-		return res, fmt.Errorf("%w: %q is what alias %q asks of its upstream; request the alias instead",
-			ErrRewriteTarget, model, alias)
-	}
-
-	return res, nil
-}
-
-// selectionKey and resolutionKey are the private types of the request-context
-// keys a Selection and a Resolution are carried under, so no other package can
-// collide with them.
-type (
-	selectionKey  struct{}
-	resolutionKey struct{}
+// Resolution and lifecycle sentinel errors.
+var (
+	ErrUnknownContext = errors.New("unknown context")
+	ErrRewriteTarget  = errors.New("model is a rewrite target, not a binding")
+	ErrInvalid        = errors.New("registry is invalid")
 )
 
-// Registry resolves requests against a registry file, reloading it when the
-// file changes. It is safe for concurrent use.
+// State is the non-secret operator view of the current registry snapshot.
+type State struct {
+	Valid          bool
+	Error          string
+	DefaultContext string
+	Seats          map[string]Seat
+	Contexts       map[string]Context
+}
+
+// Registry owns the current valid document or fail-closed invalid sentinel.
 type Registry struct {
 	path string
 
-	mu       sync.RWMutex
-	loaded   bool
-	stamp    fileStamp
-	contexts map[string]Context
-	err      error
+	mu     sync.RWMutex
+	stamp  fileStamp
+	doc    *document
+	err    error
+	loaded bool
 }
 
-// New returns a Registry backed by the JSON file at path. Nothing is read until
-// the first Resolve or Err call, and a missing file is not an error: it simply
-// means no context has anything of its own to add.
-func New(path string) *Registry {
-	return &Registry{path: path}
-}
-
-// WithSelection returns ctx carrying sel, so the context a request selected in
-// its path is known to every handler downstream of the one that stripped it.
-func WithSelection(ctx context.Context, sel Selection) context.Context {
-	return context.WithValue(ctx, selectionKey{}, sel)
-}
-
-// SelectionFrom returns the selection ctx carries. A request that never named a
-// context — every bare path — selects the personal one implicitly.
-func SelectionFrom(ctx context.Context) Selection {
-	if sel, ok := ctx.Value(selectionKey{}).(Selection); ok {
-		return sel
+// New validates the initial registry synchronously. No caller should bind a listener before it succeeds.
+func New(path string) (*Registry, error) {
+	snap, err := loadSnapshot(path)
+	if err != nil {
+		return nil, fmt.Errorf("registry %s: %w", path, err)
 	}
-
-	return Selection{Name: PersonalContext, Explicit: false}
+	if snap.err != nil {
+		return nil, fmt.Errorf("registry %s: %w", path, snap.err)
+	}
+	return &Registry{path: path, stamp: snap.stamp, doc: snap.doc, loaded: true}, nil
 }
 
-// WithResolution returns ctx carrying res, so the one resolution a request made
-// is the one every handler downstream of it forwards, lists and records by.
-func WithResolution(ctx context.Context, res Resolution) context.Context {
-	return context.WithValue(ctx, resolutionKey{}, res)
-}
-
-// ResolutionFrom returns the resolution ctx carries, and whether it carries
-// one. A request that reached a handler without passing through the surface
-// that resolves — a pipeline driven directly — carries none, and the handler
-// resolves for itself.
-func ResolutionFrom(ctx context.Context) (Resolution, bool) {
-	res, ok := ctx.Value(resolutionKey{}).(Resolution)
-
-	return res, ok
-}
-
-// Resolve returns the route serving model inside the selected context, with
-// that context's own metadata alongside it. Aliases match as whole opaque
-// strings, so a namespaced key like "openrouter/sol" resolves the same way any
-// other key does; the slash carries no meaning here. An alias may deliberately
-// shadow a real Claude model id — that is how a model gets pinned to a
-// different upstream.
+// Resolve selects one Seat using public, marked-subagent, guard, then default precedence.
 //
-// Resolve re-reads the registry file when it has changed since the last call,
-// so it always answers from the file as it stands now.
-//
-// It fails two ways, and the caller must refuse the request on either rather
-// than serve it from somewhere else: an explicitly named context the current
-// file cannot produce returns ErrUnknownContext, and a model that is a foreign
-// route's rewrite target returns ErrRewriteTarget — see Select. A bare
-// selection of an ordinary model never fails — a missing, unparsable or
-// invalid registry file costs it only the foreign aliases, and the built-in
-// default route always survives. The health of the file itself is observed
-// through Err.
-func (r *Registry) Resolve(sel Selection, model string) (Resolution, error) {
+// A registry that went invalid under a running gateway is refused with the bare
+// ErrInvalid sentinel and nothing else. This error is what an unauthenticated
+// caller reads in a 503 and what the ledger persists as that refusal's body,
+// while the detail behind it — the field, the value the file named, the path it
+// was read from — is exactly what a validation error quotes. Err carries that
+// detail to the operator surfaces entitled to it; a request gets the sentinel.
+func (r *Registry) Resolve(
+	sel Selection,
+	model string,
+	observation *SubagentObservation,
+) (Resolution, error) {
 	r.refresh()
-
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-
-	name := sel.Name
-	if name == "" && !sel.Explicit {
-		name = PersonalContext
+	if r.err != nil || r.doc == nil {
+		return Resolution{Context: sel.Name}, ErrInvalid
 	}
 
-	found, ok := r.contexts[name]
-	if !ok && sel.Explicit {
+	return resolveDocument(*r.doc, sel, model, observation)
+}
+
+// ResolveState applies the runtime resolver to an introspected non-secret snapshot.
+//
+// The State belongs to the caller and stays theirs: it is a struct of exported
+// maps, slices and pointers, passed by value, so the copy this receives still
+// points at everything the caller can still write to. A Resolution is documented
+// as an immutable snapshot and outlives this call — Select re-runs the
+// precedence against it, and Models, SubagentPolicy, DefaultSeat and
+// PublicBindings hand out copies of it — so the whole document is cloned here,
+// before anything is derived from it, rather than aliased and read later.
+func ResolveState(
+	state State,
+	sel Selection,
+	model string,
+	observation *SubagentObservation,
+) (Resolution, error) {
+	if !state.Valid {
+		return Resolution{Context: sel.Name}, ErrInvalid
+	}
+	seats := cloneSeats(state.Seats)
+	contexts := make(map[string]Context, len(state.Contexts))
+	for id, ctx := range state.Contexts {
+		cloned := cloneContext(ctx)
+		cloned.foreignTargets = foreignTargets(cloned, seats)
+		contexts[id] = cloned
+	}
+	return resolveDocument(
+		document{DefaultContext: state.DefaultContext, Seats: seats, Contexts: contexts},
+		sel,
+		model,
+		observation,
+	)
+}
+
+func resolveDocument(
+	doc document,
+	sel Selection,
+	model string,
+	observation *SubagentObservation,
+) (Resolution, error) {
+	name := sel.Name
+	if !sel.Explicit {
+		name = doc.DefaultContext
+	}
+	ctx, ok := doc.Contexts[name]
+	if !ok {
 		return Resolution{Context: name}, fmt.Errorf("%w %q", ErrUnknownContext, name)
 	}
-
-	return resolution(name, found, ok).Select(model)
+	return resolution(name, ctx, doc.Seats).Select(model, observation)
 }
 
-// Contexts returns every context the registry currently serves, sorted by name,
-// alongside whether the registry file behind them actually loaded. It is the
-// same lookup Resolve answers one request with, so nothing built from it can
-// describe a context differently from how the pipeline forwards to it.
-//
-// The personal context is always present. A missing or broken file costs every
-// other context, and reports loaded false, but a bare request still rides the
-// built-in default route — so a document that left personal out would describe a
-// gateway that does not exist.
-func (r *Registry) Contexts() ([]Resolution, bool) {
+// State returns an isolated, non-secret snapshot. Invalid registries expose no
+// stale summaries, and no detail of the file that was rejected: Error carries
+// the same sentinel text Resolve does, because this snapshot is what
+// introspection publishes to every holder of the caller key rather than to an
+// operator reading the gateway's own diagnostics.
+func (r *Registry) State() State {
 	r.refresh()
-
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	names := make([]string, 0, len(r.contexts)+1)
-	for name := range r.contexts {
-		names = append(names, name)
-	}
-
-	if _, ok := r.contexts[PersonalContext]; !ok {
-		names = append(names, PersonalContext)
-	}
-
-	slices.Sort(names)
-
-	all := make([]Resolution, 0, len(names))
-	for _, name := range names {
-		found, ok := r.contexts[name]
-		all = append(all, resolution(name, found, ok))
-	}
-
-	return all, r.err == nil && r.stamp.exists
+	return r.state()
 }
 
-// Path is the registry file this Registry reads. It is fixed for the lifetime of
-// the Registry — only the file's contents are ever reloaded.
-func (r *Registry) Path() string {
-	return r.path
+// Inspect returns both operator views of one snapshot: the isolated non-secret
+// State, and the detailed error behind an invalid one.
+//
+// Reading them separately reads the file twice, and between the two reads a
+// home-manager generation can swap it. Whichever way it moves, the two halves
+// then describe different versions — a summary of the document that opened
+// beside a refusal from the one that replaced it, or a summary of a document
+// nothing ever validated. So the refresh happens once and both halves are taken
+// under the same lock: a valid snapshot inspects with a nil error, and an
+// invalid one hands back the same sanitized empty State introspection publishes
+// together with the field and the value that rejected the file.
+func (r *Registry) Inspect() (State, error) {
+	r.refresh()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.state(), r.invalidErr()
 }
 
-// Err returns the parse or validation error from the current registry file, or
-// nil when the file is valid or simply absent. It reflects the file as of the
-// last check, refreshing first, so it can be called on its own to report
-// registry health.
+// state builds the isolated non-secret snapshot with the read lock already
+// held, which is what lets Inspect pair it with the error of the same version.
+func (r *Registry) state() State {
+	if r.err != nil || r.doc == nil {
+		return State{
+			Valid:    false,
+			Error:    ErrInvalid.Error(),
+			Seats:    map[string]Seat{},
+			Contexts: map[string]Context{},
+		}
+	}
+	contexts := make(map[string]Context, len(r.doc.Contexts))
+	for id, ctx := range r.doc.Contexts {
+		contexts[id] = cloneContext(ctx)
+	}
+	return State{
+		Valid:          true,
+		DefaultContext: r.doc.DefaultContext,
+		Seats:          cloneSeats(r.doc.Seats),
+		Contexts:       contexts,
+	}
+}
+
+// cloneSeats copies the Seat map by value and the extra_body bytes each Seat
+// carries, which are the only part of a Seat that is not a value.
+func cloneSeats(in map[string]Seat) map[string]Seat {
+	out := make(map[string]Seat, len(in))
+	for id, seat := range in {
+		seat.ExtraBody = bytes.Clone(seat.ExtraBody)
+		out[id] = seat
+	}
+	return out
+}
+
+// cloneContext copies a Context's bindings and marked-subagent policy. The
+// foreign rewrite targets are left behind: they are derived from a Seat map, so
+// whoever holds the clone derives them against the Seats it holds.
+func cloneContext(in Context) Context {
+	return Context{
+		DefaultSeat: in.DefaultSeat,
+		Models:      cloneBindings(in.Models),
+		Subagents:   cloneSubagents(in.Subagents),
+	}
+}
+
+// Path returns the configured registry path.
+func (r *Registry) Path() string { return r.path }
+
+// Err reports the current hot-reload invalid sentinel, if any, with the detail
+// behind it: the path, the field, and the value the rejected file named. It is
+// the operator's surface — startup, the check subcommand, the gateway's own
+// logs — and the one place that detail survives, because it is what an operator
+// needs to repair the file and what no request may be told.
 func (r *Registry) Err() error {
 	r.refresh()
-
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	return r.err
+	return r.invalidErr()
 }
 
-// refresh reloads the registry file when its stamp has moved since the last
-// load. Both outcomes are cached, success and failure alike, so a broken file
-// is not re-read and re-reported on every single request.
+// invalidErr renders the current refusal for an operator with the read lock
+// already held, or nil while the registry is valid. It copies nothing: this is
+// on the request path, and what an operator is owed here is a sentence about
+// the file, not a document.
+func (r *Registry) invalidErr() error {
+	if r.err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: registry %s: %w", ErrInvalid, r.path, r.err)
+}
+
+// refresh reloads the document when the file's stamp has moved, and does
+// nothing at all when it has not.
+//
+// The reload keeps whatever loadSnapshot settled on — a document or the detailed
+// error the file produced instead of one — under the stamp of the version it was
+// actually read from. An acquisition that never settled is the one case that
+// stores no stamp: it installs the fail-closed sentinel and clears loaded, so
+// the next request tries again rather than treating a version nothing validated
+// as the current one.
 func (r *Registry) refresh() {
 	current := statFile(r.path)
-
 	r.mu.RLock()
 	fresh := r.loaded && r.stamp.equal(current)
 	r.mu.RUnlock()
-
 	if fresh {
 		return
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	// Another goroutine may have reloaded while this one waited for the lock.
 	if r.loaded && r.stamp.equal(current) {
 		return
 	}
+	r.store(loadSnapshot(r.path))
+}
 
-	r.contexts, r.err = loadContexts(r.path)
-	r.stamp = current
+// store installs one acquisition's outcome, with the write lock already held.
+//
+// A settled acquisition is kept under its own stamp, whichever way it settled.
+// An acquisition that never settled keeps no stamp and clears loaded, which is
+// what sends the next request back to the file: storing the stamp of a version
+// this registry never read whole would mark it current forever.
+func (r *Registry) store(snap snapshot, err error) {
+	if err != nil {
+		r.doc = nil
+		r.err = err
+		r.loaded = false
+
+		return
+	}
+
+	r.doc = snap.doc
+	r.err = snap.err
+	r.stamp = snap.stamp
 	r.loaded = true
 }
 
-// resolution describes one context: the one the file defines under name, or —
-// when found is not a loaded context — the built-in world a bare request rides
-// when the registry has nothing to add.
-//
-// The route map it carries is the loaded document's own. A load builds fresh
-// maps and swaps them in whole, so a map handed out here is never written to
-// again and a Resolution outliving a reload keeps describing the document it
-// was resolved against.
-func resolution(name string, found Context, ok bool) Resolution {
-	if !ok {
-		return Resolution{
-			Context:        name,
-			Route:          DefaultRoute(),
-			DefaultRoute:   DefaultRoute(),
-			routes:         nil,
-			foreignTargets: nil,
-		}
-	}
-
+func resolution(name string, ctx Context, seats map[string]Seat) Resolution {
 	return Resolution{
-		Context:        name,
-		Route:          found.DefaultRoute,
-		DefaultRoute:   found.DefaultRoute,
-		routes:         found.Routes,
-		foreignTargets: found.foreignTargets,
+		Context:       name,
+		defaultSeatID: ctx.DefaultSeat,
+		seats:         seats,
+		models:        ctx.Models,
+		subagents:     ctx.Subagents,
+		foreign:       ctx.foreignTargets,
 	}
 }
 
-// loadContexts reads, parses and validates the registry file. An absent file
-// yields no contexts and no error. Any other failure yields no contexts and an
-// error naming the file, the offending context or alias, and the rule it broke.
-func loadContexts(path string) (map[string]Context, error) {
-	data, readErr := os.ReadFile(filepath.Clean(path))
-	if readErr != nil {
-		if errors.Is(readErr, fs.ErrNotExist) {
-			return map[string]Context{}, nil
+// snapshot is one consistent acquisition of the registry file: what the file
+// settled on — a validated document, or the detailed error it produced instead
+// of one — paired with the stamp of the exact version both describe.
+type snapshot struct {
+	doc   *document
+	err   error
+	stamp fileStamp
+}
+
+// loadSnapshot acquires path's current version consistently.
+func loadSnapshot(path string) (snapshot, error) {
+	return acquire(
+		func() fileStamp { return statFile(path) },
+		func() (document, error) { return loadDocument(path) },
+	)
+}
+
+// acquire pairs one load with the stamp of the version it actually read.
+//
+// Stamping only after the read is what pairs document A with stamp B when the
+// file is replaced between the two — and since the cache is invalidated by the
+// stamp alone, that pairing is permanent: the replacement's own stamp is already
+// installed, so every later refresh sees it as current and the superseded
+// document is served until something else moves the file. So the file is
+// stamped on both sides of the read and the result is kept only when the two
+// agree.
+//
+// A file that keeps moving is bounded rather than spun on. It yields no
+// snapshot and no stamp at all, because the only thing worse than refusing an
+// acquisition is trusting a stamp for bytes nobody validated.
+func acquire(stat func() fileStamp, load func() (document, error)) (snapshot, error) {
+	for range loadAttempts {
+		before := stat()
+
+		doc, err := load()
+
+		after := stat()
+		if !before.equal(after) {
+			continue
 		}
 
-		return nil, fmt.Errorf("registry %s: read: %w", path, readErr)
+		return settled(doc, err, after), nil
 	}
 
-	contexts, parseErr := parseRegistry(data)
-	if parseErr != nil {
-		return nil, fmt.Errorf("registry %s: %w", path, parseErr)
+	return snapshot{}, fmt.Errorf(
+		"changed while being read %d times running; no version could be read whole",
+		loadAttempts,
+	)
+}
+
+// settled builds the snapshot of one version read whole: the document it
+// produced, or the detailed error it produced instead of one, under the stamp
+// they both describe. A failure keeps no document, so nothing downstream can
+// mistake a zero document for a loaded one.
+func settled(doc document, err error, stamp fileStamp) snapshot {
+	if err != nil {
+		return snapshot{doc: nil, err: err, stamp: stamp}
 	}
 
-	if validateErr := validateContexts(contexts); validateErr != nil {
-		return nil, fmt.Errorf("registry %s: %w", path, validateErr)
-	}
+	return snapshot{doc: &doc, err: nil, stamp: stamp}
+}
 
-	return contexts, nil
+func loadDocument(path string) (document, error) {
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return document{}, fmt.Errorf("read: %w", err)
+	}
+	doc, err := parseRegistry(data)
+	if err != nil {
+		return document{}, err
+	}
+	if validateErr := validateDocument(&doc); validateErr != nil {
+		return document{}, validateErr
+	}
+	return doc, nil
 }

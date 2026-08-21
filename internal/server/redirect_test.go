@@ -64,7 +64,10 @@ func TestDefaultClientRelaysARedirectRatherThanFollowingIt(t *testing.T) {
 	}).ServeHTTP(rec, req)
 
 	if hits := attackerHits(attacker); hits != 0 {
-		t.Fatalf("the redirect target saw %d requests; want 0 — following one leaks the caller's credentials", hits)
+		t.Fatalf(
+			"the redirect target saw %d requests; want 0 — following one leaks the caller's credentials",
+			hits,
+		)
 	}
 
 	if rec.Code != http.StatusFound {
@@ -89,11 +92,13 @@ func countingServer(t *testing.T) *hitCounter {
 	t.Helper()
 
 	counter := &hitCounter{hits: make(chan struct{}, 8)}
-	counter.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		counter.hits <- struct{}{}
-		w.WriteHeader(http.StatusOK)
-		io.WriteString(w, `{"credentials":"stolen"}`)
-	}))
+	counter.Server = httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			counter.hits <- struct{}{}
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, `{"credentials":"stolen"}`)
+		}),
+	)
 	t.Cleanup(counter.Close)
 
 	return counter
@@ -128,15 +133,16 @@ func pinnedTransport(t *testing.T, addr string) *http.Transport {
 	return transport
 }
 
-// emptyRegistry returns a registry with no aliases, so every model lookup is
-// the upstream's to answer.
 func emptyRegistry(t *testing.T) *registry.Registry {
 	t.Helper()
-
 	path := filepath.Join(t.TempDir(), "registry.json")
-	if err := os.WriteFile(path, []byte(`{"routes":{}}`), 0o600); err != nil {
-		t.Fatalf("write registry: %v", err)
+	body := `{"default_context":"personal","seats":{"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"}},"contexts":{"personal":{"default_seat":"anthropic","models":{}}}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
 	}
-
-	return registry.New(path)
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reg
 }

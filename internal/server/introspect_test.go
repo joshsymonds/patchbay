@@ -8,442 +8,412 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joshsymonds/patchbay/internal/proxy"
-	"github.com/joshsymonds/patchbay/internal/registry"
 	"github.com/joshsymonds/patchbay/internal/server"
 )
 
 const (
-	// introspectPath is the one endpoint that describes the gateway's routing.
 	introspectPath = "/_patchbay/registry"
-
-	// callerKey is the shared secret the introspection endpoint is gated on.
-	callerKey = "s3cret-caller-key"
-
-	// listenAddr is the address the handler is told it is listening on, which
-	// the document has to report back.
-	listenAddr = "127.0.0.1:4100"
-
-	// keyEnvName and mapEnvName are the environment variables a route names for
-	// its key file and its model map. Only the NAMES and the paths they resolve
-	// to may ever appear in the document.
-	keyEnvName = "PATCHBAY_TEST_KEY_FILE"
-	mapEnvName = "PATCHBAY_TEST_MODEL_MAP"
-
-	// upstreamKey is the injected key the route pays with, and bedrockARN the
-	// Bedrock model id its map translates to. Neither may appear in a document.
-	upstreamKey = "sk-upstream-never-printed"
-	bedrockARN  = "arn:aws:bedrock:us-west-2::foundation-model/never-printed"
-
-	// bedrockRoute is a sigv4 alias: no base_url of its own, an endpoint derived
-	// from its region, and a model map named by environment variable.
-	bedrockRoute = `"bedrock-opus":{"auth":"sigv4","aws_profile":"prod",` +
-		`"aws_region":"us-west-2","model_map_env_file":"` + mapEnvName + `",` +
-		`"model":"claude-opus-5","max_input_tokens":200000}`
-
-	// bedrockEndpoint is the upstream that route's region derives.
-	bedrockEndpoint = "https://bedrock-runtime.us-west-2.amazonaws.com"
+	callerKey      = "s3cret-caller-key"
+	listenAddr     = "127.0.0.1:4100"
 )
 
-// callerKeyFile writes a caller-key file and names it in the environment, the
-// same double indirection the proxy's own gate reads.
 func callerKeyFile(t *testing.T) {
 	t.Helper()
-
 	path := filepath.Join(t.TempDir(), "caller.key")
 	if err := os.WriteFile(path, []byte(callerKey), 0o600); err != nil {
-		t.Fatalf("write caller key: %v", err)
+		t.Fatal(err)
 	}
-
 	t.Setenv(proxy.CallerKeyEnvFile, path)
 }
 
-// introspectRequest builds a GET for the introspection endpoint carrying key as
-// the caller secret. An empty key presents no header at all.
-func introspectRequest(target, key string) *http.Request {
-	req := httptest.NewRequest(http.MethodGet, target, nil)
+func introspectRequest(key string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, introspectPath, nil)
 	if key != "" {
 		req.Header.Set(proxy.CallerKeyHeader, key)
 	}
-
 	return req
 }
 
-// decodeDocument decodes an introspection response body.
 func decodeDocument(t *testing.T, body []byte) server.Document {
 	t.Helper()
-
 	var doc server.Document
 	if err := json.Unmarshal(body, &doc); err != nil {
-		t.Fatalf("decode introspection document %q: %v", body, err)
+		t.Fatal(err)
 	}
-
 	return doc
 }
 
-func TestIntrospectionDescribesEveryContext(t *testing.T) {
+func TestIntrospectionReturnsSeatSummariesContextBindingsAndDefault(t *testing.T) {
 	callerKeyFile(t)
-	t.Setenv(keyEnvName, "/run/agenix/openrouter.key")
-	t.Setenv(mapEnvName, "/run/agenix/bedrock-models.json")
-
-	reg := newContextRegistry(t, `"personal":{"routes":{`+lunaRoute+`}},`+
-		`"work":{"default_route":{"auth":"sigv4","aws_profile":"prod",`+
-		`"aws_region":"us-west-2","model_map_env_file":"`+mapEnvName+`"},`+
-		`"routes":{`+bedrockRoute+`}}`)
-
-	proxied := newSentinel()
-	rec := serve(t, server.Config{
-		Proxy:    proxied,
-		Registry: reg,
-		Listen:   listenAddr,
-	}, introspectRequest(introspectPath, callerKey))
-
+	body := strings.Replace(
+		modelRegistry("personal"),
+		`"luna":{"upstream"`,
+		`"luna":{"extra_body":{"secretish":"must-not-appear"},"upstream"`,
+		1,
+	)
+	rec := serve(
+		t,
+		server.Config{
+			Proxy:    newSentinel(),
+			Registry: newRegistryDocument(t, body),
+			Listen:   listenAddr,
+		},
+		introspectRequest(callerKey),
+	)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET %s status = %d; want %d (body %q)", introspectPath, rec.Code, http.StatusOK, rec.Body)
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-
-	if proxied.hits() != 0 {
-		t.Fatal("the introspection endpoint was forwarded upstream")
-	}
-
 	doc := decodeDocument(t, rec.Body.Bytes())
-
-	if !doc.RegistryLoaded {
-		t.Fatal("registry_loaded = false; want a valid registry reported as loaded")
+	if !doc.RegistryValid || doc.RegistryError != "" || doc.DefaultContext == nil ||
+		*doc.DefaultContext != "personal" ||
+		doc.Listen != listenAddr {
+		t.Fatalf("doc=%+v", doc)
 	}
-
-	if doc.Listen != listenAddr {
-		t.Fatalf("listen = %q; want %q", doc.Listen, listenAddr)
+	if len(doc.Seats) != 5 || doc.Seats["luna"].AuthMode != "inject" ||
+		doc.Seats["luna"].Upstream != "https://openrouter.ai/api" {
+		t.Fatalf("seats=%+v", doc.Seats)
 	}
-
-	if doc.RegistryPath == "" || !strings.HasSuffix(doc.RegistryPath, "registry.json") {
-		t.Fatalf("registry_path = %q; want the file the gateway reads", doc.RegistryPath)
+	personal := doc.Contexts["personal"]
+	if personal.DefaultSeat != "anthropic" || personal.Models["luna-fast"] != "luna" ||
+		personal.Subagents == nil ||
+		personal.Subagents.DefaultSeat != "sub" {
+		t.Fatalf("context=%+v", personal)
 	}
-
-	if len(doc.Contexts) != 2 {
-		t.Fatalf("contexts = %v; want personal and work", doc.Contexts)
-	}
-
-	assertPersonalContext(t, doc.Contexts["personal"])
-	assertWorkContext(t, doc.Contexts["work"])
-	assertNoSecrets(t, rec.Body.String())
-}
-
-// assertPersonalContext checks the inject alias and the built-in default route
-// the personal context still rides.
-func assertPersonalContext(t *testing.T, summary server.ContextSummary) {
-	t.Helper()
-
-	if summary.DefaultRoute.Auth != string(registry.AuthForward) ||
-		summary.DefaultRoute.Upstream != "https://api.anthropic.com" {
-		t.Fatalf("personal default_route = %+v; want the built-in Anthropic forward", summary.DefaultRoute)
-	}
-
-	route, ok := summary.Routes["luna-fast"]
-	if !ok {
-		t.Fatalf("personal routes = %v; want the luna-fast alias", summary.Routes)
-	}
-
-	if route.Auth != string(registry.AuthInject) || route.Upstream != "https://openrouter.ai/api" {
-		t.Fatalf("luna-fast summary = %+v; want an inject route to OpenRouter", route)
-	}
-
-	if route.Model != "openai/gpt-5.6-luna" || route.MaxInputTokens != 262144 {
-		t.Fatalf("luna-fast summary = %+v; want its model and input ceiling", route)
-	}
-
-	if route.KeyEnvFile != "OPENROUTER_API_KEY_FILE" {
-		t.Fatalf("luna-fast api_key_env_file = %q; want the environment variable NAME", route.KeyEnvFile)
-	}
-}
-
-// assertWorkContext checks the sigv4 half: an endpoint derived from the region,
-// and the model map named by environment variable and resolved to a path.
-func assertWorkContext(t *testing.T, summary server.ContextSummary) {
-	t.Helper()
-
-	if summary.DefaultRoute.Auth != string(registry.AuthSigV4) ||
-		summary.DefaultRoute.Upstream != bedrockEndpoint {
-		t.Fatalf("work default_route = %+v; want the derived Bedrock endpoint", summary.DefaultRoute)
-	}
-
-	route, ok := summary.Routes["bedrock-opus"]
-	if !ok {
-		t.Fatalf("work routes = %v; want the bedrock-opus alias", summary.Routes)
-	}
-
-	if route.Upstream != bedrockEndpoint || route.Model != "claude-opus-5" {
-		t.Fatalf("bedrock-opus summary = %+v; want the derived endpoint and its model", route)
-	}
-
-	if route.ModelMapEnvFile != mapEnvName {
-		t.Fatalf("bedrock-opus model_map_env_file = %q; want %q", route.ModelMapEnvFile, mapEnvName)
-	}
-
-	if route.ModelMapFile != "/run/agenix/bedrock-models.json" {
-		t.Fatalf("bedrock-opus model_map_file = %q; want the resolved path", route.ModelMapFile)
-	}
-
-	// The profile and the region are what the route pays and signs with, and
-	// they are the two things an operator chasing a Bedrock refusal needs to
-	// see. Neither is a secret: a profile NAME is not a credential.
-	if summary.DefaultRoute.AWSProfile != "prod" || summary.DefaultRoute.AWSRegion != "us-west-2" {
-		t.Fatalf("work default_route = %+v; want its AWS profile and region", summary.DefaultRoute)
-	}
-
-	if route.AWSProfile != "prod" || route.AWSRegion != "us-west-2" {
-		t.Fatalf("bedrock-opus summary = %+v; want its AWS profile and region", route)
-	}
-}
-
-// A route that signs with AWS names no profile or region unless it has one, so
-// nothing that does not sign reports an empty pair.
-func TestIntrospectionOmitsAWSFieldsForRoutesThatDoNotSign(t *testing.T) {
-	callerKeyFile(t)
-
-	rec := serve(t, server.Config{
-		Proxy:    newSentinel(),
-		Registry: newRegistry(t, lunaRoute),
-		Listen:   listenAddr,
-	}, introspectRequest(introspectPath, callerKey))
-
-	if strings.Contains(rec.Body.String(), "aws_profile") || strings.Contains(rec.Body.String(), "aws_region") {
-		t.Fatalf("document = %s; an inject route signs nothing and names no AWS fields", rec.Body)
-	}
-}
-
-// assertNoSecrets fails if a document carries any value that only a secret file
-// holds — a key, or a Bedrock model id from a map.
-func assertNoSecrets(t *testing.T, body string) {
-	t.Helper()
-
-	for _, secret := range []string{callerKey, upstreamKey, bedrockARN} {
-		if strings.Contains(body, secret) {
-			t.Fatalf("introspection document leaked a secret value: %q", body)
+	for _, secret := range []string{"must-not-appear", callerKey, "arn:"} {
+		if strings.Contains(rec.Body.String(), secret) {
+			t.Errorf("secret %q exposed: %s", secret, rec.Body.String())
 		}
 	}
 }
 
-func TestIntrospectionRefusesACallerWithoutTheKey(t *testing.T) {
+// rejectedValue is the distinctive string the invalid replacement below names in
+// a field validation quotes back, standing in for whatever an operator pasted
+// into the wrong place. Introspection is caller-key-gated, not operator-only:
+// the key is a machine-local secret many processes hold, so the document says
+// the registry is invalid without republishing what the rejected file contains.
+const rejectedValue = "sk-live-secret"
+
+// secretRegistry is an invalid registry whose validation error quotes
+// rejectedValue: api_key_env_file names a value that is not an environment
+// variable name at all.
+const secretRegistry = `{"default_context":"personal","seats":{` +
+	`"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna",` +
+	`"auth_mode":"inject","api_key_env_file":"` + rejectedValue + `"}},` +
+	`"contexts":{"personal":{"default_seat":"luna","models":{}}}}`
+
+func TestUnprefixedIntrospectionReportsHotInvalidSentinel(t *testing.T) {
 	callerKeyFile(t)
-
-	tests := []struct {
-		name string
-		key  string
-	}{
-		{name: "no key at all", key: ""},
-		{name: "the wrong key", key: "not-the-key"},
+	reg := newRegistryDocument(t, modelRegistry("personal"))
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(reg.Path(), base, base); err != nil {
+		t.Fatal(err)
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			proxied := newSentinel()
-			rec := serve(t, server.Config{
-				Proxy:    proxied,
-				Registry: newRegistry(t, lunaRoute),
-				Listen:   listenAddr,
-			}, introspectRequest(introspectPath, tc.key))
-
-			if rec.Code != http.StatusForbidden {
-				t.Fatalf("status = %d; want %d", rec.Code, http.StatusForbidden)
-			}
-
-			if proxied.hits() != 0 {
-				t.Fatal("a refused introspection request was forwarded upstream")
-			}
-
-			body := rec.Body.String()
-			if !strings.Contains(body, "patchbay: ") || !strings.Contains(body, "caller key") {
-				t.Fatalf("body = %q; want patchbay's own caller-key refusal", body)
-			}
-
-			assertNoSecrets(t, body)
-		})
+	if err := os.WriteFile(reg.Path(), []byte(secretRegistry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(reg.Path(), base.Add(time.Hour), base.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	rec := serve(
+		t,
+		server.Config{Proxy: newSentinel(), Registry: reg},
+		introspectRequest(callerKey),
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	doc := decodeDocument(t, rec.Body.Bytes())
+	if doc.RegistryValid || doc.RegistryError == "" || doc.DefaultContext != nil ||
+		len(doc.Seats) != 0 ||
+		len(doc.Contexts) != 0 {
+		t.Fatalf("doc=%+v", doc)
+	}
+	if strings.Contains(doc.RegistryError, reg.Path()) {
+		t.Fatalf("unsanitized error=%q", doc.RegistryError)
+	}
+	// registry_path is the document's own field and stays; what the rejected file
+	// said must appear nowhere in the answer.
+	if strings.Contains(rec.Body.String(), rejectedValue) {
+		t.Fatalf("invalid document republishes a rejected value: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"validation_error"`) ||
+		strings.Contains(rec.Body.String(), `"registry_error"`) {
+		t.Fatalf("invalid registry wire fields=%s", rec.Body.String())
 	}
 }
 
-func TestIntrospectionFailsWhenNoKeyFileIsConfigured(t *testing.T) {
-	t.Setenv(proxy.CallerKeyEnvFile, "")
-
-	rec := serve(t, server.Config{
-		Proxy:    newSentinel(),
-		Registry: newRegistry(t, lunaRoute),
-		Listen:   listenAddr,
-	}, introspectRequest(introspectPath, callerKey))
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d; want %d for an unconfigured caller key", rec.Code, http.StatusInternalServerError)
-	}
-}
-
-func TestIntrospectionTellsTheDegradedTruth(t *testing.T) {
+// TestBareIntrospectionReportsTheInvalidRegistryOnlyForAKeyedCaller pins the one
+// invalid state introspection sees first. Bare "/_patchbay/registry" is answered
+// by the outer wrapper before any context is selected, so nothing else has
+// observed the failure yet and this is the only place the operator can hear
+// about it.
+//
+// The report sits behind the caller-key gate rather than in front of it. What is
+// logged is the detail the rejected file contains, and an unauthenticated prober
+// must not be able to make the gateway write it anywhere — the answer such a
+// caller gets is 403 and a silent log.
+func TestBareIntrospectionReportsTheInvalidRegistryOnlyForAKeyedCaller(t *testing.T) {
 	callerKeyFile(t)
-
-	tests := []struct {
-		name string
-		reg  func(t *testing.T) *registry.Registry
+	for _, tc := range []struct {
+		name, key    string
+		want, report int
 	}{
-		{
-			name: "a registry that will not validate",
-			reg: func(t *testing.T) *registry.Registry {
-				t.Helper()
-
-				return newRawRegistry(t, `{"contexts":{"personal":{"routes":{"broken":{"auth":"nonsense"}}}}}`)
-			},
-		},
-		{
-			name: "no registry file at all",
-			reg: func(t *testing.T) *registry.Registry {
-				t.Helper()
-
-				return registry.New(filepath.Join(t.TempDir(), "absent.json"))
-			},
-		},
-	}
-
-	for _, tc := range tests {
+		{name: "no key", key: "", want: http.StatusForbidden},
+		{name: "wrong key", key: "wrong", want: http.StatusForbidden},
+		{name: "the caller key", key: callerKey, want: http.StatusOK, report: 1},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
+			reg := newRegistryDocument(t, modelRegistry("personal"))
+			base := time.Now().Add(-time.Hour).Truncate(time.Second)
+			if err := os.Chtimes(reg.Path(), base, base); err != nil {
+				t.Fatal(err)
+			}
+			replaceRegistryFile(t, reg.Path(), secretRegistry, base.Add(time.Hour))
+
+			sink := newLogSink()
 			rec := serve(t, server.Config{
 				Proxy:    newSentinel(),
-				Registry: tc.reg(t),
-				Listen:   listenAddr,
-			}, introspectRequest(introspectPath, callerKey))
+				Registry: reg,
+				Logger:   sink.logger(),
+			}, introspectRequest(tc.key))
 
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status = %d; want %d", rec.Code, http.StatusOK)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d; want %d (body %s)", rec.Code, tc.want, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), rejectedValue) {
+				t.Errorf("the answer republished a rejected value: %s", rec.Body.String())
 			}
 
-			doc := decodeDocument(t, rec.Body.Bytes())
-
-			if doc.RegistryLoaded {
-				t.Fatal("registry_loaded = true; want a broken or absent registry reported as not loaded")
+			got := sink.matching(operatorInvalidMessage)
+			if len(got) != tc.report {
+				t.Fatalf("operator log holds %d %q entries; want %d\n%s",
+					len(got), operatorInvalidMessage, tc.report, sink)
+			}
+			if tc.report == 0 {
+				return
 			}
 
-			if len(doc.Contexts) != 1 {
-				t.Fatalf("contexts = %v; want the built-in personal context alone", doc.Contexts)
+			if !got[0].operatorVisible() {
+				t.Errorf("operator log %q is quieter than a warning", got[0].text())
 			}
-
-			personal, ok := doc.Contexts[registry.PersonalContext]
-			if !ok {
-				t.Fatalf("contexts = %v; want the personal context", doc.Contexts)
+			for _, detail := range []string{reg.Path(), rejectedValue, "api_key_env_file"} {
+				if !strings.Contains(got[0].attrs, detail) {
+					t.Errorf("operator log %q keeps no %q", got[0].text(), detail)
+				}
 			}
-
-			if personal.DefaultRoute.Auth != string(registry.AuthForward) || len(personal.Routes) != 0 {
-				t.Fatalf("personal = %+v; want the built-in default route and no aliases", personal)
-			}
-		})
-	}
-}
-
-func TestIntrospectionNeverForwardsItsOwnPaths(t *testing.T) {
-	callerKeyFile(t)
-
-	// The prefix is patchbay's own under a context prefix too: a context cannot
-	// put an Anthropic endpoint under it, so "/ctx/<name>/_patchbay/..." is
-	// answered here — or refused for naming a context nobody serves — and is
-	// never forwarded as a request the caller did not make.
-	targets := []string{
-		"/_patchbay", "/_patchbay/", "/_patchbay/other", "/_patchbay/registry/extra",
-		"/ctx/personal/_patchbay/registry/extra", "/ctx/personal/_patchbay/other",
-		"/ctx/bogus/_patchbay/registry",
-	}
-
-	for _, target := range targets {
-		t.Run(target, func(t *testing.T) {
-			proxied := newSentinel()
-			rec := serve(t, server.Config{
-				Proxy:    proxied,
-				Registry: newRegistry(t, lunaRoute),
-				Listen:   listenAddr,
-			}, introspectRequest(target, callerKey))
-
-			if rec.Code != http.StatusNotFound {
-				t.Fatalf("GET %s status = %d; want %d", target, rec.Code, http.StatusNotFound)
-			}
-
-			if proxied.hits() != 0 {
-				t.Fatalf("GET %s reached the proxy; a /_patchbay path is never forwarded", target)
-			}
-
-			if !strings.Contains(rec.Body.String(), "not_found_error") {
-				t.Fatalf("GET %s body = %q; want an Anthropic not_found_error", target, rec.Body)
+			if doc := decodeDocument(t, rec.Body.Bytes()); doc.RegistryValid ||
+				doc.RegistryError == "" {
+				t.Fatalf("doc = %+v; want the sanitized invalid document", doc)
 			}
 		})
 	}
 }
 
-func TestIntrospectionMethods(t *testing.T) {
+// TestIntrospectionOnAValidRegistryForgetsTheReportedFailure is the other half
+// of the document path. Introspection reads the same state a request resolves
+// from, so a valid one is evidence the reported failure is over — and a file
+// that breaks the same way after that is a failure nobody has been told about
+// yet, on this surface exactly as on the request path.
+func TestIntrospectionOnAValidRegistryForgetsTheReportedFailure(t *testing.T) {
 	callerKeyFile(t)
+	reg := newRegistryDocument(t, modelRegistry("personal"))
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(reg.Path(), base, base); err != nil {
+		t.Fatal(err)
+	}
 
-	tests := []struct {
-		name   string
-		method string
-		want   int
+	sink := newLogSink()
+	// One handler throughout: what it has already reported is the thing under test.
+	handler := server.Handler(server.Config{
+		Proxy:    newSentinel(),
+		Registry: reg,
+		Logger:   sink.logger(),
+	})
+	ask := func() server.Document {
+		t.Helper()
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, introspectRequest(callerKey))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d; want 200 (body %s)", rec.Code, rec.Body.String())
+		}
+
+		return decodeDocument(t, rec.Body.Bytes())
+	}
+	reported := func(want int) {
+		t.Helper()
+
+		if got := sink.matching(operatorInvalidMessage); len(got) != want {
+			t.Fatalf("operator log holds %d %q entries; want %d\n%s",
+				len(got), operatorInvalidMessage, want, sink)
+		}
+	}
+
+	replaceRegistryFile(t, reg.Path(), secretRegistry, base.Add(time.Hour))
+
+	if doc := ask(); doc.RegistryValid {
+		t.Fatalf("doc = %+v; want the invalid document", doc)
+	}
+	reported(1)
+
+	replaceRegistryFile(t, reg.Path(), modelRegistry("personal"), base.Add(2*time.Hour))
+
+	if doc := ask(); !doc.RegistryValid {
+		t.Fatalf("doc = %+v; want the repaired document", doc)
+	}
+	reported(1)
+
+	replaceRegistryFile(t, reg.Path(), secretRegistry, base.Add(3*time.Hour))
+
+	if doc := ask(); doc.RegistryValid {
+		t.Fatalf("doc = %+v; want the invalid document again", doc)
+	}
+	reported(2)
+}
+
+func TestIntrospectionRemainsCallerKeyGated(t *testing.T) {
+	callerKeyFile(t)
+	for _, key := range []string{"", "wrong"} {
+		rec := serve(
+			t,
+			server.Config{
+				Proxy:    newSentinel(),
+				Registry: newRegistryDocument(t, modelRegistry("personal")),
+			},
+			introspectRequest(key),
+		)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("key %q status=%d", key, rec.Code)
+		}
+	}
+}
+
+// TestIntrospectionMethodsAndPaths pins the surface patchbay claims for itself.
+// The prefix is patchbay's own — no Anthropic endpoint lives under it — so a path
+// nobody serves is answered here rather than becoming a request to Anthropic the
+// caller never made.
+func TestIntrospectionMethodsAndPaths(t *testing.T) {
+	callerKeyFile(t)
+	for _, tc := range []struct {
+		name, method, target string
+		want                 int
+		wantAllow            bool
 	}{
-		{name: "head answers like get", method: http.MethodHead, want: http.StatusOK},
-		{name: "post is refused", method: http.MethodPost, want: http.StatusMethodNotAllowed},
-		{name: "delete is refused", method: http.MethodDelete, want: http.StatusMethodNotAllowed},
-	}
-
-	for _, tc := range tests {
+		{name: "get", method: http.MethodGet, target: introspectPath, want: http.StatusOK},
+		{name: "head", method: http.MethodHead, target: introspectPath, want: http.StatusOK},
+		{name: "post", method: http.MethodPost, target: introspectPath, want: http.StatusMethodNotAllowed, wantAllow: true},
+		{name: "delete", method: http.MethodDelete, target: introspectPath, want: http.StatusMethodNotAllowed, wantAllow: true},
+		{name: "unknown sibling", method: http.MethodGet, target: "/_patchbay/nothing", want: http.StatusNotFound},
+		{name: "bare root", method: http.MethodGet, target: "/_patchbay", want: http.StatusNotFound},
+		{name: "deep unknown", method: http.MethodGet, target: "/_patchbay/a/b/c", want: http.StatusNotFound},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			proxied := newSentinel()
-			req := httptest.NewRequest(tc.method, introspectPath, nil)
+			pipeline := newSentinel()
+			req := httptest.NewRequest(tc.method, tc.target, nil)
 			req.Header.Set(proxy.CallerKeyHeader, callerKey)
-
 			rec := serve(t, server.Config{
-				Proxy:    proxied,
-				Registry: newRegistry(t, lunaRoute),
-				Listen:   listenAddr,
+				Proxy:    pipeline,
+				Registry: newRegistryDocument(t, modelRegistry("personal")),
 			}, req)
 
 			if rec.Code != tc.want {
-				t.Fatalf("%s %s status = %d; want %d", tc.method, introspectPath, rec.Code, tc.want)
+				t.Errorf("status = %d; want %d (body %s)", rec.Code, tc.want, rec.Body.String())
 			}
-
-			if proxied.hits() != 0 {
-				t.Fatalf("%s %s reached the proxy", tc.method, introspectPath)
+			if tc.wantAllow && rec.Header().Get("Allow") == "" {
+				t.Error("a 405 carries no Allow header")
+			}
+			if pipeline.hits() != 0 {
+				t.Error("an introspection path reached the proxy")
 			}
 		})
 	}
 }
 
-// The introspection endpoint is patchbay's own under a context prefix too. The
-// context is resolved and stripped first, so the same document answers — and a
-// context nobody serves is refused before anything else looks at the path.
+// TestIntrospectionAnswersUnderAContextPrefix pins the prefixed form. A context
+// cannot put an Anthropic endpoint under patchbay's own prefix, so
+// "/ctx/work/_patchbay/..." is answered here exactly as the bare form is.
 func TestIntrospectionAnswersUnderAContextPrefix(t *testing.T) {
 	callerKeyFile(t)
+	pipeline := newSentinel()
+	rec := serve(t, server.Config{
+		Proxy:    pipeline,
+		Registry: newRegistryDocument(t, modelRegistry("personal")),
+		Listen:   listenAddr,
+	}, keyedIntrospectRequest("/ctx/personal"+introspectPath))
 
-	tests := []struct {
-		name   string
-		target string
-		want   int
-	}{
-		{name: "a context the gateway serves", target: "/ctx/personal" + introspectPath, want: http.StatusOK},
-		{name: "a context it does not", target: "/ctx/bogus" + introspectPath, want: http.StatusNotFound},
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if doc := decodeDocument(t, rec.Body.Bytes()); !doc.RegistryValid {
+		t.Fatalf("doc = %+v", doc)
+	}
+	if pipeline.hits() != 0 {
+		t.Error("a prefixed introspection path reached the proxy")
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			proxied := newSentinel()
-			rec := serve(t, server.Config{
-				Proxy:    proxied,
-				Registry: newRegistry(t, lunaRoute),
-				Listen:   listenAddr,
-			}, introspectRequest(tc.target, callerKey))
+	unknown := newSentinel()
+	unknownRec := serve(t, server.Config{
+		Proxy:    unknown,
+		Registry: newRegistryDocument(t, modelRegistry("personal")),
+	}, keyedIntrospectRequest("/ctx/personal/_patchbay/nothing"))
+	if unknownRec.Code != http.StatusNotFound || unknown.hits() != 0 {
+		t.Fatalf("prefixed unknown path status = %d hits = %d", unknownRec.Code, unknown.hits())
+	}
+}
 
-			if rec.Code != tc.want {
-				t.Fatalf("GET %s status = %d; want %d (body %s)", tc.target, rec.Code, tc.want, rec.Body)
-			}
+func keyedIntrospectRequest(target string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set(proxy.CallerKeyHeader, callerKey)
+	return req
+}
 
-			if proxied.hits() != 0 {
-				t.Fatalf("GET %s reached the proxy; a /_patchbay path is never forwarded", tc.target)
-			}
+// TestIntrospectionReportsAnUnreadableCallerKey separates the server's own
+// misconfiguration from a caller's refusal: 500, not 403.
+func TestIntrospectionReportsAnUnreadableCallerKey(t *testing.T) {
+	unreadableCallerKey(t)
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newRegistryDocument(t, modelRegistry("personal")),
+	}, introspectRequest(callerKey))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d; want 500 (body %s)", rec.Code, rec.Body.String())
+	}
+}
 
-			if tc.want == http.StatusOK && decodeDocument(t, rec.Body.Bytes()).Listen != listenAddr {
-				t.Fatalf("document = %s; want the gateway's own routing", rec.Body)
-			}
-		})
+// TestIntrospectionOmitsFieldsASeatDoesNotUse keeps the summary honest about
+// each auth mode rather than publishing empty AWS fields on every Seat.
+func TestIntrospectionOmitsFieldsASeatDoesNotUse(t *testing.T) {
+	callerKeyFile(t)
+	rec := serve(t, server.Config{
+		Proxy:    newSentinel(),
+		Registry: newRegistryDocument(t, modelRegistry("personal")),
+		Listen:   listenAddr,
+	}, introspectRequest(callerKey))
+
+	var raw struct {
+		Seats map[string]map[string]any `json:"seats"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, absent := range []string{"aws_profile", "aws_region", "model_map_env_file", "api_key_env_file"} {
+		if _, present := raw.Seats["anthropic"][absent]; present {
+			t.Errorf("forward Seat publishes %q: %v", absent, raw.Seats["anthropic"])
+		}
+	}
+	for _, absent := range []string{"aws_profile", "aws_region", "model_map_env_file"} {
+		if _, present := raw.Seats["luna"][absent]; present {
+			t.Errorf("inject Seat publishes %q: %v", absent, raw.Seats["luna"])
+		}
+	}
+	if raw.Seats["bedrock"]["upstream"] != "https://bedrock-runtime.us-east-2.amazonaws.com" {
+		t.Errorf("sigv4 Seat upstream = %v; want the endpoint its region derives", raw.Seats["bedrock"]["upstream"])
+	}
+	if _, present := raw.Seats["bedrock"]["api_key_env_file"]; present {
+		t.Errorf("sigv4 Seat publishes api_key_env_file: %v", raw.Seats["bedrock"])
 	}
 }

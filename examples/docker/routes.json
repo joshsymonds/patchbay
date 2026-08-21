@@ -1,22 +1,32 @@
 {
+  "default_context": "personal",
+  "seats": {
+    "anthropic": {
+      "upstream": "https://api.anthropic.com",
+      "auth_mode": "forward"
+    },
+    "openrouter-kimi-k2": {
+      "upstream": "https://openrouter.ai/api",
+      "model": "moonshotai/kimi-k2",
+      "auth_mode": "inject",
+      "api_key_env_file": "PATCHBAY_OPENROUTER_KEY_FILE",
+      "strip_cache_control": true
+    },
+    "chatgpt-sol": {
+      "upstream": "http://cli-proxy-api:8317",
+      "model": "gpt-5.6-sol",
+      "auth_mode": "inject",
+      "api_key_env_file": "PATCHBAY_CHATGPT_KEY_FILE",
+      "max_input_tokens": 372000,
+      "insecure": true
+    }
+  },
   "contexts": {
     "personal": {
-      "routes": {
-        "openrouter/kimi-k2": {
-          "auth": "inject",
-          "base_url": "https://openrouter.ai/api",
-          "model": "moonshotai/kimi-k2",
-          "api_key_env_file": "PATCHBAY_OPENROUTER_KEY_FILE",
-          "strip_cache_control": true
-        },
-        "chatgpt/sol": {
-          "auth": "inject",
-          "base_url": "http://cli-proxy-api:8317",
-          "model": "gpt-5.6-sol",
-          "api_key_env_file": "PATCHBAY_CHATGPT_KEY_FILE",
-          "insecure": true,
-          "max_input_tokens": 372000
-        }
+      "default_seat": "anthropic",
+      "models": {
+        "openrouter/kimi-k2": "openrouter-kimi-k2",
+        "chatgpt/sol": "chatgpt-sol"
       }
     }
   }

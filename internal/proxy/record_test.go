@@ -10,13 +10,17 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/proxy"
+	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
 // jsonTurn is a complete non-streaming answer with two content blocks.
@@ -25,7 +29,7 @@ const jsonTurn = `{"id":"msg_02","type":"message","role":"assistant","model":"ve
 	`"stop_reason":"end_turn","usage":{"input_tokens":11,"output_tokens":22}}`
 
 // TestRecordsStreamingTurn checks the ledger record a streamed turn produces:
-// the route it rode, the tokens it burned, the block shape it came back in, and
+// the Seat it rode, the tokens it burned, the block shape it came back in, and
 // the drop signature two adjacent reasoning blocks carry.
 func TestRecordsStreamingTurn(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
@@ -35,7 +39,7 @@ func TestRecordsStreamingTurn(t *testing.T) {
 	recorder := newRecorder()
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: recorder,
 		Host:     testHost,
 	}, messagesRequest(fidelityBody))
@@ -50,16 +54,21 @@ func TestRecordsStreamingTurn(t *testing.T) {
 		t.Errorf("host = %q, want %q", got.Host, testHost)
 	}
 
-	if got.Alias != echoAlias {
-		t.Errorf("alias = %q, want %q", got.Alias, echoAlias)
+	if got.Seat != "seat-0" {
+		t.Errorf("seat = %q, want %q", got.Seat, "seat-0")
 	}
 
 	if got.Upstream != stub.url() {
 		t.Errorf("upstream = %q, want %q", got.Upstream, stub.url())
 	}
 
-	if got.Model != echoAlias || got.RequestModel != echoAlias {
-		t.Errorf("model/request_model = %q/%q, want %q for both", got.Model, got.RequestModel, echoAlias)
+	if !modelIs(got.Model, echoSelector) || !modelIs(got.RequestModel, echoSelector) {
+		t.Errorf(
+			"model/request_model = %s/%s, want %q for both",
+			shownModel(got.Model),
+			shownModel(got.RequestModel),
+			echoSelector,
+		)
 	}
 
 	if got.AuthMode != "inject" {
@@ -96,7 +105,7 @@ func TestRecordsStreamingTurn(t *testing.T) {
 	}
 
 	if got.RequestBody != "" || got.ResponseBody != "" {
-		t.Error("bodies recorded for a route that did not ask for capture")
+		t.Error("bodies recorded for a Seat that did not ask for capture")
 	}
 
 	if err := got.Validate(); err != nil {
@@ -113,7 +122,7 @@ func TestRecordsNonStreamingTurn(t *testing.T) {
 	recorder := newRecorder()
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, rewriteRoute(stub.url())),
+		Registry: newRegistry(t, rewriteSeat(stub.url())),
 		Recorder: recorder,
 		Host:     testHost,
 	}, messagesRequest(rewriteBody))
@@ -124,12 +133,12 @@ func TestRecordsNonStreamingTurn(t *testing.T) {
 
 	got := recorder.wait(t)
 
-	if got.RequestModel != rewriteAlias {
-		t.Errorf("request_model = %q, want %q", got.RequestModel, rewriteAlias)
+	if !modelIs(got.RequestModel, rewriteSelector) {
+		t.Errorf("request_model = %s, want %q", shownModel(got.RequestModel), rewriteSelector)
 	}
 
-	if got.Model != "vendor/model-1" {
-		t.Errorf("model = %q, want the model actually sent upstream", got.Model)
+	if !modelIs(got.Model, "vendor/model-1") {
+		t.Errorf("model = %s, want the model actually sent upstream", shownModel(got.Model))
 	}
 
 	if want := []string{"thinking", "text"}; !reflect.DeepEqual(got.BlockShape, want) {
@@ -194,7 +203,7 @@ func TestRecordsTruncatedStreamAsIncomplete(t *testing.T) {
 	sink := newLogSink()
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: recorder,
 		Logger:   slog.New(sink),
 		Host:     testHost,
@@ -241,7 +250,7 @@ func TestRecordsUpstreamError(t *testing.T) {
 	recorder := newRecorder()
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: recorder,
 		Host:     testHost,
 	}, messagesRequest(fidelityBody))
@@ -281,7 +290,7 @@ func TestRecordsGatewayError(t *testing.T) {
 	recorder := newRecorder()
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: recorder,
 		Host:     testHost,
 	}, messagesRequest(fidelityBody))
@@ -297,7 +306,11 @@ func TestRecordsGatewayError(t *testing.T) {
 	}
 
 	if got.ErrorBody != rec.Body.String() {
-		t.Errorf("error_body = %q, want the returned error JSON %q", got.ErrorBody, rec.Body.String())
+		t.Errorf(
+			"error_body = %q, want the returned error JSON %q",
+			got.ErrorBody,
+			rec.Body.String(),
+		)
 	}
 
 	if err := got.Validate(); err != nil {
@@ -306,15 +319,59 @@ func TestRecordsGatewayError(t *testing.T) {
 }
 
 // TestCaptureBodiesRecordsBothBodies proves the capture flag stores the bytes
-// actually forwarded and the bytes actually returned — and that even the route
+// actually forwarded and the bytes actually returned — and that even the Seat
 // which records the most still records no credential of any kind: not the
 // caller's, and not the one patchbay injected.
+func TestMarkedSubagentCallerKeyFailureRecordsSelectedSeat(t *testing.T) {
+	writeCallerKeyFile(t)
+	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+	body := []byte(fmt.Sprintf(`{"default_context":"personal","seats":{`+
+		`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},`+
+		`"worker":{"upstream":%q,"model":"vendor/worker","auth_mode":"inject","api_key_env_file":%q}},`+
+		`"contexts":{"personal":{"default_seat":"anthropic","models":{},`+
+		`"subagents":{"default_seat":"worker","models":{"claude-opus-5":"worker"}}}}}`,
+		stub.url(), keyEnvName))
+	recorder := newRecorder()
+	req := messagesRequest(`{"model":"claude-opus-5"}`)
+	req.Header.Set(proxy.ClaudeCodeAgentIDHeader, "agent/one")
+	req.Header.Set(proxy.ClaudeCodeParentAgentIDHeader, "parent/one")
+	req.Header.Del(callerKeyHeader)
+
+	rec := serve(
+		t,
+		proxy.Config{Registry: newRegistryDocument(t, body), Recorder: recorder, Host: testHost},
+		req,
+	)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+	got := recorder.wait(t)
+	if got.Selection == nil || got.Selection.Kind != ledger.SelectionSubagent ||
+		got.Selection.Model == nil ||
+		*got.Selection.Model != "claude-opus-5" {
+		t.Fatalf("selection = %+v", got.Selection)
+	}
+	if got.Context != "personal" || got.Seat != "worker" || got.Upstream != stub.url() ||
+		!modelIs(got.Model, "vendor/worker") || !modelIs(got.RequestModel, "claude-opus-5") ||
+		got.AuthMode != "inject" ||
+		got.ConfigSource != keyEnvName {
+		t.Fatalf("selected fields = %+v", got)
+	}
+	if got.Subagent == nil || got.Subagent.AgentID != "agent/one" ||
+		got.Subagent.ParentAgentID != "parent/one" {
+		t.Fatalf("subagent = %+v", got.Subagent)
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("record does not validate: %v", err)
+	}
+}
+
 func TestCaptureBodiesRecordsBothBodies(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
-	route := fmt.Sprintf(`%q:{"base_url":%q,"auth":"inject","api_key_env_file":%q,`+
-		`"capture_bodies":true}`, echoAlias, stub.url(), keyEnvName)
+	seat := fmt.Sprintf(`%q:{"upstream":%q,"auth_mode":"inject","api_key_env_file":%q,`+
+		`"capture_bodies":true}`, echoSelector, stub.url(), keyEnvName)
 	recorder := newRecorder()
 
 	req := messagesRequest(fidelityBody)
@@ -322,7 +379,7 @@ func TestCaptureBodiesRecordsBothBodies(t *testing.T) {
 	req.Header.Set("X-Api-Key", "caller-api-key")
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, route),
+		Registry: newRegistry(t, seat),
 		Recorder: recorder,
 		Host:     testHost,
 	}, req)
@@ -384,7 +441,7 @@ func TestRecorderFailuresNeverReachTheClient(t *testing.T) {
 			stub := newUpstream(t, sseHandler(t, payload, pathologicalSplits(payload)))
 
 			cfg := proxy.Config{
-				Registry: newRegistry(t, identityRoute(stub.url())),
+				Registry: newRegistry(t, identitySeat(stub.url())),
 				Host:     testHost,
 			}
 
@@ -419,7 +476,7 @@ func TestDroppedRecordIsLoggedToTheConfiguredLogger(t *testing.T) {
 	sink := newLogSink()
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: &stubRecorder{records: make(chan ledger.Record, 1), err: io.ErrClosedPipe},
 		Logger:   slog.New(sink),
 		Host:     testHost,
@@ -455,7 +512,7 @@ func TestOversizedResponseDropsCaptureNotStream(t *testing.T) {
 	recorder := newRecorder()
 
 	gateway := httptest.NewServer(proxy.New(proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: recorder,
 		Host:     testHost,
 	}))
@@ -500,16 +557,196 @@ func TestOversizedResponseDropsCaptureNotStream(t *testing.T) {
 	}
 }
 
-// workContext is a second context whose default route rides a foreign upstream,
-// so a request in it resolves nothing the personal context holds.
-func workContext(baseURL string) string {
-	return fmt.Sprintf(`"work":{"default_route":{"base_url":%q,"model":"vendor/work-1",`+
-		`"auth":"inject","api_key_env_file":%q},"routes":{}}`, baseURL, keyEnvName)
+func contextRegistry(baseURL string) []byte {
+	return []byte(fmt.Sprintf(`{"default_context":"personal","seats":{`+
+		`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},`+
+		`"personal":{"upstream":%q,"auth_mode":"inject","api_key_env_file":%q},`+
+		`"work":{"upstream":%q,"model":"vendor/work-1","auth_mode":"inject","api_key_env_file":%q}},`+
+		`"contexts":{"personal":{"default_seat":"anthropic","models":{%q:"personal"}},`+
+		`"work":{"default_seat":"work","models":{}}}}`, baseURL, keyEnvName, baseURL, keyEnvName, echoSelector))
+}
+
+// whitespaceSelector is a public selector that is nothing but spaces. It is a
+// strange thing for an operator to bind and a perfectly valid one: a selector is
+// an opaque exact string, matched byte for byte, so the only selector patchbay
+// treats as absent is the empty one.
+const whitespaceSelector = "   "
+
+// TestOpaqueWhitespaceSelectorSurvivesRoutingAndPersistence follows one such
+// selector the whole way: the strict registry admits the binding, a request
+// naming those exact bytes selects it, and the record stores them — in the
+// selection, in request_model, and, on a Seat that rewrites nothing, in model
+// too. JSON null is what a record says when a request named no model at all, and
+// a selector that exists must never be filed under it.
+func TestOpaqueWhitespaceSelectorSurvivesRoutingAndPersistence(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+	document := []byte(fmt.Sprintf(`{"default_context":"personal","seats":{`+
+		`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},`+
+		`"spaced":{"upstream":%q,"auth_mode":"inject","api_key_env_file":%q}},`+
+		`"contexts":{"personal":{"default_seat":"anthropic","models":{%q:"spaced"}}}}`,
+		stub.url(), keyEnvName, whitespaceSelector))
+	recorder := newRecorder()
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistryDocument(t, document),
+		Recorder: recorder,
+		Host:     testHost,
+	}, messagesRequest(fmt.Sprintf(`{"model":%q}`, whitespaceSelector)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body %s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	// The request reached the Seat the selector names, carrying the caller's own
+	// bytes: a Seat that rewrites nothing forwards the model it was asked for.
+	call := stub.call(t)
+	if got := string(call.body); got != fmt.Sprintf(`{"model":%q}`, whitespaceSelector) {
+		t.Errorf("forwarded body = %q, want the caller's own bytes", got)
+	}
+
+	got := recorder.wait(t)
+
+	if got.Selection == nil || got.Selection.Kind != ledger.SelectionModel ||
+		got.Selection.Model == nil || *got.Selection.Model != whitespaceSelector {
+		t.Fatalf("selection = %+v, want the exact selector under the model kind", got.Selection)
+	}
+
+	if got.Seat != "spaced" {
+		t.Errorf("seat = %q, want %q", got.Seat, "spaced")
+	}
+
+	if !modelIs(got.RequestModel, whitespaceSelector) || !modelIs(got.Model, whitespaceSelector) {
+		t.Errorf(
+			"model/request_model = %s/%s, want the exact selector %q for both",
+			shownModel(got.Model),
+			shownModel(got.RequestModel),
+			whitespaceSelector,
+		)
+	}
+
+	if err := got.Validate(); err != nil {
+		t.Errorf("record does not validate: %v", err)
+	}
+}
+
+// noneSelector is a public selector an operator genuinely named "(none)". It is
+// an opaque exact string like any other, and it used to be the one string the
+// ledger reserved to mean a model that was not there at all.
+const noneSelector = "(none)"
+
+// TestLiteralNoneSelectorIsNotAbsence follows the collision the whole way down,
+// through the real ledger rather than a stub that accepts anything.
+//
+// Two requests: one selecting a Seat bound to the exact selector "(none)" and
+// rewriting to a model of the same name, and one naming no model at all on a
+// Seat that rewrites nothing. Under the old sentinel both persisted the same
+// bytes — "(none)" in model and request_model — so an operator reading the file
+// could not tell a Seat that was used from a request that named nothing. They
+// have to be two different lines and two different scanned records.
+func TestLiteralNoneSelectorIsNotAbsence(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+	document := []byte(fmt.Sprintf(`{"default_context":"personal","seats":{`+
+		`"plain":{"upstream":%q,"auth_mode":"inject","api_key_env_file":%q},`+
+		`"named":{"upstream":%q,"model":%q,"auth_mode":"inject","api_key_env_file":%q}},`+
+		`"contexts":{"personal":{"default_seat":"plain","models":{%q:"named"}}}}`,
+		stub.url(), keyEnvName, stub.url(), noneSelector, keyEnvName, noneSelector))
+
+	dir := t.TempDir()
+	led, err := ledger.Open(dir)
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := led.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+	})
+
+	day := time.Now().UTC().Format(time.DateOnly)
+	pipeline := proxy.New(proxy.Config{
+		Registry: newRegistryDocument(t, document),
+		Recorder: led,
+		Host:     testHost,
+	})
+
+	for _, body := range []string{
+		fmt.Sprintf(`{"model":%q}`, noneSelector),
+		`{"max_tokens":4}`,
+	} {
+		rec := httptest.NewRecorder()
+		pipeline.ServeHTTP(rec, messagesRequest(body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("body %s status = %d (%s)", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	pipeline.Drain(t.Context())
+
+	days := []string{day}
+	if last := time.Now().UTC().Format(time.DateOnly); last != day {
+		days = append(days, last)
+	}
+
+	records := make([]ledger.Record, 0, 2)
+	for _, scanDay := range days {
+		got, scanErr := led.Scan(scanDay)
+		if scanErr != nil {
+			t.Fatalf("scan ledger day %s: %v", scanDay, scanErr)
+		}
+		records = append(records, got...)
+	}
+	if len(records) != 2 {
+		t.Fatalf("ledger days %v hold %d records; want 2: %+v", days, len(records), records)
+	}
+
+	var named, absent *ledger.Record
+	for index := range records {
+		if records[index].Seat == "named" {
+			named = &records[index]
+		} else {
+			absent = &records[index]
+		}
+	}
+	if named == nil || absent == nil {
+		t.Fatalf("records did not cover both Seats: %+v", records)
+	}
+
+	if !modelIs(named.Model, noneSelector) || !modelIs(named.RequestModel, noneSelector) {
+		t.Errorf("the literal selector recorded model/request_model = %s/%s; want %q for both",
+			shownModel(named.Model), shownModel(named.RequestModel), noneSelector)
+	}
+	if absent.Model != nil || absent.RequestModel != nil {
+		t.Errorf("naming no model recorded model/request_model = %s/%s; want both absent",
+			shownModel(absent.Model), shownModel(absent.RequestModel))
+	}
+
+	// The distinction has to survive as bytes, since the file is what gets read.
+	namedLine, err := json.Marshal(named)
+	if err != nil {
+		t.Fatalf("marshal the literal-selector record: %v", err)
+	}
+	absentLine, err := json.Marshal(absent)
+	if err != nil {
+		t.Fatalf("marshal the absent-model record: %v", err)
+	}
+	if !bytes.Contains(namedLine, []byte(`"model":"(none)"`)) {
+		t.Errorf("the literal selector did not persist as an exact string: %s", namedLine)
+	}
+	if !bytes.Contains(absentLine, []byte(`"model":null`)) {
+		t.Errorf("exact absence did not persist as null: %s", absentLine)
+	}
+	if bytes.Contains(absentLine, []byte(noneSelector)) {
+		t.Errorf("exact absence persisted as a string a Seat could be named: %s", absentLine)
+	}
 }
 
 // TestRecordsTheResolvedContext pins the attribution half of contexts: every
 // record names the context that served it, and a named context resolves its own
-// routes rather than another context's aliases.
+// bindings rather than another context's.
 func TestRecordsTheResolvedContext(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
@@ -517,21 +754,21 @@ func TestRecordsTheResolvedContext(t *testing.T) {
 		name        string
 		named       string
 		wantContext string
-		wantAlias   string
+		wantSeat    string
 		wantModel   string
 	}{
 		{
-			name:        "a bare path is the personal context",
+			name:        "a bare path uses the configured default_context",
 			named:       "",
 			wantContext: "personal",
-			wantAlias:   echoAlias,
-			wantModel:   echoAlias,
+			wantSeat:    "personal",
+			wantModel:   echoSelector,
 		},
 		{
-			name:        "a named context resolves its own default route",
+			name:        "a named context resolves its own default Seat",
 			named:       "work",
 			wantContext: "work",
-			wantAlias:   "",
+			wantSeat:    "work",
 			wantModel:   "vendor/work-1",
 		},
 	}
@@ -547,8 +784,7 @@ func TestRecordsTheResolvedContext(t *testing.T) {
 			}
 
 			rec := serve(t, proxy.Config{
-				Registry: newContextRegistry(t,
-					`"personal":{"routes":{`+identityRoute(stub.url())+`}},`+workContext(stub.url())),
+				Registry: newRegistryDocument(t, contextRegistry(stub.url())),
 				Recorder: recorder,
 				Host:     testHost,
 			}, req)
@@ -563,12 +799,12 @@ func TestRecordsTheResolvedContext(t *testing.T) {
 				t.Errorf("context = %q, want %q", got.Context, tc.wantContext)
 			}
 
-			if got.Alias != tc.wantAlias {
-				t.Errorf("alias = %q, want %q", got.Alias, tc.wantAlias)
+			if got.Seat != tc.wantSeat {
+				t.Errorf("seat = %q, want %q", got.Seat, tc.wantSeat)
 			}
 
-			if got.Model != tc.wantModel {
-				t.Errorf("model = %q, want %q", got.Model, tc.wantModel)
+			if !modelIs(got.Model, tc.wantModel) {
+				t.Errorf("model = %s, want %q", shownModel(got.Model), tc.wantModel)
 			}
 
 			if err := got.Validate(); err != nil {
@@ -581,7 +817,7 @@ func TestRecordsTheResolvedContext(t *testing.T) {
 // TestPipelineFailsClosedOnAnUnknownContext is the pipeline's own half of the
 // fail-closed rule. The HTTP surface refuses an unknown context before the
 // pipeline is reached, so this is the registry-reloaded-underneath race: the
-// request is refused, never served by another context or the default route.
+// request is refused, never served by another context or the default Seat.
 func TestPipelineFailsClosedOnAnUnknownContext(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
@@ -589,7 +825,7 @@ func TestPipelineFailsClosedOnAnUnknownContext(t *testing.T) {
 	recorder := newRecorder()
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: recorder,
 		Host:     testHost,
 	}, inContext(messagesRequest(fidelityBody), "vanished"))
@@ -619,9 +855,78 @@ func TestPipelineFailsClosedOnAnUnknownContext(t *testing.T) {
 	}
 }
 
+// rejectedValue is the distinctive string the invalid replacement below names in
+// a field validation quotes back.
+const rejectedValue = "sk-live-secret"
+
+// secretRegistry is an invalid registry whose validation error quotes
+// rejectedValue: api_key_env_file names a value that is not an environment
+// variable name at all.
+const secretRegistry = `{"default_context":"personal","seats":{` +
+	`"luna":{"upstream":"https://openrouter.ai/api","model":"vendor/luna",` +
+	`"auth_mode":"inject","api_key_env_file":"` + rejectedValue + `"}},` +
+	`"contexts":{"personal":{"default_seat":"luna","models":{}}}}`
+
+// TestInvalidRegistryRefusalRepublishesNothingOfTheRejectedFile is the fail-
+// closed refusal's confidentiality half. A registry that goes invalid under a
+// running gateway refuses every request with 503, and that refusal is answered
+// to an unauthenticated caller and persisted verbatim as the record's
+// error_body — a ledger that is routinely shipped somewhere else. Neither may
+// carry what the rejected file said or where it lives.
+func TestInvalidRegistryRefusalRepublishesNothingOfTheRejectedFile(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+	recorder := newRecorder()
+	reg := newRegistry(t, identitySeat(stub.url()))
+
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(reg.Path(), base, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(reg.Path(), []byte(secretRegistry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(reg.Path(), base.Add(time.Hour), base.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := serve(t, proxy.Config{
+		Registry: reg,
+		Recorder: recorder,
+		Host:     testHost,
+	}, messagesRequest(fidelityBody))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d (body %s)", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+
+	if stub.hits() != 0 {
+		t.Fatalf("upstream received %d requests; want none from an invalid registry", stub.hits())
+	}
+
+	got := recorder.wait(t)
+
+	for surface, message := range map[string]string{
+		"the 503 body":       rec.Body.String(),
+		"the record's error": got.ErrorBody,
+	} {
+		if strings.Contains(message, rejectedValue) {
+			t.Errorf("%s carries the rejected value: %s", surface, message)
+		}
+		if strings.Contains(message, reg.Path()) {
+			t.Errorf("%s carries the registry path: %s", surface, message)
+		}
+	}
+
+	if err := got.Validate(); err != nil {
+		t.Errorf("refusal record does not validate: %v", err)
+	}
+}
+
 // TestRecordsTheInboundCredentialClass classifies the credential the CLIENT
-// presented, which is not the one the route pays with: every case below rides
-// an inject route, whose own credential never appears in the record.
+// presented, which is not the one the Seat pays with: every case below rides
+// an inject Seat, whose own credential never appears in the record.
 func TestRecordsTheInboundCredentialClass(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -676,7 +981,7 @@ func TestRecordsTheInboundCredentialClass(t *testing.T) {
 			}
 
 			rec := serve(t, proxy.Config{
-				Registry: newRegistry(t, identityRoute(stub.url())),
+				Registry: newRegistry(t, identitySeat(stub.url())),
 				Recorder: recorder,
 				Host:     testHost,
 			}, req)
@@ -713,7 +1018,7 @@ func TestRecordNeverCarriesACredentialValue(t *testing.T) {
 	req.Header.Set("X-Api-Key", clientSecret)
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Recorder: recorder,
 		Host:     testHost,
 	}, req)
@@ -805,7 +1110,7 @@ func TestEveryRecordNamesItsContextAndCredentialClass(t *testing.T) {
 			recorder := newRecorder()
 
 			serve(t, proxy.Config{
-				Registry: newRegistry(t, identityRoute(stub.url())),
+				Registry: newRegistry(t, identitySeat(stub.url())),
 				Recorder: recorder,
 				Host:     testHost,
 			}, tc.request(t, stub))
@@ -817,12 +1122,63 @@ func TestEveryRecordNamesItsContextAndCredentialClass(t *testing.T) {
 			}
 
 			if got.CredentialClass == "" {
-				t.Error("credential_class is empty; a current binary must never write a legacy-shaped record")
+				t.Error(
+					"credential_class is empty; a current binary must never write a legacy-shaped record",
+				)
 			}
 
 			if err := got.Validate(); err != nil {
 				t.Errorf("record does not validate: %v", err)
 			}
 		})
+	}
+}
+
+// TestRecordedConfigSourceIsAlwaysOneTheLedgerStores closes the loop between the
+// two ends of the config_source contract. A Seat that loads must produce a
+// record the ledger accepts, and a Seat whose key-file variable is not an
+// environment-variable name never loads at all — so no proxied request can ever
+// produce a config_source the ledger would refuse.
+func TestRecordedConfigSourceIsAlwaysOneTheLedgerStores(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+
+	document := func(envFile string) []byte {
+		return []byte(fmt.Sprintf(`{"default_context":"personal","seats":{`+
+			`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},`+
+			`"worker":{"upstream":%q,"model":"vendor/worker","auth_mode":"inject","api_key_env_file":%q}},`+
+			`"contexts":{"personal":{"default_seat":"anthropic","models":{"worker":"worker"}}}}`,
+			stub.url(), envFile))
+	}
+
+	for _, envFile := range []string{"", "9KEY", "KEY-FILE", "KEY FILE", "aws_profile:work", "caller key"} {
+		path := filepath.Join(t.TempDir(), "registry.json")
+		if err := os.WriteFile(path, document(envFile), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := registry.New(path); err == nil {
+			t.Errorf("api_key_env_file %q loaded; the ledger would refuse its config_source", envFile)
+		}
+	}
+
+	recorder := newRecorder()
+	rec := serve(t, proxy.Config{
+		Registry: newRegistryDocument(t, document(keyEnvName)),
+		Recorder: recorder,
+		Host:     testHost,
+	}, messagesRequest(`{"model":"worker"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	got := recorder.wait(t)
+	if got.ConfigSource != keyEnvName {
+		t.Fatalf("config_source = %q; want %q", got.ConfigSource, keyEnvName)
+	}
+	if err := registry.ValidEnvName(got.ConfigSource); err != nil {
+		t.Fatalf("recorded config_source is not an environment-variable name: %v", err)
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("record does not validate: %v", err)
 	}
 }

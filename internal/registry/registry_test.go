@@ -13,692 +13,514 @@ import (
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
-// lunaRoute is the brief's example inject route, written compactly so the
-// preserved extra_body bytes are predictable.
-const lunaRoute = `"luna-fast":{"base_url":"https://openrouter.ai/api",` +
-	`"model":"openai/gpt-5.6-luna","auth":"inject",` +
-	`"api_key_env_file":"OPENROUTER_API_KEY_FILE",` +
-	`"extra_body":{"reasoning_effort":"low"},` +
-	`"max_input_tokens":262144,"max_output_tokens":65536}`
+const validRegistry = `{
+  "default_context":"personal",
+  "seats":{
+    "anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},
+    "luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"},
+    "sol":{"upstream":"https://openrouter.ai/api","model":"openrouter/sol-1","auth_mode":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"},
+    "bedrock":{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"BEDROCK_MODEL_MAP_FILE"}
+  },
+  "contexts":{
+    "personal":{"default_seat":"anthropic","models":{"luna-fast":"luna"},"subagents":{"default_seat":"sol","models":{"claude-opus-5":"bedrock"}}},
+    "work":{"default_seat":"luna","models":{"openrouter/sol":"sol"}}
+  }
+}`
 
-// deepseekRoute exercises strip_cache_control and capture_bodies.
-const deepseekRoute = `"deepseek-flash-low":{"base_url":"https://openrouter.ai/api",` +
-	`"model":"deepseek/deepseek-v4-flash-0731","auth":"inject",` +
-	`"api_key_env_file":"OPENROUTER_API_KEY_FILE",` +
-	`"strip_cache_control":true,"capture_bodies":true}`
-
-// solRoute uses the directory-style namespaced alias convention. The slash is
-// an ordinary character in an alias key, not a path or a namespace lookup.
-const solRoute = `"openrouter/sol":{"base_url":"https://openrouter.ai/api",` +
-	`"model":"openrouter/sol-1","auth":"inject",` +
-	`"api_key_env_file":"OPENROUTER_API_KEY_FILE"}`
-
-// injectDefault is a default_route paid for with a foreign key: the shape that
-// makes a whole context ride somewhere other than Anthropic.
-const injectDefault = `"default_route":{"base_url":"https://openrouter.ai/api",` +
-	`"model":"openai/gpt-5.6-luna","auth":"inject",` +
-	`"api_key_env_file":"OPENROUTER_API_KEY_FILE","max_input_tokens":262144}`
-
-// personalDoc wraps route entries as the routes of the personal context — the
-// context every bare, unprefixed path resolves against.
-func personalDoc(routes string) string {
-	return `{"contexts":{"personal":{"routes":{` + routes + `}}}}`
-}
-
-// contextDoc wraps whole context entries as a registry document.
-func contextDoc(contexts string) string {
-	return `{"contexts":{` + contexts + `}}`
-}
-
-// writeRegistry writes body to path and returns path.
 func writeRegistry(t *testing.T, path, body string) string {
 	t.Helper()
-
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatalf("write registry %s: %v", path, err)
+		t.Fatalf("write registry: %v", err)
 	}
-
 	return path
 }
 
-// newRegistry writes body into a fresh temp dir and returns a Registry over it.
 func newRegistry(t *testing.T, body string) *registry.Registry {
 	t.Helper()
-
-	return registry.New(writeRegistry(t, filepath.Join(t.TempDir(), "registry.json"), body))
-}
-
-// resolve resolves model within the named context, failing on any error.
-func resolve(t *testing.T, reg *registry.Registry, sel registry.Selection, model string) registry.Resolution {
-	t.Helper()
-
-	res, err := reg.Resolve(sel, model)
+	reg, err := registry.New(writeRegistry(t, filepath.Join(t.TempDir(), "registry.json"), body))
 	if err != nil {
-		t.Fatalf("Resolve(%+v, %q) = %v; want no error", sel, model, err)
+		t.Fatalf("New() = %v", err)
 	}
-
-	return res
+	return reg
 }
 
-// bare resolves model the way a request carrying no context prefix does.
-func bare(t *testing.T, reg *registry.Registry, model string) registry.Route {
-	t.Helper()
-
-	return resolve(t, reg, registry.Selection{}, model).Route
-}
-
-// bareAliases lists the aliases a bare, unprefixed request sees.
-func bareAliases(t *testing.T, reg *registry.Registry) []registry.Route {
-	t.Helper()
-
-	return resolve(t, reg, registry.Selection{}, "").Aliases()
-}
-
-// assertDefault fails unless resolving model yields exactly the built-in route.
-func assertDefault(t *testing.T, reg *registry.Registry, model string) {
-	t.Helper()
-
-	if got := bare(t, reg, model); !reflect.DeepEqual(got, registry.DefaultRoute()) {
-		t.Fatalf("Resolve(%q) = %+v; want the default route %+v", model, got, registry.DefaultRoute())
-	}
-}
-
-func TestDefaultRouteIsTheFixedBuiltIn(t *testing.T) {
+func TestNewLoadsRequiredGlobalSeatsAndContexts(t *testing.T) {
 	t.Parallel()
+	reg := newRegistry(t, validRegistry)
 
-	want := registry.Route{
-		Alias:             "",
-		BaseURL:           "https://api.anthropic.com",
-		Model:             "",
-		Auth:              registry.AuthForward,
-		APIKeyEnvFile:     "",
-		ExtraBody:         nil,
-		MaxInputTokens:    0,
-		MaxOutputTokens:   0,
-		StripCacheControl: false,
-		CaptureBodies:     false,
+	res, err := reg.Resolve(registry.Selection{}, "luna-fast", nil)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
 	}
-
-	if got := registry.DefaultRoute(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("DefaultRoute() = %+v; want %+v", got, want)
+	if res.Context != "personal" || res.SeatID != "luna" ||
+		res.Seat.Model != "openai/gpt-5.6-luna" {
+		t.Fatalf("resolution = %+v", res)
+	}
+	if res.Match.Kind != registry.SelectionModel || res.Match.Model == nil ||
+		*res.Match.Model != "luna-fast" {
+		t.Fatalf("match = %+v", res.Match)
 	}
 }
 
-func TestDefaultRouteIgnoresTheRegistryFile(t *testing.T) {
+func TestBareRequestsUseConfiguredDefaultContext(t *testing.T) {
 	t.Parallel()
-
-	// A file that redefines the empty alias must not move the built-in route.
-	reg := newRegistry(t, personalDoc(`"":{"base_url":"https://evil.example"}`))
-
-	assertDefault(t, reg, "claude-sonnet-5")
-
-	if err := reg.Err(); err == nil {
-		t.Fatal("Err() = nil; want an error rejecting the empty alias key")
+	reg := newRegistry(
+		t,
+		strings.Replace(
+			validRegistry,
+			`"default_context":"personal"`,
+			`"default_context":"work"`,
+			1,
+		),
+	)
+	res, err := reg.Resolve(registry.Selection{}, "unbound", nil)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	if res.Context != "work" || res.SeatID != "luna" {
+		t.Fatalf("resolution = %+v; want work/luna", res)
 	}
 }
 
-func TestResolveFallsBackToDefaultRoute(t *testing.T) {
+func TestResolveMarkedSubagentPrecedence(t *testing.T) {
 	t.Parallel()
+	reg := newRegistry(t, validRegistry)
+	marked := &registry.SubagentObservation{AgentID: "agent-1", ParentAgentID: "parent-1"}
 
 	tests := []struct {
-		name  string
-		body  string
-		write bool
-		model string
+		name      string
+		model     string
+		obs       *registry.SubagentObservation
+		wantSeat  string
+		wantKind  registry.SelectionKind
+		wantModel *string
 	}{
 		{
-			name:  "missing file",
-			write: false,
-			model: "claude-sonnet-5",
+			name:      "public binding wins while marked",
+			model:     "luna-fast",
+			obs:       marked,
+			wantSeat:  "luna",
+			wantKind:  registry.SelectionModel,
+			wantModel: ptr("luna-fast"),
 		},
 		{
-			name:  "unparsable file",
-			body:  `{"contexts":{`,
-			write: true,
-			model: "claude-sonnet-5",
+			name:      "exact marked requested model",
+			model:     "claude-opus-5",
+			obs:       marked,
+			wantSeat:  "bedrock",
+			wantKind:  registry.SelectionSubagent,
+			wantModel: ptr("claude-opus-5"),
 		},
 		{
-			name: "file failing validation",
-			body: personalDoc(lunaRoute +
-				`,"bad":{"base_url":"https://evil.example","auth":"forward"}`),
-			write: true,
-			model: "luna-fast",
+			name:     "unnamed marked uses subagent default under the subagent kind",
+			model:    "unknown",
+			obs:      marked,
+			wantSeat: "sol",
+			wantKind: registry.SelectionSubagent,
 		},
 		{
-			name:  "valid file with no matching alias",
-			body:  personalDoc(lunaRoute),
-			write: true,
-			model: "claude-opus-5",
-		},
-		{
-			name:  "empty routes object",
-			body:  personalDoc(``),
-			write: true,
-			model: "anything",
-		},
-		{
-			name:  "file without a contexts key",
-			body:  `{}`,
-			write: true,
-			model: "anything",
-		},
-		{
-			name:  "document with no personal context",
-			body:  contextDoc(`"work":{"routes":{` + lunaRoute + `}}`),
-			write: true,
-			model: "luna-fast",
-		},
-		{
-			name:  "v1 document the v2 parser refuses whole",
-			body:  `{"routes":{` + lunaRoute + `}}`,
-			write: true,
-			model: "luna-fast",
+			name:     "unmarked uses context default",
+			model:    "unknown",
+			wantSeat: "anthropic",
+			wantKind: registry.SelectionDefault,
 		},
 	}
-
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
-			path := filepath.Join(t.TempDir(), "registry.json")
-			if tc.write {
-				writeRegistry(t, path, tc.body)
+			res, err := reg.Resolve(registry.Selection{}, tc.model, tc.obs)
+			if err != nil {
+				t.Fatalf("Resolve() = %v", err)
 			}
-
-			assertDefault(t, registry.New(path), tc.model)
-		})
-	}
-}
-
-func TestResolveReturnsTheExactAliasedRoute(t *testing.T) {
-	t.Parallel()
-
-	reg := newRegistry(t, personalDoc(lunaRoute+`,`+deepseekRoute+`,`+solRoute))
-
-	tests := []struct {
-		name  string
-		model string
-		want  registry.Route
-	}{
-		{
-			name:  "every field carried through",
-			model: "luna-fast",
-			want: registry.Route{
-				Alias:           "luna-fast",
-				BaseURL:         "https://openrouter.ai/api",
-				Model:           "openai/gpt-5.6-luna",
-				Auth:            registry.AuthInject,
-				APIKeyEnvFile:   "OPENROUTER_API_KEY_FILE",
-				ExtraBody:       []byte(`{"reasoning_effort":"low"}`),
-				MaxInputTokens:  262144,
-				MaxOutputTokens: 65536,
-			},
-		},
-		{
-			name:  "directory-style namespaced alias",
-			model: "openrouter/sol",
-			want: registry.Route{
-				Alias:         "openrouter/sol",
-				BaseURL:       "https://openrouter.ai/api",
-				Model:         "openrouter/sol-1",
-				Auth:          registry.AuthInject,
-				APIKeyEnvFile: "OPENROUTER_API_KEY_FILE",
-			},
-		},
-		{
-			name:  "namespace prefix alone matches nothing",
-			model: "openrouter",
-			want:  registry.DefaultRoute(),
-		},
-		{
-			name:  "booleans and omitted fields",
-			model: "deepseek-flash-low",
-			want: registry.Route{
-				Alias:             "deepseek-flash-low",
-				BaseURL:           "https://openrouter.ai/api",
-				Model:             "deepseek/deepseek-v4-flash-0731",
-				Auth:              registry.AuthInject,
-				APIKeyEnvFile:     "OPENROUTER_API_KEY_FILE",
-				StripCacheControl: true,
-				CaptureBodies:     true,
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := bare(t, reg, tc.model); !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("Resolve(%q) = %+v; want %+v", tc.model, got, tc.want)
+			if res.SeatID != tc.wantSeat || res.Match.Kind != tc.wantKind ||
+				!reflect.DeepEqual(res.Match.Model, tc.wantModel) {
+				t.Fatalf("resolution = %+v", res)
+			}
+			if !reflect.DeepEqual(res.Subagent, tc.obs) {
+				t.Fatalf("subagent = %+v; want %+v", res.Subagent, tc.obs)
 			}
 		})
 	}
 }
 
-func TestAliasKeysAreArbitraryNonEmptyStrings(t *testing.T) {
+func TestContextWithoutSubagentsUsesOrdinaryPolicyForMarkedTraffic(t *testing.T) {
 	t.Parallel()
-
-	// Aliases are opaque keys. Directory-style namespacing is a naming
-	// convention the registry does not interpret: nothing about a key is
-	// validated beyond it being non-empty, and nothing is split on the slash.
-	// Context names are the opposite — they ride in a URL path and are checked.
-	const forwardRoute = `{"base_url":"https://api.anthropic.com","model":"claude-opus-5","auth":"forward"}`
-	const injectRoute = `{"base_url":"https://openrouter.ai/api","model":"vendor/model-1",` +
-		`"auth":"inject","api_key_env_file":"KEY_FILE"}`
-
-	aliases := []struct {
-		name  string
-		alias string
-		route string
-	}{
-		{name: "vendor namespace", alias: "openrouter/sol", route: injectRoute},
-		{name: "second vendor namespace", alias: "chatgpt/luna", route: injectRoute},
-		{name: "anthropic namespace pinning a claude model", alias: "anthropic/opus", route: forwardRoute},
-		{name: "deeply nested", alias: "deep/nested/path/model", route: injectRoute},
-		{name: "spaces", alias: "an alias with spaces", route: injectRoute},
-		{name: "dots and colons", alias: "vendor.io:model-1", route: injectRoute},
-		{name: "non ascii", alias: "模型/一号", route: injectRoute},
-		{name: "leading slash", alias: "/leading", route: injectRoute},
-		{name: "trailing slash", alias: "trailing/", route: injectRoute},
+	reg := newRegistry(t, validRegistry)
+	res, err := reg.Resolve(
+		registry.Selection{Name: "work", Explicit: true},
+		"unknown",
+		&registry.SubagentObservation{AgentID: "a"},
+	)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
 	}
-
-	parts := make([]string, 0, len(aliases))
-	for _, entry := range aliases {
-		parts = append(parts, `"`+entry.alias+`":`+entry.route)
-	}
-
-	reg := newRegistry(t, personalDoc(strings.Join(parts, ",")))
-
-	if err := reg.Err(); err != nil {
-		t.Fatalf("Err() = %v; want nil — alias keys carry no character rules", err)
-	}
-
-	for _, entry := range aliases {
-		t.Run(entry.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := bare(t, reg, entry.alias).Alias; got != entry.alias {
-				t.Fatalf("Resolve(%q) returned alias %q; want the aliased route", entry.alias, got)
-			}
-		})
+	if res.SeatID != "luna" || res.Match.Kind != registry.SelectionDefault {
+		t.Fatalf("resolution = %+v", res)
 	}
 }
 
-func TestResolveAliasShadowsAClaudeModelID(t *testing.T) {
+func TestForeignRewriteTargetGuardUsesPublicBindingsOnly(t *testing.T) {
 	t.Parallel()
+	body := `{"default_context":"personal","seats":{` +
+		`"default":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},` +
+		`"foreign-a":{"upstream":"https://one.example","model":"target","auth_mode":"inject","api_key_env_file":"KEY"},` +
+		`"foreign-b":{"upstream":"https://two.example","model":"target","auth_mode":"inject","api_key_env_file":"KEY"},` +
+		`"same":{"upstream":"https://api.anthropic.com","model":"target","auth_mode":"forward"},` +
+		`"sub":{"upstream":"https://three.example","model":"sub-target","auth_mode":"inject","api_key_env_file":"KEY"}` +
+		`},"contexts":{"personal":{"default_seat":"default","models":{"z":"foreign-b","a":"foreign-a"},"subagents":{"default_seat":"sub","models":{}}}}}`
+	reg := newRegistry(t, body)
 
-	// Pinning: a forward route aliased to a real Claude model id rewrites it to
-	// another Claude model. Rule 3 constrains inject routes only.
-	reg := newRegistry(t, personalDoc(`"claude-sonnet-5":{`+
-		`"base_url":"https://api.anthropic.com","model":"claude-opus-5","auth":"forward"}`))
-
-	got := bare(t, reg, "claude-sonnet-5")
-	want := registry.Route{
-		Alias:   "claude-sonnet-5",
-		BaseURL: "https://api.anthropic.com",
-		Model:   "claude-opus-5",
-		Auth:    registry.AuthForward,
+	_, err := reg.Resolve(registry.Selection{}, "target", nil)
+	if !errors.Is(err, registry.ErrRewriteTarget) || !strings.Contains(err.Error(), `"a"`) {
+		t.Fatalf("Resolve(target) = %v; want lexical public selector a", err)
+	}
+	if _, err := reg.Resolve(registry.Selection{}, "sub-target", nil); err != nil {
+		t.Fatalf("subagent-only target was guarded: %v", err)
 	}
 
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("Resolve(%q) = %+v; want the pinned route %+v", "claude-sonnet-5", got, want)
-	}
-
-	if err := reg.Err(); err != nil {
-		t.Fatalf("Err() = %v; want nil for a valid pinning route", err)
+	body = strings.Replace(
+		body,
+		`"z":"foreign-b","a":"foreign-a"`,
+		`"z":"foreign-b","a":"foreign-a","same":"same"`,
+		1,
+	)
+	reg = newRegistry(t, body)
+	if _, err := reg.Resolve(registry.Selection{}, "target", nil); err != nil {
+		t.Fatalf("default-upstream public binding did not exempt target: %v", err)
 	}
 }
 
-func TestResolveRefusesAForeignRewriteTarget(t *testing.T) {
+func TestInvalidHotReloadInstallsSentinelAndRecovers(t *testing.T) {
 	t.Parallel()
-
-	// deepseekRoute rewrites to a model only openrouter serves. Asking for that
-	// rewrite target by name — the shape of a client echoing a response's model
-	// id — must be refused, never handed to the built-in forward to Anthropic.
-	reg := newRegistry(t, personalDoc(deepseekRoute))
-
-	_, err := reg.Resolve(registry.Selection{}, "deepseek/deepseek-v4-flash-0731")
-	if !errors.Is(err, registry.ErrRewriteTarget) {
-		t.Fatalf("Resolve(target) error = %v; want ErrRewriteTarget", err)
-	}
-
-	if !strings.Contains(err.Error(), `"deepseek-flash-low"`) {
-		t.Errorf("error %q does not name the alias to ask for instead", err)
-	}
-}
-
-func TestAnAliasShadowingARewriteTargetStillResolves(t *testing.T) {
-	t.Parallel()
-
-	// One route rewrites to a name another route is keyed under. The alias
-	// match must win: a key is a route, whatever some other route rewrites to.
-	reg := newRegistry(t, personalDoc(
-		`"a/one":{"base_url":"https://openrouter.ai/api","model":"upstream/x",`+
-			`"auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"},`+
-			`"upstream/x":{"base_url":"https://openrouter.ai/api",`+
-			`"auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"}`))
-
-	if got := bare(t, reg, "upstream/x"); got.Alias != "upstream/x" {
-		t.Fatalf("Resolve(%q).Alias = %q; want the shadowing alias itself", "upstream/x", got.Alias)
-	}
-}
-
-func TestARewriteTargetOnTheDefaultUpstreamStillFallsThrough(t *testing.T) {
-	t.Parallel()
-
-	// A pinning route rewrites one Claude id to another, forwarded to Anthropic
-	// — the same upstream the built-in default route reaches, which genuinely
-	// serves the target. The target id's own fallthrough must survive.
-	reg := newRegistry(t, personalDoc(`"claude-sonnet-5":{`+
-		`"base_url":"https://api.anthropic.com","model":"claude-opus-5","auth":"forward"}`))
-
-	assertDefault(t, reg, "claude-opus-5")
-}
-
-func TestARewriteTargetSharedWithTheDefaultUpstreamIsExempt(t *testing.T) {
-	t.Parallel()
-
-	// Two routes rewrite to the same target, one from a foreign upstream and
-	// one from the upstream the default route reaches. The second proves a
-	// fallthrough arrives somewhere that serves the name, so it is not refused.
-	reg := newRegistry(t, personalDoc(
-		`"a/one":{"base_url":"https://openrouter.ai/api","model":"upstream/x",`+
-			`"auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"},`+
-			`"b/two":{"base_url":"https://api.anthropic.com","model":"upstream/x",`+
-			`"auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"}`))
-
-	assertDefault(t, reg, "upstream/x")
-}
-
-func TestARewriteTargetOfADeclaredDefaultUpstreamIsExempt(t *testing.T) {
-	t.Parallel()
-
-	// A context whose declared default route reaches the same upstream a
-	// rewriting alias does — the local-models shape, where fallthrough and
-	// alias land on one server. The target must keep falling through.
-	reg := newRegistry(t, contextDoc(`"work":{`+injectDefault+`,"routes":{`+lunaRoute+`}}`))
-
-	res := resolve(t, reg, registry.Selection{Name: "work", Explicit: true}, "openai/gpt-5.6-luna")
-	if res.Route.Alias != "" {
-		t.Fatalf("Resolve(target).Alias = %q; want the declared default route", res.Route.Alias)
-	}
-}
-
-// aliasNames returns the Alias field of every route in order, so a listing's
-// order is compared without printing whole routes.
-func aliasNames(routes []registry.Route) []string {
-	names := make([]string, 0, len(routes))
-	for _, route := range routes {
-		names = append(names, route.Alias)
-	}
-
-	return names
-}
-
-func TestAliasesListsEveryRouteSortedByAlias(t *testing.T) {
-	t.Parallel()
-
-	reg := newRegistry(t, personalDoc(solRoute+`,`+lunaRoute+`,`+deepseekRoute))
-
-	got := bareAliases(t, reg)
-	want := []string{"deepseek-flash-low", "luna-fast", "openrouter/sol"}
-
-	if !reflect.DeepEqual(aliasNames(got), want) {
-		t.Fatalf("Aliases = %v; want %v sorted by alias", aliasNames(got), want)
-	}
-
-	luna := registry.Route{
-		Alias:           "luna-fast",
-		BaseURL:         "https://openrouter.ai/api",
-		Model:           "openai/gpt-5.6-luna",
-		Auth:            registry.AuthInject,
-		APIKeyEnvFile:   "OPENROUTER_API_KEY_FILE",
-		ExtraBody:       []byte(`{"reasoning_effort":"low"}`),
-		MaxInputTokens:  262144,
-		MaxOutputTokens: 65536,
-	}
-
-	if !reflect.DeepEqual(got[1], luna) {
-		t.Fatalf("Aliases[1] = %+v; want the whole route %+v", got[1], luna)
-	}
-}
-
-func TestAliasesReturnsAnIsolatedSlice(t *testing.T) {
-	t.Parallel()
-
-	reg := newRegistry(t, personalDoc(lunaRoute))
-
-	first := bareAliases(t, reg)
-	first[0].Model = "tampered"
-	first[0].Alias = "tampered"
-
-	second := bareAliases(t, reg)
-	if second[0].Model != "openai/gpt-5.6-luna" || second[0].Alias != "luna-fast" {
-		t.Fatalf("Aliases after mutating an earlier result = %+v; want the registry untouched", second[0])
-	}
-
-	// A copied struct still points at the registry's own bytes. Writing through
-	// that slice would corrupt the extra_body every later request merges, which
-	// is exactly the isolation the doc comment promises.
-	const want = `{"reasoning_effort":"low"}`
-
-	extra := second[0].ExtraBody
-	if string(extra) != want {
-		t.Fatalf("Aliases extra_body = %s; want %s", extra, want)
-	}
-
-	for i := range extra {
-		extra[i] = 'x'
-	}
-
-	if got := string(bare(t, reg, "luna-fast").ExtraBody); got != want {
-		t.Fatalf("Resolve extra_body after writing through an Aliases result = %s; want %s", got, want)
-	}
-
-	if got := string(bareAliases(t, reg)[0].ExtraBody); got != want {
-		t.Fatalf("Aliases extra_body after writing through an earlier result = %s; want %s", got, want)
-	}
-}
-
-func TestAliasesReflectsAReload(t *testing.T) {
-	t.Parallel()
-
 	path := filepath.Join(t.TempDir(), "registry.json")
-	writeRegistry(t, path, personalDoc(lunaRoute))
+	writeRegistry(t, path, validRegistry)
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, base, base); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 
+	writeRegistry(t, path, `{}`)
+	if err := os.Chtimes(path, base.Add(time.Hour), base.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Resolve(
+		registry.Selection{},
+		"luna-fast",
+		nil,
+	); !errors.Is(
+		err,
+		registry.ErrInvalid,
+	) {
+		t.Fatalf("Resolve after invalid replacement = %v; want ErrInvalid", err)
+	}
+	state := reg.State()
+	if state.Valid || state.DefaultContext != "" || len(state.Seats) != 0 ||
+		len(state.Contexts) != 0 ||
+		state.Error == "" {
+		t.Fatalf("invalid state = %+v", state)
+	}
+
+	writeRegistry(t, path, validRegistry)
+	if err := os.Chtimes(path, base.Add(2*time.Hour), base.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Resolve(registry.Selection{}, "luna-fast", nil); err != nil {
+		t.Fatalf("Resolve after repair = %v", err)
+	}
+}
+
+// rejectedValue is a distinctive string an invalid registry names in a field
+// validation quotes back. It stands in for anything an operator might have
+// pasted into the wrong field — a live key, a path, a host — so a test can tell
+// a surface that keeps the detail from one that must not.
+const rejectedValue = "sk-live-secret"
+
+// secretRegistry is an invalid document whose validation error quotes
+// rejectedValue: the env-file field names a value that is not an environment
+// variable name at all.
+const secretRegistry = `{
+  "default_context":"personal",
+  "seats":{"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":"` + rejectedValue + `"}},
+  "contexts":{"personal":{"default_seat":"luna","models":{"luna-fast":"luna"}}}
+}`
+
+// TestInvalidRuntimeSurfacesSanitizeWhatOperatorSurfacesKeep splits the two
+// audiences of a hot-reload failure. An operator asking the registry what is
+// wrong needs the field and the value to fix the file; every surface a request
+// can reach — the resolver, the introspected snapshot's error, and the resolver
+// run against that snapshot — answers an unauthenticated caller and must say
+// only that the registry is invalid, never what the rejected file contains.
+func TestInvalidRuntimeSurfacesSanitizeWhatOperatorSurfacesKeep(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, path, validRegistry)
 	base := time.Now().Add(-time.Hour).Truncate(time.Second)
 	chtimes(t, path, base)
-
-	reg := registry.New(path)
-	if got := aliasNames(bareAliases(t, reg)); !reflect.DeepEqual(got, []string{"luna-fast"}) {
-		t.Fatalf("first Aliases = %v; want [luna-fast]", got)
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	writeRegistry(t, path, personalDoc(lunaRoute+`,`+solRoute))
+	writeRegistry(t, path, secretRegistry)
 	chtimes(t, path, base.Add(time.Hour))
 
-	if got := aliasNames(bareAliases(t, reg)); !reflect.DeepEqual(got, []string{"luna-fast", "openrouter/sol"}) {
-		t.Fatalf("Aliases after a reload = %v; want [luna-fast openrouter/sol]", got)
+	operator := reg.Err()
+	if !errors.Is(operator, registry.ErrInvalid) {
+		t.Fatalf("Err() = %v; want ErrInvalid", operator)
+	}
+	for _, detail := range []string{rejectedValue, "api_key_env_file", path} {
+		if !strings.Contains(operator.Error(), detail) {
+			t.Errorf("Err() = %q; want it to keep the operator detail %q", operator, detail)
+		}
+	}
+
+	_, resolveErr := reg.Resolve(registry.Selection{}, "luna-fast", nil)
+	if !errors.Is(resolveErr, registry.ErrInvalid) {
+		t.Fatalf("Resolve() = %v; want ErrInvalid", resolveErr)
+	}
+	assertSanitized(t, "Resolve()", resolveErr.Error(), path)
+
+	state := reg.State()
+	if state.Valid || state.Error == "" {
+		t.Fatalf("invalid State() = %+v; want an invalid snapshot naming its own sentinel", state)
+	}
+	assertSanitized(t, "State().Error", state.Error, path)
+
+	_, stateErr := registry.ResolveState(state, registry.Selection{}, "luna-fast", nil)
+	if !errors.Is(stateErr, registry.ErrInvalid) {
+		t.Fatalf("ResolveState() = %v; want ErrInvalid", stateErr)
+	}
+	assertSanitized(t, "ResolveState()", stateErr.Error(), path)
+}
+
+// assertSanitized fails when a runtime-safe message carries anything of the
+// rejected file: the value it quoted or the path it was read from.
+func assertSanitized(t *testing.T, surface, message, path string) {
+	t.Helper()
+	if strings.Contains(message, rejectedValue) {
+		t.Errorf("%s = %q; want the rejected value withheld", surface, message)
+	}
+	if strings.Contains(message, path) {
+		t.Errorf("%s = %q; want the registry path withheld", surface, message)
 	}
 }
 
-func TestAliasesIsEmptyWhenThereAreNoForeignRoutes(t *testing.T) {
+// TestInspectPairsOneSnapshotWithItsOperatorError pins what an operator surface
+// needs and State and Err cannot give it separately: both halves of one
+// snapshot. Asked one at a time, a registry replaced between the two calls
+// answers each from a different version of the file — a summary of the document
+// that opened beside a refusal from the one that replaced it, or counts printed
+// for a document nothing validated. Inspect refreshes once and reads both under
+// the same lock, so the sanitized snapshot an operator is shown and the detailed
+// error explaining it always describe the same version.
+func TestInspectPairsOneSnapshotWithItsOperatorError(t *testing.T) {
 	t.Parallel()
-
-	tests := []struct {
-		name    string
-		body    string
-		write   bool
-		wantErr bool
-	}{
-		{name: "missing file", write: false},
-		{name: "empty routes object", body: personalDoc(``), write: true},
-		{name: "unparsable file", body: `{"contexts":{`, write: true, wantErr: true},
-		{
-			name:    "file failing validation",
-			body:    personalDoc(`"bad":{"auth":"nonsense"}`),
-			write:   true,
-			wantErr: true,
-		},
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, path, validRegistry)
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	chtimes(t, path, base)
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
 	}
 
+	state, inspectErr := reg.Inspect()
+	if inspectErr != nil {
+		t.Fatalf("Inspect() = %v; want a valid registry inspected without error", inspectErr)
+	}
+	if !state.Valid || state.DefaultContext != "personal" || len(state.Seats) != 4 ||
+		len(state.Contexts) != 2 {
+		t.Fatalf("valid Inspect() state = %+v; want the whole current document", state)
+	}
+
+	writeRegistry(t, path, secretRegistry)
+	chtimes(t, path, base.Add(time.Hour))
+
+	state, inspectErr = reg.Inspect()
+	if !errors.Is(inspectErr, registry.ErrInvalid) {
+		t.Fatalf("Inspect() after invalid replacement = %v; want ErrInvalid", inspectErr)
+	}
+	for _, detail := range []string{rejectedValue, "api_key_env_file", path} {
+		if !strings.Contains(inspectErr.Error(), detail) {
+			t.Errorf("Inspect() = %q; want it to keep the operator detail %q", inspectErr, detail)
+		}
+	}
+	if state.Valid || state.Error == "" || state.DefaultContext != "" ||
+		len(state.Seats) != 0 || len(state.Contexts) != 0 {
+		t.Fatalf("invalid Inspect() state = %+v; want the sanitized empty snapshot", state)
+	}
+	assertSanitized(t, "Inspect() state.Error", state.Error, path)
+}
+
+func TestInFlightContextResolutionSurvivesInvalidReload(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, path, validRegistry)
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, base, base); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctxRes, err := reg.Resolve(registry.Selection{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeRegistry(t, path, `{}`)
+	if err := os.Chtimes(path, base.Add(time.Hour), base.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Resolve(registry.Selection{}, "", nil); !errors.Is(err, registry.ErrInvalid) {
+		t.Fatalf("Resolve = %v", err)
+	}
+
+	res, err := ctxRes.Select("luna-fast", nil)
+	if err != nil || res.SeatID != "luna" {
+		t.Fatalf("cached Select = %+v, %v", res, err)
+	}
+}
+
+func TestNewRejectsMissingUnreadableUnparsableAndInvalidRegistry(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		makePath func(*testing.T) string
+	}{
+		{name: "missing", makePath: func(t *testing.T) string {
+			t.Helper()
+			return filepath.Join(t.TempDir(), "missing.json")
+		}},
+		{name: "unreadable", makePath: func(t *testing.T) string {
+			t.Helper()
+			p := filepath.Join(t.TempDir(), "registry.json")
+			if err := os.Mkdir(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}},
+		{name: "unparsable", makePath: func(t *testing.T) string {
+			t.Helper()
+			return writeRegistry(t, filepath.Join(t.TempDir(), "registry.json"), `{`)
+		}},
+		{name: "invalid", makePath: func(t *testing.T) string {
+			t.Helper()
+			return writeRegistry(t, filepath.Join(t.TempDir(), "registry.json"), `{}`)
+		}},
+	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
-			path := filepath.Join(t.TempDir(), "registry.json")
-			if tc.write {
-				writeRegistry(t, path, tc.body)
-			}
-
-			reg := registry.New(path)
-			if got := bareAliases(t, reg); len(got) != 0 {
-				t.Fatalf("Aliases = %+v; want an empty slice", got)
-			}
-
-			if err := reg.Err(); (err != nil) != tc.wantErr {
-				t.Fatalf("Err() = %v; wantErr %v", err, tc.wantErr)
+			if _, err := registry.New(tc.makePath(t)); err == nil {
+				t.Fatal("New() = nil error")
 			}
 		})
 	}
 }
 
-func TestErrReportsRegistryHealth(t *testing.T) {
+func TestUnknownExplicitContextStaysNotFound(t *testing.T) {
 	t.Parallel()
-
-	t.Run("missing file is healthy", func(t *testing.T) {
-		t.Parallel()
-
-		reg := registry.New(filepath.Join(t.TempDir(), "absent.json"))
-		if err := reg.Err(); err != nil {
-			t.Fatalf("Err() = %v; want nil for a missing registry file", err)
-		}
-	})
-
-	t.Run("valid file is healthy", func(t *testing.T) {
-		t.Parallel()
-
-		reg := newRegistry(t, personalDoc(lunaRoute))
-		if err := reg.Err(); err != nil {
-			t.Fatalf("Err() = %v; want nil for a valid registry file", err)
-		}
-	})
-
-	t.Run("broken file reports without a prior resolve", func(t *testing.T) {
-		t.Parallel()
-
-		reg := newRegistry(t, `{"contexts":{`)
-		if err := reg.Err(); err == nil {
-			t.Fatal("Err() = nil; want a parse error before any Resolve call")
-		}
-	})
-}
-
-func TestRegistryRecoversWhenTheFileIsFixed(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "registry.json")
-	writeRegistry(t, path, personalDoc(`"bad":{"auth":"nonsense"}`))
-	reg := registry.New(path)
-
-	assertDefault(t, reg, "luna-fast")
-
-	if err := reg.Err(); err == nil {
-		t.Fatal("Err() = nil; want a validation error for the broken file")
-	}
-
-	base := time.Now().Add(-time.Hour).Truncate(time.Second)
-	chtimes(t, path, base)
-	writeRegistry(t, path, personalDoc(lunaRoute))
-	chtimes(t, path, base.Add(time.Hour))
-
-	if got := bare(t, reg, "luna-fast"); got.Model != "openai/gpt-5.6-luna" {
-		t.Fatalf("Resolve after repair = %+v; want the luna-fast route", got)
-	}
-
-	if err := reg.Err(); err != nil {
-		t.Fatalf("Err() = %v; want nil once the file is valid again", err)
+	reg := newRegistry(t, validRegistry)
+	_, err := reg.Resolve(registry.Selection{Name: "missing", Explicit: true}, "x", nil)
+	if !errors.Is(err, registry.ErrUnknownContext) {
+		t.Fatalf("Resolve = %v", err)
 	}
 }
 
-// chtimes pins both timestamps of path so reload tests never depend on
-// filesystem clock granularity.
+func ptr(value string) *string { return &value }
+
+// chtimes pins a file's modification time, so a reload test can control the one
+// stat field a same-size rewrite would otherwise change on its own.
 func chtimes(t *testing.T, path string, when time.Time) {
 	t.Helper()
-
 	if err := os.Chtimes(path, when, when); err != nil {
 		t.Fatalf("chtimes %s: %v", path, err)
 	}
 }
 
-// pinnedContext is a one-route personal context whose alias "pin" rewrites to
-// model, used by the reload tests where only the model may differ.
-func pinnedContext(model string) string {
-	return personalDoc(`"pin":{"base_url":"https://api.anthropic.com","model":"` + model + `","auth":"forward"}`)
+// pinnedRegistry is a one-Seat document whose only variable is the model that
+// Seat rewrites to. Both spellings are the same length, so file size can never
+// explain a reload.
+func pinnedRegistry(model string) string {
+	return `{"default_context":"personal","seats":{"pin":{"upstream":"https://api.anthropic.com",` +
+		`"model":"` + model + `","auth_mode":"forward"}},` +
+		`"contexts":{"personal":{"default_seat":"pin","models":{}}}}`
 }
 
+func pinnedModel(t *testing.T, reg *registry.Registry) string {
+	t.Helper()
+	res, err := reg.Resolve(registry.Selection{}, "anything", nil)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	return res.Seat.Model
+}
+
+// TestReloadOnModTimeChange pins the ordinary in-place rewrite: same path, same
+// size, later modification time.
 func TestReloadOnModTimeChange(t *testing.T) {
 	t.Parallel()
-
-	// Both bodies are byte-identical in length, so size cannot explain a reload.
-	first := pinnedContext("model-one")
-	second := pinnedContext("model-two")
-
 	path := filepath.Join(t.TempDir(), "registry.json")
-	writeRegistry(t, path, first)
-
+	writeRegistry(t, path, pinnedRegistry("model-one"))
 	base := time.Now().Add(-time.Hour).Truncate(time.Second)
 	chtimes(t, path, base)
 
-	reg := registry.New(path)
-	if got := bare(t, reg, "pin").Model; got != "model-one" {
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pinnedModel(t, reg); got != "model-one" {
 		t.Fatalf("first Resolve model = %q; want %q", got, "model-one")
 	}
 
-	writeRegistry(t, path, second)
+	writeRegistry(t, path, pinnedRegistry("model-two"))
 	chtimes(t, path, base.Add(time.Hour))
 
-	if got := bare(t, reg, "pin").Model; got != "model-two" {
+	if got := pinnedModel(t, reg); got != "model-two" {
 		t.Fatalf("Resolve after mtime change = %q; want the reloaded %q", got, "model-two")
 	}
 }
 
+// TestResolveUsesTheCacheWhenNothingChanged pins the other half: a stat that has
+// not moved must not cost a re-read on every request.
 func TestResolveUsesTheCacheWhenNothingChanged(t *testing.T) {
 	t.Parallel()
-
-	first := pinnedContext("model-one")
-	second := pinnedContext("model-two")
-
 	path := filepath.Join(t.TempDir(), "registry.json")
-	writeRegistry(t, path, first)
-
+	writeRegistry(t, path, pinnedRegistry("model-one"))
 	base := time.Now().Add(-time.Hour).Truncate(time.Second)
 	chtimes(t, path, base)
 
-	reg := registry.New(path)
-	if got := bare(t, reg, "pin").Model; got != "model-one" {
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pinnedModel(t, reg); got != "model-one" {
 		t.Fatalf("first Resolve model = %q; want %q", got, "model-one")
 	}
 
 	// Same size, same mtime, different content: the cached parse must stand.
-	writeRegistry(t, path, second)
+	writeRegistry(t, path, pinnedRegistry("model-two"))
 	chtimes(t, path, base)
 
-	if got := bare(t, reg, "pin").Model; got != "model-one" {
+	if got := pinnedModel(t, reg); got != "model-one" {
 		t.Fatalf("Resolve with an unchanged stat = %q; want the cached %q", got, "model-one")
 	}
 }
 
+// TestReloadOnSymlinkRetarget pins the home-manager case: the path never
+// changes, the file it resolves to does, and store timestamps are normalised so
+// the modification time cannot tell the two generations apart.
 func TestReloadOnSymlinkRetarget(t *testing.T) {
 	t.Parallel()
-
 	dir := t.TempDir()
-	one := writeRegistry(t, filepath.Join(dir, "one.json"), pinnedContext("model-one"))
-	two := writeRegistry(t, filepath.Join(dir, "two.json"), pinnedContext("model-two"))
-
-	// Identical size and mtime on both targets: only the resolved symlink target
-	// distinguishes them, which is what a /nix/store swap looks like.
+	one := writeRegistry(t, filepath.Join(dir, "one.json"), pinnedRegistry("model-one"))
+	two := writeRegistry(t, filepath.Join(dir, "two.json"), pinnedRegistry("model-two"))
 	base := time.Now().Add(-time.Hour).Truncate(time.Second)
 	chtimes(t, one, base)
 	chtimes(t, two, base)
@@ -708,350 +530,338 @@ func TestReloadOnSymlinkRetarget(t *testing.T) {
 		t.Fatalf("symlink %s -> %s: %v", link, one, err)
 	}
 
-	reg := registry.New(link)
-	if got := bare(t, reg, "pin").Model; got != "model-one" {
+	reg, err := registry.New(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pinnedModel(t, reg); got != "model-one" {
 		t.Fatalf("first Resolve model = %q; want %q", got, "model-one")
 	}
 
-	if err := os.Remove(link); err != nil {
-		t.Fatalf("remove symlink: %v", err)
+	if removeErr := os.Remove(link); removeErr != nil {
+		t.Fatalf("remove symlink: %v", removeErr)
+	}
+	if linkErr := os.Symlink(two, link); linkErr != nil {
+		t.Fatalf("retarget symlink %s -> %s: %v", link, two, linkErr)
 	}
 
-	if err := os.Symlink(two, link); err != nil {
-		t.Fatalf("retarget symlink %s -> %s: %v", link, two, err)
-	}
-
-	if got := bare(t, reg, "pin").Model; got != "model-two" {
+	if got := pinnedModel(t, reg); got != "model-two" {
 		t.Fatalf("Resolve after symlink retarget = %q; want the reloaded %q", got, "model-two")
 	}
 }
 
-func TestReloadWhenTheFileDisappears(t *testing.T) {
+// TestHotMissingOrUnreadableRegistryFailsClosed pins the two ways a registry can
+// stop being readable at runtime. Neither one may serve the last good document:
+// there is no Seat outside the registry, so the only honest answer is refusal.
+func TestHotMissingOrUnreadableRegistryFailsClosed(t *testing.T) {
 	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		damage func(*testing.T, string)
+	}{
+		{
+			name: "removed",
+			damage: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("remove registry: %v", err)
+				}
+			},
+		},
+		{
+			name: "replaced by a directory",
+			damage: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("remove registry: %v", err)
+				}
+				if err := os.Mkdir(path, 0o750); err != nil {
+					t.Fatalf("mkdir %s: %v", path, err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "registry.json")
+			writeRegistry(t, path, validRegistry)
+			reg, err := registry.New(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, resolveErr := reg.Resolve(registry.Selection{}, "luna-fast", nil); resolveErr != nil {
+				t.Fatalf("Resolve before the break = %v", resolveErr)
+			}
 
-	path := filepath.Join(t.TempDir(), "registry.json")
-	writeRegistry(t, path, personalDoc(lunaRoute))
+			tc.damage(t, path)
 
-	reg := registry.New(path)
-	if got := bare(t, reg, "luna-fast").Alias; got != "luna-fast" {
-		t.Fatalf("first Resolve alias = %q; want %q", got, "luna-fast")
-	}
-
-	if err := os.Remove(path); err != nil {
-		t.Fatalf("remove registry: %v", err)
-	}
-
-	assertDefault(t, reg, "luna-fast")
-
-	if err := reg.Err(); err != nil {
-		t.Fatalf("Err() = %v; want nil after the registry file is removed", err)
+			if _, resolveErr := reg.Resolve(
+				registry.Selection{},
+				"luna-fast",
+				nil,
+			); !errors.Is(resolveErr, registry.ErrInvalid) {
+				t.Fatalf("Resolve = %v; want ErrInvalid", resolveErr)
+			}
+			if !errors.Is(reg.Err(), registry.ErrInvalid) {
+				t.Fatalf("Err() = %v; want ErrInvalid", reg.Err())
+			}
+			if state := reg.State(); state.Valid || len(state.Seats) != 0 || len(state.Contexts) != 0 {
+				t.Fatalf("state after the break = %+v; want no stale summaries", state)
+			}
+		})
 	}
 }
 
-func TestUnreadableRegistryIsFailClosed(t *testing.T) {
-	t.Parallel()
-
-	// A directory where the registry file belongs: present, stat-able, and
-	// impossible to read. Like every other broken registry, it costs the foreign
-	// aliases and nothing else.
-	path := filepath.Join(t.TempDir(), "registry.json")
-	if err := os.Mkdir(path, 0o750); err != nil {
-		t.Fatalf("mkdir %s: %v", path, err)
-	}
-
-	reg := registry.New(path)
-
-	assertDefault(t, reg, "luna-fast")
-
-	if err := reg.Err(); err == nil {
-		t.Fatal("Err() = nil; want a read error for an unreadable registry path")
-	}
-}
-
+// TestConcurrentResolveIsSafe runs the resolver the way the gateway does: many
+// requests at once against one shared registry, under -race.
 func TestConcurrentResolveIsSafe(t *testing.T) {
 	t.Parallel()
+	const (
+		workers = 8
+		rounds  = 50
+	)
+	reg := newRegistry(t, validRegistry)
 
-	const workers = 8
-	const rounds = 50
-
-	reg := newRegistry(t, contextDoc(
-		`"personal":{"routes":{`+lunaRoute+`}},"work":{`+injectDefault+`,"routes":{}}`))
-
-	var wg sync.WaitGroup
+	var group sync.WaitGroup
 	start := make(chan struct{})
-
 	for range workers {
-		wg.Add(1)
-
+		group.Add(1)
 		go func() {
-			defer wg.Done()
+			defer group.Done()
 			<-start
-
 			for range rounds {
-				if route := bare(t, reg, "luna-fast"); route.Model != "openai/gpt-5.6-luna" {
-					t.Errorf("Resolve model = %q; want %q", route.Model, "openai/gpt-5.6-luna")
-
+				res, err := reg.Resolve(registry.Selection{}, "luna-fast", nil)
+				if err != nil || res.SeatID != "luna" {
+					t.Errorf("public Resolve = %+v, %v", res, err)
 					return
 				}
-
-				if route := bare(t, reg, "claude-sonnet-5"); route.BaseURL != "https://api.anthropic.com" {
-					t.Errorf("Resolve of an unmatched model = %+v; want the default route", route)
-
+				marked, markedErr := reg.Resolve(
+					registry.Selection{},
+					"claude-opus-5",
+					&registry.SubagentObservation{AgentID: "agent"},
+				)
+				if markedErr != nil || marked.SeatID != "bedrock" {
+					t.Errorf("marked Resolve = %+v, %v", marked, markedErr)
 					return
 				}
-
-				work := registry.Selection{Name: "work", Explicit: true}
-				if route := resolve(t, reg, work, "claude-sonnet-5").Route; route.Auth != registry.AuthInject {
-					t.Errorf("Resolve in the work context = %+v; want its inject default route", route)
-
+				work, workErr := reg.Resolve(
+					registry.Selection{Name: "work", Explicit: true},
+					"unbound",
+					nil,
+				)
+				if workErr != nil || work.SeatID != "luna" {
+					t.Errorf("work Resolve = %+v, %v", work, workErr)
 					return
 				}
-
 				if err := reg.Err(); err != nil {
 					t.Errorf("Err() = %v; want nil for a valid registry", err)
-
 					return
 				}
 			}
 		}()
 	}
-
 	close(start)
-	wg.Wait()
+	group.Wait()
 }
 
-// TestResolveSelectsTheNamedContext pins the core of the contexts feature: the
-// same model name resolves to a different route in each context, and a context
-// resolves its own default route for a model no alias in it claims.
-func TestResolveSelectsTheNamedContext(t *testing.T) {
+// TestStateAndResolutionHandOutIsolatedCopies pins the boundary around the
+// registry's own maps. Both are handed to callers that legitimately mutate what
+// they get — the CLI builds a State into a resolver, the pipeline merges a
+// Seat's extra_body — and a shared backing map would let one request rewrite the
+// document every later request reads.
+func TestStateAndResolutionHandOutIsolatedCopies(t *testing.T) {
 	t.Parallel()
+	body := strings.Replace(
+		validRegistry,
+		`"luna":{"upstream"`,
+		`"luna":{"extra_body":{"reasoning_effort":"low"},"upstream"`,
+		1,
+	)
+	reg := newRegistry(t, body)
 
-	reg := newRegistry(t, contextDoc(
-		`"personal":{"routes":{`+lunaRoute+`}},`+
-			`"work":{`+injectDefault+`,"routes":{`+deepseekRoute+`}},`+
-			`"pinned":{"default_route":{"base_url":"https://api.anthropic.com",`+
-			`"model":"claude-opus-5","auth":"forward"},"routes":{}}`))
-
-	tests := []struct {
-		name         string
-		sel          registry.Selection
-		model        string
-		wantContext  string
-		wantAlias    string
-		wantUpstream string
-		wantModel    string
-	}{
-		{
-			name:         "bare path uses the personal context",
-			sel:          registry.Selection{},
-			model:        "luna-fast",
-			wantContext:  "personal",
-			wantAlias:    "luna-fast",
-			wantUpstream: "https://openrouter.ai/api",
-			wantModel:    "openai/gpt-5.6-luna",
-		},
-		{
-			name:         "a personal alias is invisible to another context",
-			sel:          registry.Selection{Name: "work", Explicit: true},
-			model:        "luna-fast",
-			wantContext:  "work",
-			wantAlias:    "",
-			wantUpstream: "https://openrouter.ai/api",
-			wantModel:    "openai/gpt-5.6-luna",
-		},
-		{
-			name:         "a named context resolves its own alias",
-			sel:          registry.Selection{Name: "work", Explicit: true},
-			model:        "deepseek-flash-low",
-			wantContext:  "work",
-			wantAlias:    "deepseek-flash-low",
-			wantUpstream: "https://openrouter.ai/api",
-			wantModel:    "deepseek/deepseek-v4-flash-0731",
-		},
-		{
-			name:         "an unmatched model rides the context default route",
-			sel:          registry.Selection{Name: "pinned", Explicit: true},
-			model:        "claude-sonnet-5",
-			wantContext:  "pinned",
-			wantAlias:    "",
-			wantUpstream: "https://api.anthropic.com",
-			wantModel:    "claude-opus-5",
-		},
-		{
-			name:         "a context with no default route falls to the built-in one",
-			sel:          registry.Selection{Name: "personal", Explicit: true},
-			model:        "claude-sonnet-5",
-			wantContext:  "personal",
-			wantAlias:    "",
-			wantUpstream: "https://api.anthropic.com",
-			wantModel:    "",
-		},
+	state := reg.State()
+	state.Seats["luna"] = registry.Seat{Model: "tampered"}
+	delete(state.Contexts, "personal")
+	if again := reg.State(); again.Seats["luna"].Model != "openai/gpt-5.6-luna" ||
+		len(again.Contexts) != 2 {
+		t.Fatalf("State() was mutated through a previous caller's copy: %+v", again)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	res, err := reg.Resolve(registry.Selection{}, "luna-fast", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			res := resolve(t, reg, tc.sel, tc.model)
+	models := res.Models()
+	models["luna-fast"] = "tampered"
+	models["injected"] = "luna"
+	if again := res.Models(); again["luna-fast"] != "luna" || len(again) != 1 {
+		t.Fatalf("Models() shares its backing map: %+v", again)
+	}
 
-			if res.Context != tc.wantContext {
-				t.Fatalf("Resolution.Context = %q; want %q", res.Context, tc.wantContext)
-			}
+	policy := res.SubagentPolicy()
+	policy.DefaultSeat = "tampered"
+	policy.Models["claude-opus-5"] = "tampered"
+	if again := res.SubagentPolicy(); again.DefaultSeat != "sol" ||
+		again.Models["claude-opus-5"] != "bedrock" {
+		t.Fatalf("SubagentPolicy() shares its backing values: %+v", again)
+	}
 
-			if res.Route.Alias != tc.wantAlias {
-				t.Fatalf("Resolution.Route.Alias = %q; want %q", res.Route.Alias, tc.wantAlias)
-			}
+	bindings := res.PublicBindings()
+	if len(bindings) != 1 {
+		t.Fatalf("PublicBindings() = %+v", bindings)
+	}
+	if len(bindings[0].Seat.ExtraBody) == 0 {
+		t.Fatal("the fixture Seat has no extra_body to protect")
+	}
+	bindings[0].Seat.ExtraBody[0] = 'X'
+	if again := res.PublicBindings(); again[0].Seat.ExtraBody[0] != '{' {
+		t.Fatalf("PublicBindings() shares its extra_body bytes: %s", again[0].Seat.ExtraBody)
+	}
 
-			if res.Route.BaseURL != tc.wantUpstream {
-				t.Fatalf("Resolution.Route.BaseURL = %q; want %q", res.Route.BaseURL, tc.wantUpstream)
-			}
-
-			if res.Route.Model != tc.wantModel {
-				t.Fatalf("Resolution.Route.Model = %q; want %q", res.Route.Model, tc.wantModel)
-			}
-		})
+	_, seat := res.DefaultSeat()
+	if len(seat.ExtraBody) != 0 {
+		t.Fatalf("default Seat has unexpected extra_body: %s", seat.ExtraBody)
 	}
 }
 
-// TestResolveCarriesTheContextDefaultAndAliases pins the metadata both the
-// proxy and the model endpoints read off one resolution, so introspection and
-// forwarding can never disagree about what a context holds.
-func TestResolveCarriesTheContextDefaultAndAliases(t *testing.T) {
+// TestResolveStateSnapshotsTheStateItWasGiven closes the boundary on the one
+// resolver whose whole input is caller-owned. A State is an exported struct of
+// exported maps, slices and pointers handed to ResolveState by value — which
+// copies the struct and nothing it points at. The Resolution that comes back is
+// documented as an immutable snapshot and is read long after the call: Select
+// re-runs the precedence, Models, SubagentPolicy, DefaultSeat and
+// PublicBindings hand out copies of it. Every one of those reads the caller's
+// own maps unless the snapshot is taken at the door.
+func TestResolveStateSnapshotsTheStateItWasGiven(t *testing.T) {
 	t.Parallel()
+	const wantExtraBody = `{"reasoning_effort":"low"}`
+	reg := newRegistry(t, strings.Replace(
+		validRegistry,
+		`"luna":{"upstream"`,
+		`"luna":{"extra_body":`+wantExtraBody+`,"upstream"`,
+		1,
+	))
 
-	reg := newRegistry(t, contextDoc(
-		`"personal":{"routes":{`+lunaRoute+`}},`+
-			`"work":{`+injectDefault+`,"routes":{`+solRoute+`,`+deepseekRoute+`}}`))
-
-	personal := resolve(t, reg, registry.Selection{}, "")
-	if !reflect.DeepEqual(personal.DefaultRoute, registry.DefaultRoute()) {
-		t.Fatalf("personal DefaultRoute = %+v; want the built-in %+v",
-			personal.DefaultRoute, registry.DefaultRoute())
+	state := reg.State()
+	res, err := registry.ResolveState(
+		state,
+		registry.Selection{Name: "personal", Explicit: true},
+		"luna-fast",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("ResolveState() = %v", err)
+	}
+	if res.SeatID != "luna" || string(res.Seat.ExtraBody) != wantExtraBody {
+		t.Fatalf("resolution = %+v; want the luna Seat with its extra_body", res)
 	}
 
-	if got := aliasNames(personal.Aliases()); !reflect.DeepEqual(got, []string{"luna-fast"}) {
-		t.Fatalf("personal Aliases = %v; want [luna-fast]", got)
+	// Everything the caller still holds a reference into, rewritten: the Seat
+	// map and one Seat's extra_body bytes, the Context's public bindings, its
+	// marked-subagent policy, and the Context map itself.
+	luna := state.Seats["luna"]
+	luna.ExtraBody[0] = 'X'
+	for _, id := range []string{"anthropic", "luna", "sol", "bedrock"} {
+		state.Seats[id] = registry.Seat{Model: "tampered", Upstream: "https://tampered.example"}
+	}
+	personal := state.Contexts["personal"]
+	personal.Models["luna-fast"] = "anthropic"
+	personal.Models["injected"] = "anthropic"
+	personal.Subagents.DefaultSeat = "anthropic"
+	personal.Subagents.Models["claude-opus-5"] = "anthropic"
+	delete(state.Contexts, "personal")
+	state.DefaultContext = "tampered"
+
+	if res.SeatID != "luna" || res.Seat.Model != "openai/gpt-5.6-luna" ||
+		string(res.Seat.ExtraBody) != wantExtraBody {
+		t.Errorf("selected Seat = %+v; want the pre-mutation snapshot", res.Seat)
 	}
 
-	work := resolve(t, reg, registry.Selection{Name: "work", Explicit: true}, "")
-	if work.DefaultRoute.Auth != registry.AuthInject ||
-		work.DefaultRoute.Model != "openai/gpt-5.6-luna" ||
-		work.DefaultRoute.MaxInputTokens != 262144 {
-		t.Fatalf("work DefaultRoute = %+v; want the declared inject default", work.DefaultRoute)
+	again, selectErr := res.Select("luna-fast", nil)
+	if selectErr != nil || again.SeatID != "luna" ||
+		string(again.Seat.ExtraBody) != wantExtraBody {
+		t.Errorf("a later Select() = %+v, %v; want the pre-mutation snapshot", again, selectErr)
 	}
 
-	if got := aliasNames(work.Aliases()); !reflect.DeepEqual(got, []string{"deepseek-flash-low", "openrouter/sol"}) {
-		t.Fatalf("work Aliases = %v; want the work context's own aliases sorted", got)
+	marked, markedErr := res.Select(
+		"claude-opus-5",
+		&registry.SubagentObservation{AgentID: "agent-1"},
+	)
+	if markedErr != nil || marked.SeatID != "bedrock" ||
+		marked.Match.Kind != registry.SelectionSubagent {
+		t.Errorf("a later marked Select() = %+v, %v; want the bedrock binding", marked, markedErr)
+	}
+
+	fallback, fallbackErr := res.Select("unbound", nil)
+	if fallbackErr != nil || fallback.SeatID != "anthropic" ||
+		fallback.Seat.Upstream != "https://api.anthropic.com" {
+		t.Errorf("a later default Select() = %+v, %v; want the anthropic Seat", fallback, fallbackErr)
+	}
+
+	if models := res.Models(); len(models) != 1 || models["luna-fast"] != "luna" {
+		t.Errorf("Models() = %+v; want the pre-mutation bindings", models)
+	}
+
+	policy := res.SubagentPolicy()
+	if policy == nil || policy.DefaultSeat != "sol" || policy.Models["claude-opus-5"] != "bedrock" {
+		t.Errorf("SubagentPolicy() = %+v; want the pre-mutation policy", policy)
+	}
+
+	seatID, seat := res.DefaultSeat()
+	if seatID != "anthropic" || seat.Upstream != "https://api.anthropic.com" || seat.Model != "" {
+		t.Errorf("DefaultSeat() = %q, %+v; want the pre-mutation anthropic Seat", seatID, seat)
+	}
+
+	bindings := res.PublicBindings()
+	if len(bindings) != 1 || bindings[0].Selector != "luna-fast" || bindings[0].SeatID != "luna" ||
+		string(bindings[0].Seat.ExtraBody) != wantExtraBody {
+		t.Errorf("PublicBindings() = %+v; want the pre-mutation binding", bindings)
 	}
 }
 
-// TestResolveFailsClosedOnAnUnknownContext is the security property: a request
-// that names a context patchbay cannot resolve is refused, never quietly served
-// by another context or by the built-in default route.
-func TestResolveFailsClosedOnAnUnknownContext(t *testing.T) {
+// TestSelectedSeatExtraBodyIsIsolated closes the last hole in that boundary. A
+// Resolution is documented as an immutable snapshot, but the Seat it selects is
+// handed out whole and the pipeline merges the caller's own body over its
+// extra_body — so a shared slice would let one request rewrite what every later
+// request, and the registry document itself, reads.
+func TestSelectedSeatExtraBodyIsIsolated(t *testing.T) {
 	t.Parallel()
+	const wantExtraBody = `{"reasoning_effort":"low"}`
+	reg := newRegistry(t, strings.Replace(
+		validRegistry,
+		`"luna":{"upstream"`,
+		`"luna":{"extra_body":`+wantExtraBody+`,"upstream"`,
+		1,
+	))
 
-	tests := []struct {
-		name  string
-		body  string
-		write bool
-		sel   registry.Selection
-	}{
-		{
-			name:  "name no context claims",
-			body:  contextDoc(`"personal":{"routes":{` + lunaRoute + `}}`),
-			write: true,
-			sel:   registry.Selection{Name: "work", Explicit: true},
-		},
-		{
-			name:  "registry that failed to parse",
-			body:  `{"contexts":{`,
-			write: true,
-			sel:   registry.Selection{Name: "personal", Explicit: true},
-		},
-		{
-			name:  "registry that failed validation",
-			body:  personalDoc(`"bad":{"auth":"nonsense"}`),
-			write: true,
-			sel:   registry.Selection{Name: "personal", Explicit: true},
-		},
-		{
-			name:  "registry file that is not there",
-			write: false,
-			sel:   registry.Selection{Name: "personal", Explicit: true},
-		},
-		{
-			name:  "empty name",
-			body:  contextDoc(`"personal":{"routes":{}}`),
-			write: true,
-			sel:   registry.Selection{Name: "", Explicit: true},
-		},
+	ctxRes, err := reg.Resolve(registry.Selection{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ctxRes.Select("luna-fast", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res.Seat.ExtraBody) != wantExtraBody {
+		t.Fatalf("selected Seat extra_body = %s; want the fixture's %s", res.Seat.ExtraBody, wantExtraBody)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	res.Seat.ExtraBody[0] = 'X'
 
-			path := filepath.Join(t.TempDir(), "registry.json")
-			if tc.write {
-				writeRegistry(t, path, tc.body)
-			}
-
-			res, err := registry.New(path).Resolve(tc.sel, "claude-sonnet-5")
-			if !errors.Is(err, registry.ErrUnknownContext) {
-				t.Fatalf("Resolve(%+v) error = %v; want ErrUnknownContext", tc.sel, err)
-			}
-
-			if !strings.Contains(err.Error(), tc.sel.Name) {
-				t.Fatalf("Resolve error = %q; want it to name the context %q", err, tc.sel.Name)
-			}
-
-			if !reflect.DeepEqual(res.Route, registry.Route{}) {
-				t.Fatalf("Resolve returned route %+v; want no route at all", res.Route)
-			}
-		})
+	again, err := ctxRes.Select("luna-fast", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-// TestReloadAddsAndRemovesWholeContexts covers hot reload at the document
-// level: the whole contexts map is re-read, so a context an operator adds is
-// resolvable on the next request and one they remove fails closed on it.
-func TestReloadAddsAndRemovesWholeContexts(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "registry.json")
-	writeRegistry(t, path, contextDoc(`"personal":{"routes":{`+lunaRoute+`}}`))
-
-	base := time.Now().Add(-time.Hour).Truncate(time.Second)
-	chtimes(t, path, base)
-
-	reg := registry.New(path)
-	work := registry.Selection{Name: "work", Explicit: true}
-
-	if _, err := reg.Resolve(work, "claude-sonnet-5"); !errors.Is(err, registry.ErrUnknownContext) {
-		t.Fatalf("Resolve before the context exists = %v; want ErrUnknownContext", err)
+	if string(again.Seat.ExtraBody) != wantExtraBody {
+		t.Errorf("a later Select() sees %s; want %s", again.Seat.ExtraBody, wantExtraBody)
 	}
 
-	writeRegistry(t, path, contextDoc(
-		`"personal":{"routes":{`+lunaRoute+`}},"work":{`+injectDefault+`,"routes":{`+solRoute+`}}`))
-	chtimes(t, path, base.Add(time.Hour))
-
-	added := resolve(t, reg, work, "openrouter/sol")
-	if added.Route.Alias != "openrouter/sol" {
-		t.Fatalf("Resolve after the context was added = %+v; want its own alias", added.Route)
+	fresh, err := reg.Resolve(registry.Selection{}, "luna-fast", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	if added.DefaultRoute.Model != "openai/gpt-5.6-luna" {
-		t.Fatalf("DefaultRoute after the reload = %+v; want the declared default", added.DefaultRoute)
+	if string(fresh.Seat.ExtraBody) != wantExtraBody {
+		t.Errorf("a fresh Resolve() sees %s; want %s", fresh.Seat.ExtraBody, wantExtraBody)
 	}
-
-	writeRegistry(t, path, contextDoc(`"personal":{"routes":{`+lunaRoute+`}}`))
-	chtimes(t, path, base.Add(2*time.Hour))
-
-	if _, err := reg.Resolve(work, "openrouter/sol"); !errors.Is(err, registry.ErrUnknownContext) {
-		t.Fatalf("Resolve after the context was removed = %v; want ErrUnknownContext", err)
-	}
-
-	// Removing a context never costs the bare path its default route.
-	assertDefault(t, reg, "claude-sonnet-5")
 }

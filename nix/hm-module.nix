@@ -28,46 +28,87 @@ self: {
   registryPath = "${config.xdg.configHome}/patchbay/routes.json";
 
   # The CLIProxyAPI listener key travels store → unit env → injected header,
-  # so patchbay's usual key-file indirection carries it like any other route
-  # key. It lives world-readable in the store because it only gates a loopback
+  # so patchbay's usual key-file indirection carries it like any other Seat key.
+  # It lives world-readable in the store because it only gates a loopback
   # listener — see the option's description.
   chatgptKeyVar = "PATCHBAY_CHATGPT_KEY_FILE";
   chatgptKeyFile = pkgs.writeText "patchbay-chatgpt-key" cfg.codexUpstream.listenerKey;
 
-  codexRoute = model: {
-    auth = "inject";
-    base_url = "http://127.0.0.1:${toString cfg.codexUpstream.port}";
+  # A generated Seat's ID: the selector's whole SHA-256 digest, deterministic
+  # across evaluations and carrying the digest's full collision resistance.
+  #
+  # No hash is injective — 256 bits cannot separate every possible selector — so
+  # what the whole digest offers is strength, not impossibility. Keeping only the
+  # first 16 hex characters discarded three quarters of that strength on purpose,
+  # leaving 64 bits. Two hand-declared selectors colliding in 64 bits is unlikely;
+  # it is also a risk taken for nothing, and the failure it admits is a silent
+  # one. An attrset holds one value per key, so two selectors landing on one ID
+  # become one Seat: the second generated under it replaces the first, and the
+  # registry that reaches the gateway simply has a binding missing. Nothing
+  # outside the generated document reads these IDs, so the truncation bought
+  # nothing to set against that.
+  codexSeatID = selector: "codex-${builtins.hashString "sha256" selector}";
+
+  # The registry's own inject rule, spelled once for the two sides of a binding
+  # it applies to. Case-insensitive and anywhere in the string, exactly as
+  # patchbay reads it.
+  namesNoClaude = text: !lib.hasInfix "claude" (lib.toLower text);
+
+  codexSeat = model: {
+    auth_mode = "inject";
+    upstream = "http://127.0.0.1:${toString cfg.codexUpstream.port}";
     api_key_env_file = chatgptKeyVar;
     inherit model;
     max_input_tokens = cfg.codexUpstream.maxInputTokens;
   };
 
-  codexRoutes = lib.mapAttrs (_: codexRoute) cfg.codexUpstream.routes;
+  codexSeats = lib.mapAttrs' (
+    selector: model: lib.nameValuePair (codexSeatID selector) (codexSeat model)
+  ) cfg.codexUpstream.bindings;
+
+  codexBindings = lib.mapAttrs (selector: _: codexSeatID selector) cfg.codexUpstream.bindings;
 
   codexContextNames =
     if cfg.codexUpstream.contexts == null
     then lib.attrNames (cfg.registry.contexts or { })
     else cfg.codexUpstream.contexts;
 
-  # The declared registry, with the chatgpt routes merged into the chosen
-  # contexts. A hand-written route wins over a generated one of the same name:
-  # the reviewed document beats the convenience.
+  # The declared registry, with generated ChatGPT Seats added globally and
+  # bindings merged into the chosen Contexts. A hand-written binding wins over a
+  # generated one of the same selector: the reviewed document beats convenience.
   registry =
-    if cfg.codexUpstream.enable && codexRoutes != { }
+    if cfg.codexUpstream.enable && codexBindings != { }
     then
       cfg.registry
       // {
+        seats = codexSeats // (cfg.registry.seats or { });
         contexts =
           lib.mapAttrs (
             name: context:
               if lib.elem name codexContextNames
-              then context // { routes = codexRoutes // (context.routes or { }); }
+              then context // { models = codexBindings // (context.models or { }); }
               else context
           ) (cfg.registry.contexts or { });
       }
     else cfg.registry;
 
-  registryFile = jsonFormat.generate "patchbay-routes.json" registry;
+  # The generated selectors that survive into the document above still bound to
+  # their own generated Seat.
+  #
+  # A declared binding is not the same thing as a published one. The merge lets
+  # a hand-written binding of the same selector win, and publishes nothing at
+  # all in a Context the upstream does not name or the registry does not define
+  # — so a selector can be declared here and bind no inject Seat anywhere. The
+  # question is asked of the merged Contexts rather than of the option, because
+  # the merged document is what patchbay will actually read.
+  publishedCodexSelectors = lib.filter (
+    selector:
+      lib.any (
+        name: ((registry.contexts.${name} or { }).models or { }).${selector} or null == codexSeatID selector
+      ) codexContextNames
+  ) (lib.attrNames cfg.codexUpstream.bindings);
+
+  registryFile = jsonFormat.generate "patchbay-registry.json" registry;
 
   proxyConfig = yamlFormat.generate "cliproxyapi-config.yaml" {
     host = "127.0.0.1";
@@ -124,25 +165,45 @@ in {
 
     registry = lib.mkOption {
       type = jsonFormat.type;
-      default = { contexts.personal.routes = { }; };
+      default = {
+        default_context = "personal";
+        seats.anthropic = {
+          upstream = "https://api.anthropic.com";
+          auth_mode = "forward";
+        };
+        contexts.personal = {
+          default_seat = "anthropic";
+          models = { };
+        };
+      };
       example = lib.literalExpression ''
         {
-          contexts.personal.routes."openrouter/kimi-k2" = {
-            auth = "inject";
-            base_url = "https://openrouter.ai/api";
-            model = "moonshotai/kimi-k2";
-            api_key_env_file = "PATCHBAY_OPENROUTER_KEY_FILE";
-            strip_cache_control = true;
+          default_context = "personal";
+          seats = {
+            anthropic = {
+              upstream = "https://api.anthropic.com";
+              auth_mode = "forward";
+            };
+            openrouter-kimi-k2 = {
+              upstream = "https://openrouter.ai/api";
+              model = "moonshotai/kimi-k2";
+              auth_mode = "inject";
+              api_key_env_file = "PATCHBAY_OPENROUTER_KEY_FILE";
+              strip_cache_control = true;
+            };
+          };
+          contexts.personal = {
+            default_seat = "anthropic";
+            models."openrouter/kimi-k2" = "openrouter-kimi-k2";
           };
         }
       '';
       description = ''
-        The registry document, generated to JSON in the store and linked at
-        `~/.config/patchbay/routes.json`. It holds no secrets — only the names
-        of environment variables whose values are key-file paths (declare
-        those under {option}`services.patchbay.environment`). The default is
-        one empty `personal` context: a pure Anthropic passthrough on the
-        caller's own credentials.
+        The strict registry document, generated to JSON in the store and linked
+        at `~/.config/patchbay/routes.json`. It holds no secrets — only the
+        names of environment variables whose values are key-file paths (declare
+        those under {option}`services.patchbay.environment`). The default has
+        one global Anthropic Seat and one empty `personal` Context using it.
       '';
     };
 
@@ -152,7 +213,7 @@ in {
       defaultText = lib.literalExpression ''"''${config.xdg.configHome}/patchbay/caller.key"'';
       description = ''
         Path of the file holding the caller key — the local shared secret that
-        gates the routes which spend your provider keys. A path, not a
+        gates Seats which spend your provider keys. A path, not a
         {type}`path`: the file must never enter the store.
       '';
     };
@@ -185,7 +246,7 @@ in {
       default = [ ];
       example = lib.literalExpression "[ pkgs.awscli2 ]";
       description = ''
-        Packages on the gateway unit's PATH. `sigv4` routes exec
+        Packages on the gateway unit's PATH. `sigv4` Seats exec
         `aws configure export-credentials`, so a registry using them needs
         `awscli2` here; nothing else about patchbay needs a PATH at all.
       '';
@@ -203,8 +264,8 @@ in {
     codexUpstream = {
       enable = lib.mkEnableOption ''
         the ChatGPT-subscription upstream: runs CLIProxyAPI on loopback,
-        translating Anthropic Messages to the Codex OAuth backend, and merges
-        `inject` routes at it into the registry. Read
+        translating Anthropic Messages to the Codex OAuth backend, and adds
+        global `inject` Seats plus Context bindings to the registry. Read
         docs/chatgpt-subscription.md first — reaching a ChatGPT subscription
         this way is at best a gray area of OpenAI's Terms of Use, and enabling
         this option is accepting that risk for the logged-in account. Enable
@@ -226,7 +287,7 @@ in {
         description = "Loopback port CLIProxyAPI listens on.";
       };
 
-      routes = lib.mkOption {
+      bindings = lib.mkOption {
         type = lib.types.attrsOf lib.types.str;
         default = { };
         example = lib.literalExpression ''
@@ -236,10 +297,21 @@ in {
           }
         '';
         description = ''
-          Alias → upstream model id. Each entry becomes an `inject` route at
-          the proxy in every context {option}`codexUpstream.contexts` selects.
-          List the subscription's current ids with
+          Public selector → upstream model id. Each entry creates one global
+          `inject` Seat and publishes a binding in every Context selected by
+          {option}`codexUpstream.contexts`. List current subscription ids with
           `curl -H 'Authorization: Bearer <listenerKey>' http://127.0.0.1:8317/v1/models`.
+
+          Every selector must be non-empty: it is published as a public model
+          name, and patchbay refuses an empty selector key in a Context's
+          bindings.
+
+          No target may contain `claude`, in any case: every entry generates an
+          `inject` Seat, and patchbay admits no inject model naming Claude. A
+          selector naming Claude is refused where it is actually published —
+          a hand-written Context binding of the same selector wins, so one
+          overridden in every Context it would reach binds no inject Seat and
+          is left alone.
         '';
       };
 
@@ -248,17 +320,21 @@ in {
         default = null;
         example = lib.literalExpression ''[ "personal" ]'';
         description = ''
-          Which contexts of {option}`services.patchbay.registry` publish the
-          chatgpt routes. Null means all of them.
+          Which Contexts of {option}`services.patchbay.registry` publish the
+          ChatGPT bindings. Null means all of them.
         '';
       };
 
       maxInputTokens = lib.mkOption {
-        type = lib.types.int;
+        # Unsigned, because the registry refuses a negative ceiling: a signed
+        # option would only move that refusal from evaluation to a unit that
+        # will not start.
+        type = lib.types.ints.unsigned;
         default = 372000;
         description = ''
-          `max_input_tokens` on every generated route: the subscription's
-          enforced context window, not the model's headline one.
+          `max_input_tokens` on every generated Seat: the subscription's
+          enforced context window, not the model's headline one. Zero means no
+          ceiling.
         '';
       };
 
@@ -298,6 +374,48 @@ in {
           cfg.codexUpstream.contexts == null
           || lib.all (name: lib.hasAttr name (cfg.registry.contexts or { })) cfg.codexUpstream.contexts;
         message = "services.patchbay.codexUpstream.contexts names a context that services.patchbay.registry does not define.";
+      }
+      {
+        assertion = !cfg.codexUpstream.enable || lib.all (seatID: !lib.hasAttr seatID (cfg.registry.seats or { })) (lib.attrNames codexSeats);
+        message = "services.patchbay.codexUpstream.bindings generates a Seat ID already present in services.patchbay.registry.seats.";
+      }
+      # An empty selector is not a name anything can ask for. Unlike the Claude
+      # rule below it is refused on the declaration rather than where it lands:
+      # patchbay rejects an empty models key in any Context, so an empty
+      # selector is invalid operator input whatever the Context scoping goes on
+      # to publish it in.
+      {
+        assertion = !cfg.codexUpstream.enable || !lib.hasAttr "" cfg.codexUpstream.bindings;
+        message = "services.patchbay.codexUpstream.bindings declares an empty generated selector (\"\"); a generated selector is published as a public model name, and patchbay refuses an empty selector key in a context's models.";
+      }
+      # Both sides of a generated binding, held to the one prohibition the
+      # registry puts on an inject Seat.
+      #
+      # Everything these bindings generate is an `inject` Seat, and inject
+      # strips the caller's own Anthropic credentials: a Seat that rewrites to a
+      # Claude model, or a selector that publishes one, is a request for
+      # Anthropic's own models spent on somebody else's key. Patchbay refuses
+      # both, so evaluation refuses them here — on the file that wrote them,
+      # rather than on a gateway that will not load its own generated registry.
+      #
+      # The two sides are asked different questions, because they reach the
+      # document differently. Every declared target becomes a generated Seat's
+      # model, whether or not anything binds that Seat. A selector only reaches
+      # an inject Seat where the merge actually published it, so that half is
+      # asked of the merged Contexts: a selector hand-written policy overrode
+      # everywhere binds nothing and is no business of this assertion.
+      #
+      # This is about generated bindings only. A hand-written Seat or Context
+      # binding is patchbay's to validate, and it does.
+      {
+        assertion =
+          !cfg.codexUpstream.enable
+          || lib.all namesNoClaude (lib.attrValues cfg.codexUpstream.bindings);
+        message = "services.patchbay.codexUpstream.bindings targets a model naming Claude; the generated Seats are inject Seats, and patchbay refuses an inject model containing \"claude\" in any case.";
+      }
+      {
+        assertion = !cfg.codexUpstream.enable || lib.all namesNoClaude publishedCodexSelectors;
+        message = "services.patchbay.codexUpstream.bindings publishes a selector naming Claude; a published generated selector binds a generated inject Seat, and patchbay refuses a selector containing \"claude\" on an inject binding in any case. Overriding it with a hand-written binding in every Context it is published in also resolves this.";
       }
     ];
 

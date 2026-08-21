@@ -3,357 +3,409 @@ package registry
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
-	"sort"
 	"strings"
 
 	"github.com/joshsymonds/patchbay/internal/anthropic"
+	"github.com/joshsymonds/patchbay/internal/jsonstrict"
 )
 
-// claudeMarker is the substring an inject route may never carry. A foreign key
-// paying for something that reads as a Claude model is a billing lie.
 const claudeMarker = "claude"
-
-// The alphabets an AWS region and an AWS profile are held to, spelled out for
-// the error a rejected one produces.
 const (
 	regionAlphabet  = "lowercase letters, digits and dashes"
 	profileAlphabet = "lowercase letters, digits, dashes, dots and underscores"
+	loopbackHost    = "127.0.0.1"
+	localhostHost   = "localhost"
 )
 
-// loopbackHost and localhostHost are the only hosts allowed to drop TLS.
-const (
-	loopbackHost  = "127.0.0.1"
-	localhostHost = "localhost"
-)
-
-// validateContexts checks every context and fails the whole file on the first
-// violation. Validation is deliberately all-or-nothing: a registry with one bad
-// route is a registry the operator did not mean to ship, and honoring the rest
-// of it would silently apply a configuration nobody reviewed. That holds across
-// contexts too — a broken work context invalidates the personal one, because
-// the document is what the operator wrote and reviewed, not each half of it.
-func validateContexts(contexts map[string]Context) error {
-	names := make([]string, 0, len(contexts))
-	for name := range contexts {
-		names = append(names, name)
+func validateDocument(doc *document) error {
+	if err := ValidID(doc.DefaultContext); err != nil {
+		return fmt.Errorf("default_context %q %w", doc.DefaultContext, err)
+	}
+	if _, ok := doc.Contexts[doc.DefaultContext]; !ok {
+		return fmt.Errorf("default_context %q does not reference a context", doc.DefaultContext)
 	}
 
-	sort.Strings(names)
-
-	for _, name := range names {
-		if err := validateContextName(name); err != nil {
+	for _, id := range sortedKeys(doc.Seats) {
+		if err := ValidID(id); err != nil {
+			return fmt.Errorf("seat %q %w", id, err)
+		}
+		if err := validateSeat(doc.Seats[id]); err != nil {
+			return fmt.Errorf("seat %q: %w", id, err)
+		}
+	}
+	for _, id := range sortedKeys(doc.Contexts) {
+		if err := ValidID(id); err != nil {
+			return fmt.Errorf("context %q %w", id, err)
+		}
+		ctx := doc.Contexts[id]
+		if err := validateContext(id, &ctx, doc.Seats); err != nil {
 			return err
 		}
-
-		if err := validateContext(contexts[name]); err != nil {
-			return fmt.Errorf("context %q: %w", name, err)
-		}
+		ctx.foreignTargets = foreignTargets(ctx, doc.Seats)
+		doc.Contexts[id] = ctx
 	}
-
 	return nil
 }
 
-// validateContextName holds a context name to what a URL path segment can carry
-// unambiguously. A request selects a context by name in its own path, so a name
-// needing escaping — or one that could read as a path traversal — is a name the
-// gateway would have to guess about, and it refuses to guess.
-func validateContextName(name string) error {
+// ValidID enforces the exact Context and Seat ID grammar.
+func ValidID(id string) error {
+	if id == "" {
+		return fmt.Errorf("must match ^[a-z0-9][a-z0-9-]*$: empty ID")
+	}
+	for index, char := range id {
+		if index == 0 {
+			if !isLowerAlphanumeric(char) {
+				return fmt.Errorf("must match ^[a-z0-9][a-z0-9-]*$; found %q", char)
+			}
+			continue
+		}
+		if !isLowerAlphanumeric(char) && char != '-' {
+			return fmt.Errorf("must match ^[a-z0-9][a-z0-9-]*$; found %q", char)
+		}
+	}
+	return nil
+}
+
+// ValidEnvName enforces the one environment-variable-name grammar patchbay
+// admits. It is exported because the ledger validates the config_source it
+// persists against the same rule: a Seat the registry admits must never produce
+// a record the ledger refuses, and two copies of the grammar is exactly how that
+// happens.
+func ValidEnvName(name string) error {
 	if name == "" {
-		return fmt.Errorf("empty %s key", fieldContexts)
+		return errors.New("must match ^[A-Za-z_][A-Za-z0-9_]*$: empty name")
 	}
-
-	if err := ValidContextName(name); err != nil {
-		return fmt.Errorf("context %q %w", name, err)
-	}
-
-	return nil
-}
-
-// ValidContextName reports what is wrong with a context name, or nil when
-// nothing is. It is exported because the ledger holds a stored context name to
-// exactly this rule before accepting a record: one declaration, so a name the
-// registry would never produce can never be read back as one it did.
-func ValidContextName(name string) error {
-	for _, char := range name {
-		if !isContextNameChar(char) {
-			return fmt.Errorf("must use only lowercase letters, digits and dashes; found %q", char)
+	for index, char := range name {
+		if index == 0 {
+			if !isEnvStart(char) {
+				return fmt.Errorf("must match ^[A-Za-z_][A-Za-z0-9_]*$; found %q", char)
+			}
+			continue
+		}
+		if !isEnvChar(char) {
+			return fmt.Errorf("must match ^[A-Za-z_][A-Za-z0-9_]*$; found %q", char)
 		}
 	}
-
 	return nil
 }
 
-// isContextNameChar reports whether char is one a context name may carry.
-func isContextNameChar(char rune) bool {
-	return isLowerAlphanumeric(char) || char == '-'
+func isEnvStart(char rune) bool {
+	return char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z' || char == '_'
 }
 
-// isLowerAlphanumeric reports whether char is a lowercase letter or a digit,
-// which is the core of every name rule in this file.
-func isLowerAlphanumeric(char rune) bool {
-	return (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')
+func isEnvChar(char rune) bool {
+	return isEnvStart(char) || char >= '0' && char <= '9'
 }
 
-// validateContext applies every route rule to a context's default route and to
-// each of its aliases.
-func validateContext(ctx Context) error {
-	if err := validateRoute(ctx.DefaultRoute); err != nil {
-		return fmt.Errorf("%s: %w", fieldDefaultRoute, err)
+func validateContext(id string, ctx *Context, seats map[string]Seat) error {
+	if err := requireSeat(id, "default_seat", ctx.DefaultSeat, seats); err != nil {
+		return err
 	}
-
-	return validateRoutes(ctx.Routes)
-}
-
-// validateRoutes checks every route in one context, in alias order.
-func validateRoutes(routes map[string]Route) error {
-	aliases := make([]string, 0, len(routes))
-	for alias := range routes {
-		aliases = append(aliases, alias)
-	}
-
-	sort.Strings(aliases)
-
-	for _, alias := range aliases {
-		if err := validateRoute(routes[alias]); err != nil {
-			return fmt.Errorf("alias %q: %w", alias, err)
+	for _, selector := range sortedKeys(ctx.Models) {
+		if selector == "" {
+			return fmt.Errorf("context %q models has an empty selector key", id)
+		}
+		seatID := ctx.Models[selector]
+		if err := requireSeat(
+			id,
+			fmt.Sprintf("models selector %q", selector),
+			seatID,
+			seats,
+		); err != nil {
+			return err
+		}
+		if seats[seatID].AuthMode == AuthInject &&
+			strings.Contains(strings.ToLower(selector), claudeMarker) {
+			return fmt.Errorf(
+				"context %q models selector %q cannot bind inject seat %q",
+				id,
+				selector,
+				seatID,
+			)
 		}
 	}
-
+	if ctx.Subagents == nil {
+		return nil
+	}
+	if err := requireSeat(
+		id,
+		"subagents default_seat",
+		ctx.Subagents.DefaultSeat,
+		seats,
+	); err != nil {
+		return err
+	}
+	if err := validateSubagentDestination(
+		id,
+		"subagents default",
+		ctx.Subagents.DefaultSeat,
+		seats,
+	); err != nil {
+		return err
+	}
+	for _, selector := range sortedKeys(ctx.Subagents.Models) {
+		if selector == "" {
+			return fmt.Errorf("context %q subagents models has an empty selector key", id)
+		}
+		seatID := ctx.Subagents.Models[selector]
+		if err := requireSeat(
+			id,
+			fmt.Sprintf("subagents models selector %q", selector),
+			seatID,
+			seats,
+		); err != nil {
+			return err
+		}
+		if err := validateSubagentDestination(
+			id,
+			fmt.Sprintf("subagents model %q", selector),
+			seatID,
+			seats,
+		); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// validateRoute applies every rule to a single route.
-func validateRoute(route Route) error {
-	switch route.Auth {
+func requireSeat(contextID, source, seatID string, seats map[string]Seat) error {
+	if _, ok := seats[seatID]; !ok {
+		return fmt.Errorf("context %q %s references unknown seat %q", contextID, source, seatID)
+	}
+	return nil
+}
+
+func validateSubagentDestination(contextID, source, seatID string, seats map[string]Seat) error {
+	seat := seats[seatID]
+	if seat.AuthMode == AuthInject && seat.Model == "" {
+		return fmt.Errorf(
+			"context %q %s inject seat %q requires a non-empty model rewrite",
+			contextID,
+			source,
+			seatID,
+		)
+	}
+	if seat.AuthMode == AuthInject && strings.Contains(strings.ToLower(seat.Model), claudeMarker) {
+		return fmt.Errorf(
+			"context %q %s inject seat %q model must not contain %q",
+			contextID,
+			source,
+			seatID,
+			claudeMarker,
+		)
+	}
+	return nil
+}
+
+func foreignTargets(ctx Context, seats map[string]Seat) map[string]string {
+	targets := map[string]string{}
+	defaultUpstream := seats[ctx.DefaultSeat].EffectiveUpstream()
+	for _, selector := range sortedKeys(ctx.Models) {
+		seat := seats[ctx.Models[selector]]
+		if seat.Model == "" || seat.EffectiveUpstream() == defaultUpstream {
+			continue
+		}
+		if _, exists := targets[seat.Model]; !exists {
+			targets[seat.Model] = selector
+		}
+	}
+	for _, seatID := range ctx.Models {
+		seat := seats[seatID]
+		if seat.Model != "" && seat.EffectiveUpstream() == defaultUpstream {
+			delete(targets, seat.Model)
+		}
+	}
+	return targets
+}
+
+func validateSeat(seat Seat) error {
+	if err := validateAuthFields(seat); err != nil {
+		return err
+	}
+	if seat.AuthMode != AuthSigV4 {
+		if err := validateUpstream(seat.Upstream, seat.Insecure); err != nil {
+			return err
+		}
+	}
+	if seat.MaxInputTokens < 0 {
+		return fmt.Errorf("%s must not be negative", fieldMaxInputTokens)
+	}
+	if seat.MaxOutputTokens < 0 {
+		return fmt.Errorf("%s must not be negative", fieldMaxOutputTokens)
+	}
+	return validateExtraBody(seat.ExtraBody)
+}
+
+func validateAuthFields(seat Seat) error {
+	switch seat.AuthMode {
 	case AuthForward:
-		if err := validateForward(route); err != nil {
-			return err
-		}
+		return validateForwardFields(seat)
 	case AuthInject:
-		if err := validateInject(route); err != nil {
-			return err
-		}
+		return validateInjectFields(seat)
 	case AuthSigV4:
-		if err := validateSigV4(route); err != nil {
-			return err
-		}
+		return validateSigV4Fields(seat)
 	default:
-		return fmt.Errorf("%s %q is not a valid auth mode (want %q, %q or %q)",
-			fieldAuth, route.Auth, AuthForward, AuthInject, AuthSigV4)
+		return fmt.Errorf(
+			"%s %q is not valid (want %q, %q or %q)",
+			fieldAuthMode,
+			seat.AuthMode,
+			AuthForward,
+			AuthInject,
+			AuthSigV4,
+		)
 	}
-
-	// A sigv4 route names no base_url at all — validateSigV4 refuses one — because
-	// its endpoint comes from the region it signs for.
-	if route.Auth != AuthSigV4 {
-		if err := validateBaseURL(route.BaseURL, route.Insecure); err != nil {
-			return err
-		}
-	}
-
-	if err := validateTokenCeilings(route); err != nil {
-		return err
-	}
-
-	return validateExtraBody(route.ExtraBody)
 }
 
-// validateTokenCeilings rejects a negative token ceiling. A negative
-// max_output_tokens would silently disable the proxy's clamp, and a negative
-// max_input_tokens would be advertised on /v1/models as a nonsense ceiling; a
-// ceiling is either a positive limit or absent (zero), never below zero.
-func validateTokenCeilings(route Route) error {
-	if route.MaxInputTokens < 0 {
-		return fmt.Errorf("%s must not be negative, got %d", fieldMaxInputTokens, route.MaxInputTokens)
+func validateForwardFields(seat Seat) error {
+	if seat.Upstream != anthropic.BaseURL {
+		return fmt.Errorf(
+			"forward seats must use upstream %q, got %q",
+			anthropic.BaseURL,
+			seat.Upstream,
+		)
 	}
-
-	if route.MaxOutputTokens < 0 {
-		return fmt.Errorf("%s must not be negative, got %d", fieldMaxOutputTokens, route.MaxOutputTokens)
+	if seat.APIKeyEnvFile != "" {
+		return fmt.Errorf("forward seats must not set %s", fieldKeyEnvFile)
 	}
+	return validateNoAWSFields(seat)
+}
 
+func validateInjectFields(seat Seat) error {
+	if err := ValidEnvName(seat.APIKeyEnvFile); err != nil {
+		return fmt.Errorf("inject seat %s %q %w", fieldKeyEnvFile, seat.APIKeyEnvFile, err)
+	}
+	if strings.Contains(strings.ToLower(seat.Model), claudeMarker) {
+		return fmt.Errorf("inject seat model %q must not contain %q", seat.Model, claudeMarker)
+	}
+	return validateNoAWSFields(seat)
+}
+
+func validateSigV4Fields(seat Seat) error {
+	if seat.Upstream != "" {
+		return fmt.Errorf(
+			"sigv4 seats must not set %s; endpoint derives from %s",
+			fieldUpstream,
+			fieldAWSRegion,
+		)
+	}
+	if seat.APIKeyEnvFile != "" {
+		return fmt.Errorf("sigv4 seats must not set %s", fieldKeyEnvFile)
+	}
+	if seat.Insecure {
+		return fmt.Errorf("sigv4 seats must not set %s", fieldInsecure)
+	}
+	required := []struct{ name, value string }{
+		{fieldAWSProfile, seat.AWSProfile},
+		{fieldAWSRegion, seat.AWSRegion},
+		{fieldModelMapEnvFile, seat.ModelMapEnvFile},
+	}
+	for _, field := range required {
+		if strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("sigv4 seats require a non-empty %s", field.name)
+		}
+	}
+	if err := validateAWSName(
+		fieldAWSRegion,
+		seat.AWSRegion,
+		isRegionChar,
+		regionAlphabet,
+	); err != nil {
+		return err
+	}
+	return validateAWSName(fieldAWSProfile, seat.AWSProfile, isProfileChar, profileAlphabet)
+}
+
+func validateNoAWSFields(seat Seat) error {
+	for _, field := range []struct{ name, value string }{{fieldAWSProfile, seat.AWSProfile}, {fieldAWSRegion, seat.AWSRegion}, {fieldModelMapEnvFile, seat.ModelMapEnvFile}} {
+		if field.value != "" {
+			return fmt.Errorf("%s seats must not set %s", seat.AuthMode, field.name)
+		}
+	}
 	return nil
 }
 
-// validateForward enforces the exfiltration rule: a forward route sends the
-// caller's own credentials, so it may only ever reach Anthropic, and it has no
-// business naming a key file.
-func validateForward(route Route) error {
-	if route.BaseURL != anthropic.BaseURL {
-		return fmt.Errorf("%s routes must use %s %q, got %q",
-			AuthForward, fieldBaseURL, anthropic.BaseURL, route.BaseURL)
-	}
-
-	if route.APIKeyEnvFile != "" {
-		return fmt.Errorf("%s routes must not set %s", AuthForward, fieldKeyEnvFile)
-	}
-
-	return validateNoAWSFields(route)
-}
-
-// validateSigV4 enforces what signing needs and what it forbids: a profile to
-// export credentials from, a region to sign for and reach, and a model map to
-// translate the caller's model id through — and no base_url or key file, both of
-// which would name a second, contradictory way to address or pay an upstream.
-func validateSigV4(route Route) error {
-	if route.BaseURL != "" {
-		return fmt.Errorf("%s routes must not set %s; the Bedrock endpoint is derived from %s",
-			AuthSigV4, fieldBaseURL, fieldAWSRegion)
-	}
-
-	if route.APIKeyEnvFile != "" {
-		return fmt.Errorf("%s routes must not set %s; they pay with AWS credentials",
-			AuthSigV4, fieldKeyEnvFile)
-	}
-
-	if route.Insecure {
-		return fmt.Errorf("%s routes must not set %s; the Bedrock endpoint is always https",
-			AuthSigV4, fieldInsecure)
-	}
-
-	required := []struct {
-		field string
-		value string
-	}{
-		{field: fieldAWSProfile, value: route.AWSProfile},
-		{field: fieldAWSRegion, value: route.AWSRegion},
-		{field: fieldModelMapEnvFile, value: route.ModelMapEnvFile},
-	}
-
-	for _, entry := range required {
-		if strings.TrimSpace(entry.value) == "" {
-			return fmt.Errorf("%s routes require a non-empty %s", AuthSigV4, entry.field)
-		}
-	}
-
-	if err := validateAWSName(fieldAWSRegion, route.AWSRegion, isRegionChar, regionAlphabet); err != nil {
-		return err
-	}
-
-	return validateAWSName(fieldAWSProfile, route.AWSProfile, isProfileChar, profileAlphabet)
-}
-
-// validateAWSName holds an AWS region or profile to the characters it may
-// carry. Both end up in something a request is built from — the region derives
-// the endpoint host and the profile is exported to the aws CLI's environment —
-// so a value that could carry a host, a path or an argument of its own is
-// refused here rather than interpreted later.
 func validateAWSName(field, value string, allowed func(rune) bool, alphabet string) error {
 	for _, char := range value {
 		if !allowed(char) {
 			return fmt.Errorf("%s %q must use only %s; found %q", field, value, alphabet, char)
 		}
 	}
-
 	return nil
 }
-
-// isRegionChar reports whether char is one an AWS region name may carry.
-func isRegionChar(char rune) bool {
-	return isLowerAlphanumeric(char) || char == '-'
+func isRegionChar(char rune) bool  { return isLowerAlphanumeric(char) || char == '-' }
+func isProfileChar(char rune) bool { return isRegionChar(char) || char == '.' || char == '_' }
+func isLowerAlphanumeric(char rune) bool {
+	return (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')
 }
 
-// isProfileChar reports whether char is one an AWS profile name may carry.
-// Profiles legitimately hold dots and underscores — an SSO profile named
-// "acme_prod.admin" is ordinary — so those are allowed on top of the region's
-// alphabet, and nothing else is.
-func isProfileChar(char rune) bool {
-	return isRegionChar(char) || char == '.' || char == '_'
-}
-
-// validateNoAWSFields refuses the sigv4-only fields on a route that does not
-// sign: a forward or inject route that names an AWS profile is one whose author
-// expected signing that will never happen.
-func validateNoAWSFields(route Route) error {
-	forbidden := []struct {
-		field string
-		value string
-	}{
-		{field: fieldAWSProfile, value: route.AWSProfile},
-		{field: fieldAWSRegion, value: route.AWSRegion},
-		{field: fieldModelMapEnvFile, value: route.ModelMapEnvFile},
-	}
-
-	for _, entry := range forbidden {
-		if entry.value != "" {
-			return fmt.Errorf("%s routes must not set %s, which only %s routes use",
-				route.Auth, entry.field, AuthSigV4)
-		}
-	}
-
-	return nil
-}
-
-// validateInject enforces the misbilling rule: a route paid for with a foreign
-// key must not present itself as a Claude model, in its alias or its rewrite
-// target, and it needs a key file to inject from.
-func validateInject(route Route) error {
-	if route.APIKeyEnvFile == "" {
-		return fmt.Errorf("%s routes require a non-empty %s", AuthInject, fieldKeyEnvFile)
-	}
-
-	if strings.Contains(strings.ToLower(route.Alias), claudeMarker) {
-		return fmt.Errorf("%s routes must not reference %q; found it in the alias",
-			AuthInject, claudeMarker)
-	}
-
-	if strings.Contains(strings.ToLower(route.Model), claudeMarker) {
-		return fmt.Errorf("%s routes must not reference %q; found it in %s %q",
-			AuthInject, claudeMarker, fieldModel, route.Model)
-	}
-
-	return validateNoAWSFields(route)
-}
-
-// validateBaseURL requires an absolute https URL. Plain http is allowed for
-// loopback, where there is no network to eavesdrop on, and for a route that
-// declares insecure — the operator accepting the eavesdroppable link in the
-// registry itself, typically for a model server on their own LAN.
-func validateBaseURL(raw string, insecure bool) error {
+func validateUpstream(raw string, insecure bool) error {
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("%s %q is not a valid URL: %w", fieldBaseURL, raw, err)
+		return fmt.Errorf("%s %q is not a valid URL: %w", fieldUpstream, raw, err)
 	}
-
 	if !parsed.IsAbs() || parsed.Host == "" {
-		return fmt.Errorf("%s %q must be an absolute URL with a scheme and host", fieldBaseURL, raw)
+		return fmt.Errorf(
+			"%s %q must be an absolute URL with a scheme and host",
+			fieldUpstream,
+			raw,
+		)
 	}
-
 	switch parsed.Scheme {
 	case "https":
 		if insecure {
-			return fmt.Errorf("%s is set but %s %q already uses https",
-				fieldInsecure, fieldBaseURL, raw)
+			return fmt.Errorf(
+				"%s is set but %s %q already uses https",
+				fieldInsecure,
+				fieldUpstream,
+				raw,
+			)
 		}
-
-		return nil
 	case "http":
-		if host := parsed.Hostname(); host == loopbackHost || host == localhostHost {
+		host := parsed.Hostname()
+		if host == loopbackHost || host == localhostHost {
 			if insecure {
-				return fmt.Errorf("%s is set but %s %q is loopback, where http is already allowed",
-					fieldInsecure, fieldBaseURL, raw)
+				return fmt.Errorf(
+					"%s is set but %s %q is loopback",
+					fieldInsecure,
+					fieldUpstream,
+					raw,
+				)
 			}
 		} else if !insecure {
-			return fmt.Errorf("%s %q may only use http for %s or %s, or with %s set",
-				fieldBaseURL, raw, loopbackHost, localhostHost, fieldInsecure)
+			return fmt.Errorf(
+				"%s %q may only use http for loopback or with %s",
+				fieldUpstream,
+				raw,
+				fieldInsecure,
+			)
 		}
-
-		return nil
 	default:
-		return fmt.Errorf("%s %q must use https", fieldBaseURL, raw)
+		return fmt.Errorf("%s %q must use https", fieldUpstream, raw)
 	}
+	return nil
 }
 
-// validateExtraBody requires a JSON object, since the proxy merges it into the
-// request object at forward time. An absent extra_body is fine.
+// validateExtraBody holds the one arbitrary document a Seat carries to the two
+// rules that apply to it.
+//
+// Its keys are not schema-known — an operator merges whatever the provider
+// takes — so nothing here judges a name or a value. What it must be is an
+// object, because that is what merging over a request means, and canonical: a
+// repeated member is two values under one key, and the merge would carry
+// whichever the decoder happened to keep, at the root or anywhere below it.
 func validateExtraBody(body json.RawMessage) error {
 	if len(body) == 0 {
 		return nil
 	}
-
-	if trimmed := bytes.TrimSpace(body); len(trimmed) == 0 || trimmed[0] != '{' {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return fmt.Errorf("%s must be a JSON object", fieldExtraBody)
 	}
-
+	if err := jsonstrict.RejectDuplicateNames(body); err != nil {
+		return fmt.Errorf("%s: %w", fieldExtraBody, err)
+	}
 	return nil
 }
