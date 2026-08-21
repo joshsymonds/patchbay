@@ -16,6 +16,7 @@ import (
 	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/registry"
 	"github.com/joshsymonds/patchbay/internal/server"
+	"github.com/joshsymonds/patchbay/internal/testlog"
 )
 
 // requestDeadline bounds a single upstream call made from a test. Every
@@ -246,7 +247,7 @@ func TestHotInvalidRegistryTellsTheOperatorWhatTheCallerIsNotTold(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	sink := newLogSink()
+	sink := testlog.New(callBuffer)
 	records := make(chan ledger.Record, callBuffer)
 	pipeline := proxy.New(proxy.Config{
 		Registry: reg,
@@ -261,7 +262,7 @@ func TestHotInvalidRegistryTellsTheOperatorWhatTheCallerIsNotTold(t *testing.T) 
 		Proxy:    pipeline,
 		Registry: reg,
 		Client:   deadClient(),
-		Logger:   sink.logger(),
+		Logger:   sink.Logger(),
 	})
 
 	ask := func(method, target, body string) *httptest.ResponseRecorder {
@@ -284,10 +285,10 @@ func TestHotInvalidRegistryTellsTheOperatorWhatTheCallerIsNotTold(t *testing.T) 
 			t.Fatalf("a refusal republished the rejected file: %s", rec.Body.String())
 		}
 	}
-	reported := func(want int) []logEntry {
+	reported := func(want int) []testlog.Entry {
 		t.Helper()
 
-		got := sink.matching(operatorInvalidMessage)
+		got := sink.Matching(operatorInvalidMessage)
 		if len(got) != want {
 			t.Fatalf("operator log holds %d %q entries; want %d\n%s",
 				len(got), operatorInvalidMessage, want, sink)
@@ -301,12 +302,12 @@ func TestHotInvalidRegistryTellsTheOperatorWhatTheCallerIsNotTold(t *testing.T) 
 	refused(ask(http.MethodPost, "/v1/messages", `{"model":"claude-opus-5"}`))
 
 	entry := reported(1)[0]
-	if !entry.operatorVisible() {
-		t.Errorf("operator log %q is quieter than a warning", entry.text())
+	if !entry.OperatorVisible() {
+		t.Errorf("operator log %q is quieter than a warning", entry.Text())
 	}
 	for _, detail := range []string{reg.Path(), rejectedValue, "api_key_env_file"} {
-		if !strings.Contains(entry.attrs, detail) {
-			t.Errorf("operator log %q keeps no %q", entry.text(), detail)
+		if !strings.Contains(entry.Attrs(), detail) {
+			t.Errorf("operator log %q keeps no %q", entry.Text(), detail)
 		}
 	}
 
@@ -369,8 +370,8 @@ func TestHotInvalidRegistryTellsTheOperatorWhatTheCallerIsNotTold(t *testing.T) 
 
 	refused(ask(http.MethodPost, "/v1/messages", `{"model":"claude-opus-5"}`))
 
-	if successor := reported(3)[2]; !strings.Contains(successor.attrs, secondRejectedValue) {
-		t.Errorf("operator log %q keeps no %q", successor.text(), secondRejectedValue)
+	if successor := reported(3)[2]; !strings.Contains(successor.Attrs(), secondRejectedValue) {
+		t.Errorf("operator log %q keeps no %q", successor.Text(), secondRejectedValue)
 	}
 
 	// Repaired again, and this time the only request that sees the repair names a

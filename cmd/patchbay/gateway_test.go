@@ -5,8 +5,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"io"
-	"log/slog"
-	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +17,7 @@ import (
 
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/registry"
+	"github.com/joshsymonds/patchbay/internal/testlog"
 )
 
 const testRegistry = `{"default_context":"personal","seats":{` +
@@ -59,134 +58,6 @@ func writeFile(t *testing.T, path, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// boundAttr is one attribute bound into a logger, remembered together with the
-// groups that were open when it was bound. slog renders such an attribute under
-// that scope and no other, so a group opened later must not reach back and
-// regroup it.
-type boundAttr struct {
-	groups []string
-	attr   slog.Attr
-}
-
-// logRecorder is a slog handler that keeps every line with its attributes, so a
-// test can wait for one and read what it carried — the bound port, above all.
-//
-// It is one handler's view of a shared channel: the attributes bound into this
-// handler, each under the scope it was bound in, and the group stack its
-// records' own attributes belong to. Both are immutable — WithAttrs and
-// WithGroup hand back a new recorder over the same channel rather than editing
-// this one — which is what keeps a derived logger from disturbing the logger it
-// came from, and what stops the gateway's logger-bound attributes from being
-// silently thrown away.
-type logRecorder struct {
-	lines  chan map[string]string
-	attrs  []boundAttr
-	groups []string
-}
-
-func newLogRecorder() *logRecorder {
-	return &logRecorder{lines: make(chan map[string]string, lineBuffer)}
-}
-func (*logRecorder) Enabled(context.Context, slog.Level) bool { return true }
-
-// Handle records one line, dropping it rather than blocking when the buffer is
-// full. The gateway logs from its own goroutines — startup, a request being
-// served, a shutdown — so a blocking send here would stop the process under
-// test rather than the test.
-//
-// The attributes bound into this handler come first, each under the scope it was
-// bound in, then the record's own under the scope it was written in.
-func (l *logRecorder) Handle(_ context.Context, r slog.Record) error {
-	attrs := map[string]string{"message": r.Message}
-	for _, bound := range l.attrs {
-		recordAttr(attrs, bound.groups, bound.attr)
-	}
-	r.Attrs(func(a slog.Attr) bool { recordAttr(attrs, l.groups, a); return true })
-	select {
-	case l.lines <- attrs:
-	default:
-	}
-	return nil
-}
-
-// WithAttrs binds attrs into a new recorder, stamped with the group scope they
-// were bound under.
-func (l *logRecorder) WithAttrs(attrs []slog.Attr) slog.Handler {
-	if len(attrs) == 0 {
-		return l
-	}
-	bound := make([]boundAttr, 0, len(l.attrs)+len(attrs))
-	bound = append(bound, l.attrs...)
-	for _, attr := range attrs {
-		bound = append(bound, boundAttr{groups: l.groups, attr: attr})
-	}
-	return &logRecorder{lines: l.lines, attrs: bound, groups: l.groups}
-}
-
-// WithGroup opens a group in a new recorder. The stack is copied rather than
-// appended to, so a recorder that derives twice does not hand both children the
-// same backing array.
-func (l *logRecorder) WithGroup(name string) slog.Handler {
-	if name == "" {
-		return l
-	}
-	groups := make([]string, len(l.groups)+1)
-	copy(groups, l.groups)
-	groups[len(l.groups)] = name
-	return &logRecorder{lines: l.lines, attrs: l.attrs, groups: groups}
-}
-
-// recordAttr writes one attribute into a line under the key the groups it
-// belongs to give it. A group-valued attribute is expanded into its members
-// rather than kept as one opaque value — which is what leaves a test able to
-// read a detail the gateway logged inside a group — and a group with an empty
-// key opens no scope of its own, exactly as slog inlines such a group into the
-// level around it.
-func recordAttr(line map[string]string, groups []string, attr slog.Attr) {
-	value := attr.Value.Resolve()
-	if value.Kind() != slog.KindGroup {
-		line[qualifiedKey(groups, attr.Key)] = value.String()
-		return
-	}
-	nested := groups
-	if attr.Key != "" {
-		nested = make([]string, len(groups)+1)
-		copy(nested, groups)
-		nested[len(groups)] = attr.Key
-	}
-	for _, member := range value.Group() {
-		recordAttr(line, nested, member)
-	}
-}
-
-// qualifiedKey names an attribute by the groups it sits under, dotted the way
-// slog's own handlers name one.
-func qualifiedKey(groups []string, key string) string {
-	if len(groups) == 0 {
-		return key
-	}
-	return strings.Join(groups, ".") + "." + key
-}
-
-// waitFor returns the attributes of the first line logged with message, and
-// fails naming the line that never came once the deadline passes. Ranging over
-// the channel instead would wait forever on a gateway that stopped logging.
-func (l *logRecorder) waitFor(t *testing.T, message string) map[string]string {
-	t.Helper()
-	deadline := time.After(waitDeadline)
-	for {
-		select {
-		case line := <-l.lines:
-			if line["message"] == message {
-				return line
-			}
-		case <-deadline:
-			t.Fatalf("log message %q never arrived within %s", message, waitDeadline)
-			return nil
-		}
 	}
 }
 
@@ -282,7 +153,7 @@ func routes(events []stubEvent) []string {
 // client every request in this file goes through, and how to stop it.
 type runningGateway struct {
 	base   string
-	logs   *logRecorder
+	logs   *testlog.Capture
 	client *http.Client
 	stop   func()
 }
@@ -297,7 +168,7 @@ type runningGateway struct {
 // this test rather than hang the suite behind it.
 func startGateway(t *testing.T, registryPath, ledgerDir string, client *http.Client) *runningGateway {
 	t.Helper()
-	logs := newLogRecorder()
+	logs := testlog.New(lineBuffer)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan int, 1)
 	go func() {
@@ -310,11 +181,11 @@ func startGateway(t *testing.T, registryPath, ledgerDir string, client *http.Cli
 				envLedgerDir: ledgerDir,
 			}),
 			client: client,
-			logger: slog.New(logs),
+			logger: logs.Logger(),
 		})
 	}()
 
-	addr := logs.waitFor(t, "patchbay listening")["listen"]
+	addr := logs.WaitFor(t, "patchbay listening", waitDeadline)["listen"]
 	if addr == "" {
 		t.Fatal("the listening log named no address")
 	}
@@ -623,7 +494,7 @@ func assertServesWithoutALedger(t *testing.T, dir, registryPath string, stub *st
 	gw := startGateway(t, registryPath, filepath.Join(blocker, "ledger"), stub.client(t))
 	defer gw.stop()
 
-	gw.logs.waitFor(t, "ledger unavailable; requests will not be recorded")
+	gw.logs.WaitFor(t, "ledger unavailable; requests will not be recorded", waitDeadline)
 
 	status, body := gw.post(t, "/v1/messages")
 	if status != http.StatusOK {
@@ -658,76 +529,5 @@ func TestShippedExamplesUseStrictSeatRegistries(t *testing.T) {
 				t.Fatalf("registry.New(%q) = %v", path, err)
 			}
 		})
-	}
-}
-
-func TestServeSubcommandBindsOnlyAfterValidRegistry(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "registry.json")
-	writeFile(t, path, testRegistry)
-	gw := startGateway(t, path, filepath.Join(dir, "ledger"), nil)
-	gw.stop()
-}
-
-// TestLogRecorderHonorsHandlerDerivation pins the recorder's own contract,
-// because every assertion this file makes about what a running gateway logged is
-// only as true as the handler underneath it. slog hands a handler its
-// logger-bound attributes through WithAttrs and its group scope through
-// WithGroup, and a recorder that answers either by returning itself throws both
-// away — after which a gateway that stopped logging half of what it logs still
-// looks correct here.
-//
-// The grouping is point-in-time: an attribute is recorded under the groups that
-// were open when it was bound, so a group opened afterwards must not reach back
-// and regroup it. A record's own attributes belong to the group stack in effect
-// where it was written, a group-valued attribute keeps its members rather than
-// collapsing into one opaque value, and every recorder derived from one shares
-// that one's channel — which is what lets a test read what a logger three
-// derivations down wrote.
-func TestLogRecorderHonorsHandlerDerivation(t *testing.T) {
-	t.Parallel()
-
-	logs := newLogRecorder()
-	logger := slog.New(logs).
-		With(slog.String("version", "test")).
-		WithGroup("request").
-		With(
-			slog.String("method", "GET"),
-			slog.Group("route", slog.String("context", "personal"), slog.Int("seats", 2)),
-		).
-		WithGroup("upstream")
-
-	logger.Info("derived", slog.String("listen", "127.0.0.1:8080"))
-
-	// version stays unqualified because it was bound before any group opened;
-	// method and route sit under request and not under upstream, which opened
-	// after them; the record's own attribute sits under the whole stack.
-	want := map[string]string{
-		"message":                 "derived",
-		"version":                 "test",
-		"request.method":          "GET",
-		"request.route.context":   "personal",
-		"request.route.seats":     "2",
-		"request.upstream.listen": "127.0.0.1:8080",
-	}
-	if got := logs.waitFor(t, "derived"); !maps.Equal(got, want) {
-		t.Errorf("derived line = %v; want %v", got, want)
-	}
-
-	// A sibling derived from the same recorder writes into the same channel and
-	// inherits nothing from the logger above: derivation copies a handler, it
-	// does not edit the one it came from.
-	slog.New(logs).With(slog.String("seat", "luna")).Info("sibling")
-
-	sibling := map[string]string{"message": "sibling", "seat": "luna"}
-	if got := logs.waitFor(t, "sibling"); !maps.Equal(got, sibling) {
-		t.Errorf("sibling line = %v; want %v", got, sibling)
-	}
-
-	// And the recorder itself is undisturbed by everything derived from it.
-	slog.New(logs).Info("bare")
-
-	if got := logs.waitFor(t, "bare"); !maps.Equal(got, map[string]string{"message": "bare"}) {
-		t.Errorf("bare line = %v; want only its message", got)
 	}
 }

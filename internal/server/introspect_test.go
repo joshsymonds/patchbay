@@ -12,6 +12,7 @@ import (
 
 	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/server"
+	"github.com/joshsymonds/patchbay/internal/testlog"
 )
 
 const (
@@ -173,11 +174,11 @@ func TestBareIntrospectionReportsTheInvalidRegistryOnlyForAKeyedCaller(t *testin
 			}
 			replaceRegistryFile(t, reg.Path(), secretRegistry, base.Add(time.Hour))
 
-			sink := newLogSink()
+			sink := testlog.New(callBuffer)
 			rec := serve(t, server.Config{
 				Proxy:    newSentinel(),
 				Registry: reg,
-				Logger:   sink.logger(),
+				Logger:   sink.Logger(),
 			}, introspectRequest(tc.key))
 
 			if rec.Code != tc.want {
@@ -187,7 +188,7 @@ func TestBareIntrospectionReportsTheInvalidRegistryOnlyForAKeyedCaller(t *testin
 				t.Errorf("the answer republished a rejected value: %s", rec.Body.String())
 			}
 
-			got := sink.matching(operatorInvalidMessage)
+			got := sink.Matching(operatorInvalidMessage)
 			if len(got) != tc.report {
 				t.Fatalf("operator log holds %d %q entries; want %d\n%s",
 					len(got), operatorInvalidMessage, tc.report, sink)
@@ -196,12 +197,12 @@ func TestBareIntrospectionReportsTheInvalidRegistryOnlyForAKeyedCaller(t *testin
 				return
 			}
 
-			if !got[0].operatorVisible() {
-				t.Errorf("operator log %q is quieter than a warning", got[0].text())
+			if !got[0].OperatorVisible() {
+				t.Errorf("operator log %q is quieter than a warning", got[0].Text())
 			}
 			for _, detail := range []string{reg.Path(), rejectedValue, "api_key_env_file"} {
-				if !strings.Contains(got[0].attrs, detail) {
-					t.Errorf("operator log %q keeps no %q", got[0].text(), detail)
+				if !strings.Contains(got[0].Attrs(), detail) {
+					t.Errorf("operator log %q keeps no %q", got[0].Text(), detail)
 				}
 			}
 			if doc := decodeDocument(t, rec.Body.Bytes()); doc.RegistryValid ||
@@ -225,12 +226,12 @@ func TestIntrospectionOnAValidRegistryForgetsTheReportedFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sink := newLogSink()
+	sink := testlog.New(callBuffer)
 	// One handler throughout: what it has already reported is the thing under test.
 	handler := server.Handler(server.Config{
 		Proxy:    newSentinel(),
 		Registry: reg,
-		Logger:   sink.logger(),
+		Logger:   sink.Logger(),
 	})
 	ask := func() server.Document {
 		t.Helper()
@@ -247,7 +248,7 @@ func TestIntrospectionOnAValidRegistryForgetsTheReportedFailure(t *testing.T) {
 	reported := func(want int) {
 		t.Helper()
 
-		if got := sink.matching(operatorInvalidMessage); len(got) != want {
+		if got := sink.Matching(operatorInvalidMessage); len(got) != want {
 			t.Fatalf("operator log holds %d %q entries; want %d\n%s",
 				len(got), operatorInvalidMessage, want, sink)
 		}
