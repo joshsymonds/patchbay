@@ -232,6 +232,12 @@ and fsynced; a ledger that fails costs the record and nothing else. The schema
 has no field for headers of any kind, so no credential can land in it. See
 [docs/ledger.md](docs/ledger.md).
 
+`PATCHBAY_LEDGER_DIR` overrides the ledger directory. `PATCHBAY_USAGE_DB`
+overrides the durable accounting database, which defaults to
+`$XDG_STATE_HOME/patchbay/usage.sqlite` (or
+`$HOME/.local/state/patchbay/usage.sqlite`). Unlike the ledger, Patchbay will
+not start if the accounting database cannot be opened.
+
 ## Security model
 
 patchbay binds `127.0.0.1:4100` by default, and that default matters: the

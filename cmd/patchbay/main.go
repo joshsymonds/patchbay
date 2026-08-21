@@ -6,8 +6,8 @@
 // The gateway itself is configured entirely by environment, with no flags,
 // because deployment is declarative: the unit file is generated, not typed.
 // Everything it needs has a default that works on a machine where nothing has
-// been set up, and nothing it needs is fatal except the socket it was asked to
-// listen on.
+// been set up. The usage database, hostname, and socket are required to serve;
+// a registry or ledger failure leaves the built-in route available without them.
 //
 // The subcommands are the other half. "patchbay serve" is the daemon; every
 // other subcommand answers a question an operator would otherwise answer by
@@ -37,6 +37,7 @@ import (
 	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/registry"
 	"github.com/joshsymonds/patchbay/internal/server"
+	"github.com/joshsymonds/patchbay/internal/usage"
 )
 
 // The process exit codes: nothing went wrong, something did, or the command
@@ -83,6 +84,7 @@ const (
 	envListen    = "PATCHBAY_LISTEN"
 	envRegistry  = "PATCHBAY_REGISTRY"
 	envLedgerDir = "PATCHBAY_LEDGER_DIR"
+	envUsageDB   = "PATCHBAY_USAGE_DB"
 	envConfigXDG = "XDG_CONFIG_HOME"
 	envStateXDG  = "XDG_STATE_HOME"
 	envHome      = "HOME"
@@ -97,6 +99,7 @@ const (
 	registryFile   = "routes.json"
 	appDir         = "patchbay"
 	ledgerLeafDir  = "ledger"
+	usageLeafFile  = "usage.sqlite"
 	configHomeTail = ".config"
 	stateHomeTail  = ".local/state"
 )
@@ -124,6 +127,7 @@ type config struct {
 	listen    string
 	registry  string
 	ledgerDir string
+	usageDB   string
 }
 
 // cli is everything one invocation needs from the process it runs in. A test
@@ -234,20 +238,47 @@ func (c cli) serve(ctx context.Context) int {
 }
 
 // serveGateway starts the gateway and serves until ctx is canceled. It returns an error
-// only for a failure that leaves nothing to serve: a configuration that cannot
-// be resolved, or a socket that cannot be bound. Everything else degrades — a
-// registry that will not parse costs the aliases, a ledger that will not open
-// costs the records — because a gateway that refuses to start is worse for the
-// caller than one that starts diminished.
+// only for a failure that leaves nothing to serve: a configuration or hostname
+// that cannot be resolved, a usage database that cannot be opened, or a socket
+// that cannot be bound. A registry that will not parse costs the aliases, and a
+// ledger that will not open costs the records; accounting is the durable evidence that
+// upstream contact is allowed, so it is required before serving.
 //
 // client is the upstream HTTP client both halves of the gateway use. A nil
 // client means each package builds its own default, which is what production
 // passes; a test passes one that never leaves the machine.
 func serveGateway(ctx context.Context, lookupEnv lookupEnvFunc, logger *slog.Logger, client *http.Client) error {
+	return serveGatewayWithHostname(ctx, lookupEnv, logger, client, os.Hostname)
+}
+
+func serveGatewayWithHostname(
+	ctx context.Context,
+	lookupEnv lookupEnvFunc,
+	logger *slog.Logger,
+	client *http.Client,
+	lookupHostname func() (string, error),
+) error {
 	cfg, err := resolveConfig(lookupEnv)
 	if err != nil {
 		return err
 	}
+
+	host, hostnameErr := lookupHostname()
+	if hostnameErr != nil {
+		return fmt.Errorf("resolve hostname: %w", hostnameErr)
+	}
+	if host == "" {
+		return errors.New("resolve hostname: hostname is empty")
+	}
+
+	usageStore, usageErr := usage.Open(cfg.usageDB)
+	if usageErr != nil {
+		return fmt.Errorf("open usage database %s: %w", cfg.usageDB, usageErr)
+	}
+	// Registered before drainRecords below, so LIFO defer order closes the usage
+	// store only after Drain returns. Rows still pending at a bounded drain timeout
+	// are the durable, auditable crash-equivalent signal for later inspection.
+	defer closeUsage(ctx, usageStore, logger)
 
 	var listen net.ListenConfig
 
@@ -279,13 +310,17 @@ func serveGateway(ctx context.Context, lookupEnv lookupEnvFunc, logger *slog.Log
 		defer closeLedger(ctx, led, logger)
 	}
 
-	pipeline := proxy.New(proxy.Config{
-		Registry: reg,
-		Recorder: recorder,
-		Client:   client,
-		Logger:   logger,
-		Host:     hostname(ctx, logger),
+	pipeline, proxyErr := proxy.New(proxy.Config{
+		Registry:   reg,
+		Recorder:   recorder,
+		Accountant: usageStore,
+		Client:     client,
+		Logger:     logger,
+		Host:       host,
 	})
+	if proxyErr != nil {
+		return fmt.Errorf("construct proxy: %w", proxyErr)
+	}
 
 	// Deferred after the ledger's own close so it runs before it: records are
 	// written off the request path, and closing the ledger under one loses it.
@@ -321,6 +356,7 @@ func resolveConfig(lookupEnv lookupEnvFunc) (config, error) {
 		listen:    valueOr(lookupEnv, envListen, defaultListen),
 		registry:  value(lookupEnv, envRegistry),
 		ledgerDir: value(lookupEnv, envLedgerDir),
+		usageDB:   value(lookupEnv, envUsageDB),
 	}
 
 	if cfg.registry == "" {
@@ -332,13 +368,18 @@ func resolveConfig(lookupEnv lookupEnvFunc) (config, error) {
 		cfg.registry = found
 	}
 
-	if cfg.ledgerDir == "" {
+	if cfg.ledgerDir == "" || cfg.usageDB == "" {
 		base, err := baseDir(lookupEnv, envStateXDG, stateHomeTail)
 		if err != nil {
-			return config{}, fmt.Errorf("resolve the ledger directory: %w", err)
+			return config{}, fmt.Errorf("resolve the state directory: %w", err)
 		}
 
-		cfg.ledgerDir = filepath.Join(base, appDir, ledgerLeafDir)
+		if cfg.ledgerDir == "" {
+			cfg.ledgerDir = filepath.Join(base, appDir, ledgerLeafDir)
+		}
+		if cfg.usageDB == "" {
+			cfg.usageDB = filepath.Join(base, appDir, usageLeafFile)
+		}
 	}
 
 	return cfg, nil
@@ -426,18 +467,11 @@ func closeLedger(ctx context.Context, led *ledger.Ledger, logger *slog.Logger) {
 	}
 }
 
-// hostname is the machine name stamped on every ledger record. A machine that
-// cannot name itself costs the records — the ledger rejects one with no host —
-// and nothing else, which is the same bargain every other ledger failure makes.
-func hostname(ctx context.Context, logger *slog.Logger) string {
-	host, err := os.Hostname()
-	if err != nil {
-		logger.ErrorContext(ctx, "hostname unavailable; records will be rejected", slog.Any("error", err))
-
-		return ""
+// closeUsage releases the usage store after record goroutines have drained.
+func closeUsage(ctx context.Context, store *usage.Store, logger *slog.Logger) {
+	if err := store.Close(); err != nil {
+		logger.ErrorContext(ctx, "closing the usage database failed", slog.Any("error", err))
 	}
-
-	return host
 }
 
 // serve runs the HTTP server on listener until ctx is canceled, then gives

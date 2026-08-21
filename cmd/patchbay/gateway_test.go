@@ -202,6 +202,7 @@ func startGateway(t *testing.T, registryPath, ledgerDir string, client *http.Cli
 				"PATCHBAY_LISTEN":     "127.0.0.1:0",
 				"PATCHBAY_REGISTRY":   registryPath,
 				"PATCHBAY_LEDGER_DIR": ledgerDir,
+				"PATCHBAY_USAGE_DB":   filepath.Join(filepath.Dir(filepath.Dir(ledgerDir)), "usage.sqlite"),
 			}),
 			client: client,
 			logger: slog.New(logs),

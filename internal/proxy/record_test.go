@@ -455,10 +455,11 @@ func TestOversizedResponseDropsCaptureNotStream(t *testing.T) {
 	})
 	recorder := newRecorder()
 
-	gateway := httptest.NewServer(proxy.New(proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
-		Recorder: recorder,
-		Host:     testHost,
+	gateway := httptest.NewServer(newProxy(t, proxy.Config{
+		Registry:   newRegistry(t, identityRoute(stub.url())),
+		Recorder:   recorder,
+		Host:       testHost,
+		Accountant: permissiveAccountant{},
 	}))
 	t.Cleanup(gateway.Close)
 

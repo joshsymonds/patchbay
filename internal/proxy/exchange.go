@@ -52,6 +52,9 @@ type exchange struct {
 	durationMS      int64
 	requestBody     string
 	errorBody       string
+
+	accountingID         int64
+	accountingDispatched bool
 }
 
 // newExchange starts recording a request that arrived at start in the named
@@ -67,7 +70,7 @@ func newExchange(
 		route:           route,
 		context:         ctxName,
 		credentialClass: credentialClass,
-		requestModel:    requestModel,
+		requestModel:    namedModel(requestModel),
 		start:           start,
 		status:          0,
 		contentType:     "",

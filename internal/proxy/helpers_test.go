@@ -21,6 +21,7 @@ import (
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/registry"
+	"github.com/joshsymonds/patchbay/internal/usage"
 )
 
 const (
@@ -398,13 +399,44 @@ func (s *logSink) waitFor(t *testing.T, want string) {
 	}
 }
 
+// permissiveAccountant lets existing proxy tests exercise their own behavior
+// without coupling to the durable-store assertions in accounting_test.go.
+type permissiveAccountant struct{}
+
+func (permissiveAccountant) InsertPending(context.Context, usage.PendingRequest) (int64, error) {
+	return 1, nil
+}
+
+func (permissiveAccountant) MarkUpstreamDispatched(context.Context, int64, time.Time) error {
+	return nil
+}
+
+func (permissiveAccountant) Finalize(context.Context, int64, usage.FinalizedRequest) error {
+	return nil
+}
+
+func newProxy(t *testing.T, cfg proxy.Config) *proxy.Proxy {
+	t.Helper()
+
+	if cfg.Accountant == nil {
+		cfg.Accountant = permissiveAccountant{}
+	}
+
+	pipeline, err := proxy.New(cfg)
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+
+	return pipeline
+}
+
 // serve runs one request through a proxy built from cfg and returns the
 // recorder holding the response.
 func serve(t *testing.T, cfg proxy.Config, req *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
 
 	rec := httptest.NewRecorder()
-	proxy.New(cfg).ServeHTTP(rec, req)
+	newProxy(t, cfg).ServeHTTP(rec, req)
 
 	return rec
 }

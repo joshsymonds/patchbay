@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/joshsymonds/patchbay/internal/anthropic"
@@ -95,6 +96,10 @@ type Config struct {
 	// and changes nothing else.
 	Recorder Recorder
 
+	// Accountant durably tracks every routed request. It is required: upstream
+	// contact is forbidden until its pending and dispatch evidence are persisted.
+	Accountant Accountant
+
 	// Client is the upstream HTTP client. A nil Client gets an internal default
 	// with connection timeouts and no overall deadline, since streams run long.
 	Client *http.Client
@@ -111,11 +116,12 @@ type Config struct {
 // use: every request carries its own state, and the only shared values are the
 // registry and the client, which are themselves concurrent.
 type Proxy struct {
-	registry *registry.Registry
-	recorder Recorder
-	client   *http.Client
-	host     string
-	logger   *slog.Logger
+	registry   *registry.Registry
+	recorder   Recorder
+	accountant Accountant
+	client     *http.Client
+	host       string
+	logger     *slog.Logger
 
 	// credentials exports and caches the AWS credentials sigv4 routes sign with,
 	// one cache per profile shared by every request that rides one.
@@ -124,10 +130,18 @@ type Proxy struct {
 	// pending counts the record goroutines still in flight, so a host process
 	// can wait for them instead of closing the ledger out from under one.
 	pending sync.WaitGroup
+
+	// inFlight is the current number of record goroutines. It is only diagnostic:
+	// Drain still relies on pending for the wait itself.
+	inFlight atomic.Int64
 }
 
 // New returns a Proxy serving cfg.
-func New(cfg Config) *Proxy {
+func New(cfg Config) (*Proxy, error) {
+	if cfg.Accountant == nil {
+		return nil, errors.New("proxy accountant is required")
+	}
+
 	client := cfg.Client
 	if client == nil {
 		client = defaultClient()
@@ -141,11 +155,12 @@ func New(cfg Config) *Proxy {
 	return &Proxy{
 		registry:    cfg.Registry,
 		recorder:    cfg.Recorder,
+		accountant:  cfg.Accountant,
 		client:      client,
 		host:        cfg.Host,
 		logger:      logger,
 		credentials: awssig.NewCredentialSource(),
-	}
+	}, nil
 }
 
 // ServeHTTP runs one request through the pipeline: read it, resolve its route,
@@ -199,6 +214,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route := res.Route
 	exch := newExchange(route, res.Context, class, requestModel, start)
 
+	if accountingErr := p.insertPending(r.Context(), r, exch); accountingErr != nil {
+		p.abort(r.Context(), w, exch, accountingErr)
+
+		return
+	}
+
 	if route.Auth == registry.AuthForward {
 		if credentialErr := credential.forwardError(); credentialErr != nil {
 			p.abort(r.Context(), w, exch, credentialErr)
@@ -226,6 +247,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sent := time.Now()
+	if accountingErr := p.markDispatched(r.Context(), exch, sent); accountingErr != nil {
+		p.abort(r.Context(), w, exch, accountingErr)
+
+		return
+	}
 
 	resp, sendErr := p.send(r, route, upstreamBody, req, generation)
 	if sendErr != nil {
@@ -234,6 +260,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	p.relayResponse(r.Context(), w, route, resp, exch, sent)
+}
+
+func (p *Proxy) relayResponse(
+	ctx context.Context,
+	w http.ResponseWriter,
+	route registry.Route,
+	resp *http.Response,
+	exch *exchange,
+	sent time.Time,
+) {
 	defer resp.Body.Close()
 
 	exch.upstreamMS = millis(time.Since(sent))
@@ -241,18 +278,46 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	exch.contentType = resp.Header.Get(anthropic.HeaderContentType)
 
 	var capt *capture
-
 	if isBedrockStream(route, resp) {
 		// The caller is handed Anthropic SSE, so that — not the event-stream
 		// framing it arrived in — is what the record is summarized from.
 		exch.contentType = eventStreamType
-		capt = p.streamBedrock(r.Context(), w, resp)
+		capt = p.streamBedrock(ctx, w, resp)
 	} else {
-		capt = p.stream(r.Context(), w, resp)
+		capt = p.stream(ctx, w, resp)
 	}
-	exch.durationMS = millis(time.Since(start))
+	exch.durationMS = millis(time.Since(exch.start))
 
-	p.record(exch, capt)
+	p.record(ctx, exch, capt)
+}
+
+func (p *Proxy) insertPending(ctx context.Context, r *http.Request, exch *exchange) *gatewayError {
+	accountingID, err := p.accountant.InsertPending(ctx, pendingRequest(exch, p.host, requestKind(r)))
+	if err != nil {
+		p.logger.ErrorContext(ctx, "usage accounting pending insert failed", slog.Any("error", err))
+
+		return &gatewayError{
+			status: http.StatusInternalServerError,
+			err:    fmt.Errorf("record pending usage accounting: %w", err),
+		}
+	}
+	exch.accountingID = accountingID
+
+	return nil
+}
+
+func (p *Proxy) markDispatched(ctx context.Context, exch *exchange, sent time.Time) *gatewayError {
+	if err := p.accountant.MarkUpstreamDispatched(ctx, exch.accountingID, sent); err != nil {
+		p.logger.ErrorContext(ctx, "usage accounting dispatch mark failed", slog.Any("error", err))
+
+		return &gatewayError{
+			status: http.StatusBadGateway,
+			err:    fmt.Errorf("record usage accounting dispatch: %w", err),
+		}
+	}
+	exch.accountingDispatched = true
+
+	return nil
 }
 
 // resolve picks the route serving model inside the request's own context. A
@@ -310,6 +375,8 @@ func (p *Proxy) Drain(ctx context.Context) {
 	select {
 	case <-done:
 	case <-ctx.Done():
+		p.logger.ErrorContext(ctx, "usage accounting drain timed out; finalization may be incomplete",
+			slog.Int64("in_flight_records", p.inFlight.Load()))
 	}
 }
 
@@ -333,7 +400,7 @@ func (p *Proxy) abort(ctx context.Context, w http.ResponseWriter, exch *exchange
 	p.logger.WarnContext(ctx, "gateway error", slog.String("alias", exch.route.Alias),
 		slog.Int("status", gwErr.status), slog.Any("error", gwErr.err))
 
-	p.record(exch, nil)
+	p.record(ctx, exch, nil)
 }
 
 // stream copies the upstream response to the client, flushing every chunk so a
@@ -403,27 +470,37 @@ func (p *Proxy) writeChunk(
 // record hands the finished exchange to the ledger without making the client
 // wait for it. A recorder that fails, or blocks, costs the record and nothing
 // else.
-func (p *Proxy) record(exch *exchange, capt *capture) {
-	if p.recorder == nil {
+func (p *Proxy) record(ctx context.Context, exch *exchange, capt *capture) {
+	if p.recorder == nil && exch.accountingID == 0 {
 		return
 	}
 
 	p.pending.Add(1)
+	p.inFlight.Add(1)
 
-	go p.appendRecord(exch, capt)
+	go p.appendRecord(ctx, exch, capt)
 }
 
 // appendRecord builds and appends one record, off the request path.
-func (p *Proxy) appendRecord(exch *exchange, capt *capture) {
-	defer p.pending.Done()
+func (p *Proxy) appendRecord(ctx context.Context, exch *exchange, capt *capture) {
+	defer func() {
+		p.inFlight.Add(-1)
+		p.pending.Done()
+	}()
 
 	if capt != nil && capt.dropped {
-		p.logger.Warn("response capture dropped at the size ceiling",
+		p.logger.WarnContext(ctx, "response capture dropped at the size ceiling",
 			slog.Int("limit_bytes", captureLimitBytes))
 	}
 
-	if err := p.recorder.Append(exch.record(p.host, capt)); err != nil {
-		p.logger.Warn("ledger record dropped", slog.Any("error", err))
+	if exch.accountingID != 0 {
+		p.finalizeAccounting(ctx, exch, capt)
+	}
+
+	if p.recorder != nil {
+		if err := p.recorder.Append(exch.record(p.host, capt)); err != nil {
+			p.logger.WarnContext(ctx, "ledger record dropped", slog.Any("error", err))
+		}
 	}
 }
 

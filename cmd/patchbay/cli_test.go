@@ -228,6 +228,7 @@ func TestServeSubcommandServes(t *testing.T) {
 				envListen:    "127.0.0.1:0",
 				envRegistry:  registryPath,
 				envLedgerDir: filepath.Join(dir, "ledger"),
+				envUsageDB:   filepath.Join(dir, "usage.sqlite"),
 			}),
 			client: nil,
 			logger: slog.New(logs),

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -44,6 +45,7 @@ func TestResolveConfig(t *testing.T) {
 				listen:    "127.0.0.1:4100",
 				registry:  "/xdg/config/patchbay/routes.json",
 				ledgerDir: "/xdg/state/patchbay/ledger",
+				usageDB:   "/xdg/state/patchbay/usage.sqlite",
 			},
 		},
 		{
@@ -53,6 +55,7 @@ func TestResolveConfig(t *testing.T) {
 				listen:    "127.0.0.1:4100",
 				registry:  "/home/tester/.config/patchbay/routes.json",
 				ledgerDir: "/home/tester/.local/state/patchbay/ledger",
+				usageDB:   "/home/tester/.local/state/patchbay/usage.sqlite",
 			},
 		},
 		{
@@ -66,6 +69,7 @@ func TestResolveConfig(t *testing.T) {
 				listen:    "127.0.0.1:4100",
 				registry:  "/home/tester/.config/patchbay/routes.json",
 				ledgerDir: "/home/tester/.local/state/patchbay/ledger",
+				usageDB:   "/home/tester/.local/state/patchbay/usage.sqlite",
 			},
 		},
 		{
@@ -77,11 +81,13 @@ func TestResolveConfig(t *testing.T) {
 				"PATCHBAY_LISTEN":     "127.0.0.1:9999",
 				"PATCHBAY_REGISTRY":   "/etc/patchbay/routes.json",
 				"PATCHBAY_LEDGER_DIR": "/var/lib/patchbay",
+				"PATCHBAY_USAGE_DB":   "/var/lib/patchbay/usage.sqlite",
 			},
 			want: config{
 				listen:    "127.0.0.1:9999",
 				registry:  "/etc/patchbay/routes.json",
 				ledgerDir: "/var/lib/patchbay",
+				usageDB:   "/var/lib/patchbay/usage.sqlite",
 			},
 		},
 		{
@@ -94,6 +100,7 @@ func TestResolveConfig(t *testing.T) {
 				listen:    "127.0.0.1:4100",
 				registry:  "/home/tester/.config/patchbay/routes.json",
 				ledgerDir: "/home/tester/.local/state/patchbay/ledger",
+				usageDB:   "/home/tester/.local/state/patchbay/usage.sqlite",
 			},
 		},
 		{
@@ -101,11 +108,13 @@ func TestResolveConfig(t *testing.T) {
 			env: map[string]string{
 				"PATCHBAY_REGISTRY":   "/etc/patchbay/routes.json",
 				"PATCHBAY_LEDGER_DIR": "/var/lib/patchbay",
+				"PATCHBAY_USAGE_DB":   "/var/lib/patchbay/usage.sqlite",
 			},
 			want: config{
 				listen:    "127.0.0.1:4100",
 				registry:  "/etc/patchbay/routes.json",
 				ledgerDir: "/var/lib/patchbay",
+				usageDB:   "/var/lib/patchbay/usage.sqlite",
 			},
 		},
 	}
@@ -173,6 +182,7 @@ func TestRunFailsOnAnUnusableListenAddress(t *testing.T) {
 				"PATCHBAY_LISTEN":     tc.listen,
 				"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
 				"PATCHBAY_LEDGER_DIR": filepath.Join(dir, "ledger"),
+				"PATCHBAY_USAGE_DB":   filepath.Join(dir, "usage.sqlite"),
 			}), quietLogger(), nil)
 
 			if err == nil {
@@ -208,6 +218,7 @@ func TestRunServesUntilTheContextIsCancelled(t *testing.T) {
 			"PATCHBAY_LISTEN":     "127.0.0.1:0",
 			"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
 			"PATCHBAY_LEDGER_DIR": ledgerDir,
+			"PATCHBAY_USAGE_DB":   filepath.Join(dir, "state", "usage.sqlite"),
 		}), quietLogger(), nil)
 	}()
 
@@ -247,6 +258,7 @@ func TestRunSurvivesAnUnusableLedger(t *testing.T) {
 			"PATCHBAY_LISTEN":     "127.0.0.1:0",
 			"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
 			"PATCHBAY_LEDGER_DIR": filepath.Join(blocker, "ledger"),
+			"PATCHBAY_USAGE_DB":   filepath.Join(dir, "usage.sqlite"),
 		}), quietLogger(), nil)
 	}()
 
@@ -254,5 +266,45 @@ func TestRunSurvivesAnUnusableLedger(t *testing.T) {
 
 	if err := <-done; err != nil {
 		t.Fatalf("serveGateway() error = %v; want the gateway to serve without a ledger", err)
+	}
+}
+
+func TestRunFailsWhenHostnameCannotBeResolved(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	err := serveGatewayWithHostname(t.Context(), envMap(map[string]string{
+		"PATCHBAY_LISTEN":     "127.0.0.1:0",
+		"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
+		"PATCHBAY_LEDGER_DIR": filepath.Join(dir, "ledger"),
+		"PATCHBAY_USAGE_DB":   filepath.Join(dir, "usage.sqlite"),
+	}), quietLogger(), nil, func() (string, error) {
+		return "", errors.New("hostname unavailable")
+	})
+	if err == nil {
+		t.Fatal("serveGatewayWithHostname() error = nil; want hostname failure to prevent startup")
+	}
+	if !strings.Contains(err.Error(), "hostname") {
+		t.Fatalf("serveGatewayWithHostname() error = %v; want it to name hostname resolution", err)
+	}
+}
+
+func TestRunFailsOnAnUnusableUsageDatabase(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("in the way"), 0o600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+
+	err := serveGateway(t.Context(), envMap(map[string]string{
+		"PATCHBAY_LISTEN":     "127.0.0.1:0",
+		"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
+		"PATCHBAY_LEDGER_DIR": filepath.Join(dir, "ledger"),
+		"PATCHBAY_USAGE_DB":   filepath.Join(blocker, "usage.sqlite"),
+	}), quietLogger(), nil)
+	if err == nil {
+		t.Fatal("serveGateway() error = nil; want an unusable usage database to prevent startup")
 	}
 }

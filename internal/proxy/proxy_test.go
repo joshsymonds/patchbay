@@ -107,9 +107,10 @@ func TestIdentityRoutePreservesBytesBothWays(t *testing.T) {
 	payload := sseTurn()
 	stub := newUpstream(t, sseHandler(t, payload, pathologicalSplits(payload)))
 
-	gateway := httptest.NewServer(proxy.New(proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
-		Host:     testHost,
+	gateway := httptest.NewServer(newProxy(t, proxy.Config{
+		Registry:   newRegistry(t, identityRoute(stub.url())),
+		Host:       testHost,
+		Accountant: permissiveAccountant{},
 	}))
 	t.Cleanup(gateway.Close)
 
@@ -755,10 +756,11 @@ func TestConcurrentRequestsAreIndependent(t *testing.T) {
 	payload := sseTurn()
 	stub := newUpstream(t, sseHandler(t, payload, pathologicalSplits(payload)))
 
-	gateway := proxy.New(proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
-		Recorder: newRecorder(),
-		Host:     testHost,
+	gateway := newProxy(t, proxy.Config{
+		Registry:   newRegistry(t, identityRoute(stub.url())),
+		Recorder:   newRecorder(),
+		Host:       testHost,
+		Accountant: permissiveAccountant{},
 	})
 
 	const callers = 16
