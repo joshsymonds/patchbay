@@ -69,8 +69,8 @@ func TestOpenCreatesSecureMigratedDatabase(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read migration version: %v", err)
 	}
-	if version != rateCardsAndFinalCostMigrationVersion {
-		t.Fatalf("migration version = %d; want %d", version, rateCardsAndFinalCostMigrationVersion)
+	if version != importedLedgerProvenanceMigrationVersion {
+		t.Fatalf("migration version = %d; want %d", version, importedLedgerProvenanceMigrationVersion)
 	}
 
 	var table string
@@ -244,9 +244,9 @@ func TestOpenIsIdempotent(t *testing.T) {
 		Scan(&count, &version); err != nil {
 		t.Fatal(err)
 	}
-	if count != rateCardsAndFinalCostMigrationVersion || version != rateCardsAndFinalCostMigrationVersion {
+	if count != importedLedgerProvenanceMigrationVersion || version != importedLedgerProvenanceMigrationVersion {
 		t.Fatalf("migration rows = %d, max version = %d; want %d, %d",
-			count, version, rateCardsAndFinalCostMigrationVersion, rateCardsAndFinalCostMigrationVersion)
+			count, version, importedLedgerProvenanceMigrationVersion, importedLedgerProvenanceMigrationVersion)
 	}
 }
 
@@ -302,6 +302,8 @@ func TestAccountingRequestsSchema(t *testing.T) {
 		{"cost_basis", "TEXT", 0, 0},
 		{"final_cost_nano_usd", "INTEGER", 0, 0},
 		{"rate_card_id", "INTEGER", 0, 0},
+		{"import_source", "TEXT", 0, 0},
+		{"import_line", "INTEGER", 0, 0},
 	}
 
 	rows, err := db.Query(`PRAGMA table_info(accounting_requests)`)
@@ -358,6 +360,38 @@ func TestFinalizedResponseAccountingMigrationDeclarationAndIndex(t *testing.T) {
 	want := "CREATE UNIQUE INDEX accounting_requests_finalized_response_id ON accounting_requests(response_id) WHERE lifecycle_state = 'finalized' AND response_id IS NOT NULL AND response_id <> ''"
 	if indexSQL != want {
 		t.Fatalf("finalized response ID index SQL = %q; want %q", indexSQL, want)
+	}
+}
+
+func TestImportedLedgerProvenanceMigrationAndInsertTrigger(t *testing.T) {
+	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+	first := insertPendingRequest(t, store)
+	second := insertPendingRequest(t, store)
+	if _, err := store.db.Exec(
+		`UPDATE accounting_requests SET import_source = 'source', import_line = 1 WHERE id = ?`,
+		first,
+	); err != nil {
+		t.Fatalf("set provenance: %v", err)
+	}
+	if _, err := store.db.Exec(
+		`UPDATE accounting_requests SET import_source = 'source' WHERE id = ?`,
+		second,
+	); err == nil {
+		t.Fatal("partial import provenance update returned nil error")
+	}
+	if _, err := store.db.Exec(
+		`UPDATE accounting_requests SET import_source = 'source', import_line = 1 WHERE id = ?`,
+		second,
+	); err == nil {
+		t.Fatal("duplicate import provenance update returned nil error")
+	}
+	if _, err := store.db.Exec(`INSERT INTO accounting_requests (
+		started_at, request_kind, lifecycle_state, upstream_contacted, route_host, route_context,
+		route_upstream, request_model, resolved_model, auth_mode, credential_class, billing_policy,
+		cost_status
+	) VALUES (1, 'other', 'finalized', 0, 'host', '', 'upstream', 'model', 'model',
+		'inject', '', 'explicit', 'unknown')`); err == nil || !strings.Contains(err.Error(), "invalid finalized accounting snapshot") {
+		t.Fatalf("incomplete finalized INSERT error = %v; want finalized snapshot rejection", err)
 	}
 }
 
@@ -606,7 +640,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	}
 	defer db.Close()
 
-	failing := migration{version: 4, name: "fail", statements: []string{
+	failing := migration{version: 5, name: "fail", statements: []string{
 		`CREATE TABLE must_not_survive (id INTEGER)`,
 		`THIS IS NOT SQL`,
 	}}
@@ -623,7 +657,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	if count != 0 {
 		t.Fatal("failed migration published partial schema")
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 4`).
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 5`).
 		Scan(&count); err != nil {
 		t.Fatal(err)
 	}

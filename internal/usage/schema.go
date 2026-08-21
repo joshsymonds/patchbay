@@ -12,6 +12,8 @@ const finalizedResponseAccountingMigrationVersion = 2
 
 const rateCardsAndFinalCostMigrationVersion = 3
 
+const importedLedgerProvenanceMigrationVersion = 4
+
 type migration struct {
 	version    int
 	name       string
@@ -101,6 +103,53 @@ func declaredMigrations() []migration {
 			},
 		},
 		rateCardsAndFinalCostMigration(),
+		importedLedgerProvenanceMigration(),
+	}
+}
+
+func importedLedgerProvenanceMigration() migration {
+	return migration{
+		version: importedLedgerProvenanceMigrationVersion,
+		name:    "imported_ledger_provenance",
+		statements: []string{
+			`ALTER TABLE accounting_requests ADD COLUMN import_source TEXT`,
+			`ALTER TABLE accounting_requests ADD COLUMN import_line INTEGER CHECK (
+				(import_line IS NULL OR import_line > 0)
+				AND (import_source IS NULL) = (import_line IS NULL)
+			)`,
+			`CREATE UNIQUE INDEX accounting_requests_import_provenance
+			ON accounting_requests(import_source, import_line) WHERE import_source IS NOT NULL`,
+			`CREATE TRIGGER accounting_requests_validate_finalized_snapshot_insert
+			BEFORE INSERT ON accounting_requests
+			WHEN NEW.lifecycle_state = 'finalized' AND (
+				NEW.completed_at IS NULL
+				OR NEW.completed_at < NEW.started_at
+				OR NEW.outcome IS NULL
+				OR NEW.outcome NOT IN ('success', 'local_rejection', 'upstream_http_failure', 'transport_failure', 'response_interrupted', 'normalization_failure')
+				OR NEW.cost_status NOT IN ('known', 'unknown')
+				OR NEW.normalization_complete IS NULL
+				OR NEW.provider_cost_present IS NULL
+				OR NEW.provider_cost_valid IS NULL
+				OR NEW.provider_cost_nano_usd IS NULL
+				OR NOT (
+					(NEW.provider_cost_present = 0 AND NEW.provider_cost_valid = 0 AND NEW.provider_cost_nano_usd = 0)
+					OR (NEW.provider_cost_present = 1 AND NEW.provider_cost_valid = 0 AND NEW.provider_cost_nano_usd = 0)
+					OR (NEW.provider_cost_present = 1 AND NEW.provider_cost_valid = 1 AND NEW.provider_cost_nano_usd >= 0)
+				)
+				OR NEW.response_id = ''
+				OR NEW.stop_reason IS NULL
+				OR NEW.block_shape IS NULL
+				OR NEW.duration_ms IS NULL
+				OR NEW.upstream_ms IS NULL
+				OR NEW.upstream_contacted NOT IN (0, 1)
+				OR (NEW.upstream_contacted = 0 AND NEW.upstream_dispatched_at IS NOT NULL)
+				OR (NEW.upstream_contacted = 1 AND NEW.upstream_dispatched_at IS NULL)
+				OR (NEW.upstream_dispatched_at IS NOT NULL AND NEW.completed_at < NEW.upstream_dispatched_at)
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'invalid finalized accounting snapshot');
+			END`,
+		},
 	}
 }
 

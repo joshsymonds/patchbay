@@ -68,8 +68,8 @@ func TestExportIsDeterministicAndComplete(t *testing.T) {
 	if err := json.Unmarshal(lines[0], &header); err != nil {
 		t.Fatalf("decode header: %v", err)
 	}
-	if header.PatchbayUsageExport != 1 || header.SchemaVersion != rateCardsAndFinalCostMigrationVersion {
-		t.Fatalf("header = %+v; want export 1 and schema %d", header, rateCardsAndFinalCostMigrationVersion)
+	if header.PatchbayUsageExport != 1 || header.SchemaVersion != importedLedgerProvenanceMigrationVersion {
+		t.Fatalf("header = %+v; want export 1 and schema %d", header, importedLedgerProvenanceMigrationVersion)
 	}
 
 	rows := map[string]map[string]any{}

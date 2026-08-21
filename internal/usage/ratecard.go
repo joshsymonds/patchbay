@@ -74,7 +74,9 @@ func (store *Store) withRateCardTransaction(
 		if committed {
 			return
 		}
-		if _, rollbackErr := conn.ExecContext(ctx, `ROLLBACK`); rollbackErr != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+		if _, rollbackErr := conn.ExecContext(cleanupCtx, `ROLLBACK`); rollbackErr != nil {
 			result = errors.Join(result, fmt.Errorf("load rate cards: roll back transaction: %w", rollbackErr))
 		}
 	}()

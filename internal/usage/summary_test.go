@@ -331,7 +331,7 @@ type summaryFixtureRow struct {
 func insertSummaryFixtureRow(t *testing.T, db *sql.DB, row summaryFixtureRow) {
 	t.Helper()
 
-	var billingClass, costBasis, finalCost any
+	var billingClass, costBasis, finalCost, completedAt, outcome any
 	if row.billingClass != "" {
 		billingClass = row.billingClass
 	}
@@ -348,22 +348,37 @@ func insertSummaryFixtureRow(t *testing.T, db *sql.DB, row summaryFixtureRow) {
 	if row.context == "" {
 		row.context = "personal"
 	}
+	costStatus := "pending"
+	if row.state == "finalized" {
+		completedAt = row.startedAt.UnixNano()
+		outcome = "success"
+		if finalCost != nil {
+			costStatus = "known"
+		} else {
+			costStatus = "unknown"
+		}
+	}
 
 	_, err := db.ExecContext(
 		t.Context(),
 		`INSERT INTO accounting_requests (
-		started_at, request_kind, lifecycle_state, upstream_contacted, route_host,
-		route_context, route_upstream, request_model, resolved_model, auth_mode,
-		credential_class, billing_policy, billing_class, cost_status, cost_basis,
-		final_cost_nano_usd, input_tokens, output_tokens, cache_read_input_tokens,
-		cache_creation_input_tokens, cache_creation_5m_input_tokens, cache_creation_1h_input_tokens
-	) VALUES (?, ?, ?, 0, 'host', ?, 'upstream', 'model', 'model', 'forward',
-		'oauth', 'credential_derived', ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
+		started_at, completed_at, upstream_dispatched_at, request_kind, lifecycle_state,
+		outcome, upstream_contacted, route_host, route_context, route_upstream, request_model,
+		resolved_model, auth_mode, credential_class, billing_policy, billing_class, cost_status,
+		cost_basis, final_cost_nano_usd, normalization_complete, provider_cost_present,
+		provider_cost_valid, provider_cost_nano_usd, stop_reason, block_shape, duration_ms,
+		upstream_ms, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+		cache_creation_5m_input_tokens, cache_creation_1h_input_tokens
+	) VALUES (?, ?, NULL, ?, ?, ?, 0, 'host', ?, 'upstream', 'model', 'model', 'forward',
+		'oauth', 'credential_derived', ?, ?, ?, ?, 0, 0, 0, 0, '', '[]', 0, 0, ?, ?, ?, ?, ?, ?)`,
 		row.startedAt.UnixNano(),
+		completedAt,
 		row.kind,
 		row.state,
+		outcome,
 		row.context,
 		billingClass,
+		costStatus,
 		costBasis,
 		finalCost,
 		nullableSummaryToken(

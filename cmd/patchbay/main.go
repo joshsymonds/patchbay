@@ -30,6 +30,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -75,6 +77,7 @@ commands:
   check [--registry <path>]    validate a registry file without asking the gateway
   usage snapshot <dest>        write a consistent SQLite usage database snapshot
   usage export <dest>          write a deterministic JSONL usage database export
+  usage import <ledger-dir>    import legacy JSONL ledger accounting
 
   -h, --help                   print this text
 
@@ -231,7 +234,7 @@ func (c cli) usageTooling(ctx context.Context, args []string) int {
 		return exitUsage
 	}
 	operation, dest := args[0], args[1]
-	if operation != "snapshot" && operation != "export" {
+	if operation != "snapshot" && operation != "export" && operation != "import" {
 		c.fail(fmt.Errorf("unknown usage subcommand %q", operation))
 		c.usage(c.stderr)
 
@@ -242,6 +245,13 @@ func (c cli) usageTooling(ctx context.Context, args []string) int {
 		c.fail(err)
 
 		return exitFailure
+	}
+	if operation == "import" {
+		if importErr := c.usageImport(ctx, cfg.usageDB, dest); importErr != nil {
+			c.fail(importErr)
+			return exitFailure
+		}
+		return exitOK
 	}
 	var operationErr error
 	if operation == "snapshot" {
@@ -257,6 +267,70 @@ func (c cli) usageTooling(ctx context.Context, args []string) int {
 	fmt.Fprintf(c.stdout, "OK usage %s: %s\n", operation, dest)
 
 	return exitOK
+}
+
+func (c cli) usageImport(ctx context.Context, usageDB, ledgerDir string) (result error) {
+	files, err := ledgerImportFiles(ledgerDir)
+	if err != nil {
+		return err
+	}
+	store, err := usage.Open(usageDB)
+	if err != nil {
+		return fmt.Errorf("open usage database %s: %w", usageDB, err)
+	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			result = errors.Join(result, fmt.Errorf("close usage database %s: %w", usageDB, closeErr))
+		}
+	}()
+	boundary, boundaryErr := store.ImportBoundary(ctx)
+	if boundaryErr != nil {
+		return fmt.Errorf("read import boundary: %w", boundaryErr)
+	}
+	for _, path := range files {
+		importResult, importErr := store.ImportLedgerFile(ctx, path, filepath.Base(path), boundary)
+		if importErr != nil {
+			return fmt.Errorf("import ledger %s: %w", path, importErr)
+		}
+		fmt.Fprintf(c.stdout, "OK usage import %s: imported=%d skipped-boundary=%d skipped-existing=%d\n",
+			filepath.Base(path), importResult.Imported, importResult.SkippedBoundary, importResult.SkippedExisting)
+	}
+	return nil
+}
+
+func ledgerImportFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read ledger directory %q: %w", dir, err)
+	}
+	var files []string
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && isLedgerImportFile(entry.Name()) {
+			files = append(files, filepath.Join(dir, entry.Name()))
+		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("ledger directory %q contains no ledger files", dir)
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func isLedgerImportFile(name string) bool {
+	const suffix = ".jsonl"
+	for _, prefix := range []string{"patchbay-", "patchbay-v2-"} {
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		date := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+		if len(date) != len("2006-01-02") {
+			continue
+		}
+		if _, err := time.Parse("2006-01-02", date); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // fail reports an operational failure on stderr, marked as patchbay's own.

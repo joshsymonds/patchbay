@@ -218,6 +218,7 @@ patchbay project [dir]                show which context a directory selects
 patchbay check [--registry <path>]    validate a registry file, no daemon needed
 patchbay usage snapshot <dest>        write a consistent SQLite usage database snapshot
 patchbay usage export <dest>          write a deterministic JSONL usage database export
+patchbay usage import <ledger-dir>    import legacy JSONL ledger accounting
 ```
 
 `contexts`, `routes`, `resolve`, and `project` ask the running gateway over its
@@ -264,6 +265,27 @@ export destinations can be anywhere. To restore a snapshot, stop the daemon,
 plain-copy the snapshot over the resolved `$PATCHBAY_USAGE_DB` path, then start
 the daemon. `patchbay serve` opens the restored database and automatically
 migrates an older-schema snapshot forward before serving.
+
+### Legacy ledger import
+
+`patchbay usage import <ledger-dir>` imports recognized `patchbay-YYYY-MM-DD.jsonl`
+and `patchbay-v2-YYYY-MM-DD.jsonl` files in filename order. Each imported row
+keeps its ledger basename and one-based line number as `import_source` and
+`import_line`; live accounting rows leave both columns null. That provenance
+makes a rerun safe and lets a resumed import skip only records already stored.
+Idempotence assumes ledger files are immutable: changing an imported line, or
+importing a different file with the same basename, retains the originally
+imported accounting row for that basename and line number.
+
+Before the first file, Patchbay fixes one overlap boundary at the earliest live
+SQLite `started_at`. Ledger records at or after that instant are skipped, so the
+period where both ledger and SQLite accounting ran is never double-counted.
+The command prints imported, boundary-skipped, and already-present counts for
+each file. It can run while the daemon is serving.
+
+Legacy ledgers do not contain complete pricing or normalization evidence. Imported
+subscription rows are known zero-marginal cost; imported metered rows deliberately
+remain unknown cost and are never rate-card priced.
 
 ### Usage summary
 

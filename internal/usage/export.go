@@ -145,6 +145,8 @@ type accountingRequestExportRow struct {
 	CostBasis                  *string `json:"cost_basis"`
 	FinalCostNanoUSD           *int64  `json:"final_cost_nano_usd"`
 	RateCardID                 *int64  `json:"rate_card_id"`
+	ImportSource               *string `json:"import_source"`
+	ImportLine                 *int64  `json:"import_line"`
 }
 
 func writeExport(ctx context.Context, db *sql.DB, writer *bufio.Writer) (result error) {
@@ -224,7 +226,7 @@ func writeAccountingRequestExport(ctx context.Context, tx *sql.Tx, encoder *json
 		cache_creation_input_tokens, cache_read_input_tokens, cache_creation_5m_input_tokens,
 		cache_creation_1h_input_tokens, provider_cost_present, provider_cost_valid,
 		provider_cost_nano_usd, stop_reason, block_shape, duration_ms, upstream_ms, cost_basis,
-		final_cost_nano_usd, rate_card_id
+		final_cost_nano_usd, rate_card_id, import_source, import_line
 	FROM accounting_requests ORDER BY id`)
 	if queryErr != nil {
 		return fmt.Errorf("read accounting requests for usage export: %w", queryErr)
@@ -259,16 +261,49 @@ func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, er
 	var inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens sql.NullInt64
 	var cacheCreation5mInputTokens, cacheCreation1hInputTokens sql.NullInt64
 	var providerCostPresent, providerCostValid, providerCostNanoUSD sql.NullInt64
-	var durationMS, upstreamMS, finalCostNanoUSD, rateCardID sql.NullInt64
-	var outcome, routeAlias, billingClass, responseID, stopReason, blockShape, costBasis sql.NullString
+	var durationMS, upstreamMS, finalCostNanoUSD, rateCardID, importLine sql.NullInt64
+	var outcome, routeAlias, billingClass, responseID, stopReason, blockShape, costBasis, importSource sql.NullString
 	if scanErr := rows.Scan(
-		&row.ID, &row.StartedAt, &completedAt, &upstreamDispatchedAt, &row.RequestKind, &row.LifecycleState,
-		&outcome, &row.UpstreamContacted, &row.RouteHost, &row.RouteContext, &routeAlias, &row.RouteUpstream,
-		&row.RequestModel, &row.ResolvedModel, &row.AuthMode, &row.CredentialClass, &row.BillingPolicy, &billingClass,
-		&row.CostStatus, &responseID, &httpStatus, &normalizationComplete, &inputTokens, &outputTokens,
-		&cacheCreationInputTokens, &cacheReadInputTokens, &cacheCreation5mInputTokens,
-		&cacheCreation1hInputTokens, &providerCostPresent, &providerCostValid, &providerCostNanoUSD,
-		&stopReason, &blockShape, &durationMS, &upstreamMS, &costBasis, &finalCostNanoUSD, &rateCardID,
+		&row.ID,
+		&row.StartedAt,
+		&completedAt,
+		&upstreamDispatchedAt,
+		&row.RequestKind,
+		&row.LifecycleState,
+		&outcome,
+		&row.UpstreamContacted,
+		&row.RouteHost,
+		&row.RouteContext,
+		&routeAlias,
+		&row.RouteUpstream,
+		&row.RequestModel,
+		&row.ResolvedModel,
+		&row.AuthMode,
+		&row.CredentialClass,
+		&row.BillingPolicy,
+		&billingClass,
+		&row.CostStatus,
+		&responseID,
+		&httpStatus,
+		&normalizationComplete,
+		&inputTokens,
+		&outputTokens,
+		&cacheCreationInputTokens,
+		&cacheReadInputTokens,
+		&cacheCreation5mInputTokens,
+		&cacheCreation1hInputTokens,
+		&providerCostPresent,
+		&providerCostValid,
+		&providerCostNanoUSD,
+		&stopReason,
+		&blockShape,
+		&durationMS,
+		&upstreamMS,
+		&costBasis,
+		&finalCostNanoUSD,
+		&rateCardID,
+		&importSource,
+		&importLine,
 	); scanErr != nil {
 		return accountingRequestExportRow{}, fmt.Errorf("scan accounting request for usage export: %w", scanErr)
 	}
@@ -296,6 +331,8 @@ func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, er
 	row.CostBasis = nullableExportString(costBasis)
 	row.FinalCostNanoUSD = nullableExportInt(finalCostNanoUSD)
 	row.RateCardID = nullableExportInt(rateCardID)
+	row.ImportSource = nullableExportString(importSource)
+	row.ImportLine = nullableExportInt(importLine)
 	return row, nil
 }
 

@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -74,6 +75,40 @@ func TestRateCardImmutabilityAndAtomicSQLFailure(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("rate card count after SQL failure = %d; want 1", count)
+	}
+}
+
+func TestRateCardTransactionRollsBackAfterCallerCancellation(t *testing.T) {
+	store := openStore(t, t.TempDir()+"/usage.sqlite")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cause := errors.New("cancel after rate-card insert")
+	err := store.withRateCardTransaction(ctx, func(conn *sql.Conn) error {
+		if err := insertRateCard(
+			ctx,
+			conn,
+			makeStoredRateCard(testRateCard("openrouter/canceled", time.Unix(1, 0).UTC())),
+		); err != nil {
+			return err
+		}
+		cancel()
+		return cause
+	})
+	if !errors.Is(err, cause) || strings.Contains(err.Error(), "roll back transaction") {
+		t.Fatalf("withRateCardTransaction() error = %v; want only action failure after cleanup", err)
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM rate_cards`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("rolled-back rate cards = %d; want 0", count)
+	}
+	if err := store.LoadRateCards(
+		t.Context(),
+		[]RateCard{testRateCard("openrouter/usable", time.Unix(2, 0).UTC())},
+	); err != nil {
+		t.Fatalf("LoadRateCards() after canceled rollback: %v", err)
 	}
 }
 

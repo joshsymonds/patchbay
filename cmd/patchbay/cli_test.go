@@ -861,3 +861,89 @@ func TestUsageSnapshotCoexistsWithServingDaemon(t *testing.T) {
 		t.Fatalf("serve exited %d; want %d", code, exitOK)
 	}
 }
+
+func writeUsageLedger(t *testing.T, dir, name, contents string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o600); err != nil {
+		t.Fatalf("write ledger: %v", err)
+	}
+}
+
+func legacyLedgerLine(timestamp string) string {
+	return `{"timestamp":"` + timestamp + `","host":"host","upstream":"upstream","model":"model","request_model":"model","auth_mode":"inject","status":200,"input_tokens":0,"output_tokens":1,"duration_ms":0,"upstream_ms":0,"block_shape":[]}` + "\n"
+}
+
+func TestUsageImportEnumeratesSortedLedgerFiles(t *testing.T) {
+	dir := t.TempDir()
+	usageDB := filepath.Join(t.TempDir(), "usage.sqlite")
+	writeUsageLedger(t, dir, "patchbay-v2-2026-08-21.jsonl", legacyLedgerLine("2026-08-21T12:00:00Z"))
+	writeUsageLedger(t, dir, "patchbay-2026-08-20.jsonl", legacyLedgerLine("2026-08-20T12:00:00Z"))
+	writeUsageLedger(t, dir, "patchbay-invalid.jsonl", legacyLedgerLine("2026-08-22T12:00:00Z"))
+
+	got := invoke(t, map[string]string{envUsageDB: usageDB, envHome: t.TempDir()}, "usage", "import", dir)
+	if got.code != exitOK {
+		t.Fatalf("usage import code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
+	}
+	first := strings.Index(got.stdout, "patchbay-2026-08-20.jsonl")
+	second := strings.Index(got.stdout, "patchbay-v2-2026-08-21.jsonl")
+	if first < 0 || second < 0 || first >= second || strings.Contains(got.stdout, "patchbay-invalid") {
+		t.Fatalf("usage import stdout = %q; want sorted recognized ledger names only", got.stdout)
+	}
+	got.contains(t, "stdout", "imported=1")
+}
+
+func TestUsageImportRejectsMissingOrEmptyLedgerDirectory(t *testing.T) {
+	missing := invoke(
+		t,
+		map[string]string{envUsageDB: filepath.Join(t.TempDir(), "usage.sqlite"), envHome: t.TempDir()},
+		"usage",
+		"import",
+		filepath.Join(t.TempDir(), "missing"),
+	)
+	if missing.code != exitFailure {
+		t.Fatalf("missing ledger directory code = %d; want %d", missing.code, exitFailure)
+	}
+	empty := invoke(
+		t,
+		map[string]string{envUsageDB: filepath.Join(t.TempDir(), "usage.sqlite"), envHome: t.TempDir()},
+		"usage",
+		"import",
+		t.TempDir(),
+	)
+	if empty.code != exitFailure {
+		t.Fatalf("empty ledger directory code = %d; want %d", empty.code, exitFailure)
+	}
+	empty.contains(t, "stderr", "no ledger files")
+}
+
+func TestUsageImportCoexistsWithServingDaemon(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "routes.json")
+	writeFile(t, registryPath, lunaRegistry)
+	callerKeyFile(t, testCallerKey)
+	logs := newLogRecorder()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	usageDB := filepath.Join(dir, "usage.sqlite")
+	env := map[string]string{
+		envListen:    "127.0.0.1:0",
+		envRegistry:  registryPath,
+		envLedgerDir: filepath.Join(dir, "ledger"),
+		envUsageDB:   usageDB,
+	}
+	done := make(chan int, 1)
+	go func() {
+		done <- dispatch(ctx, []string{"serve"}, cli{stdout: io.Discard, stderr: io.Discard, lookupEnv: envMap(env), logger: slog.New(logs)})
+	}()
+	logs.waitFor(t, "patchbay listening")
+	ledgerDir := t.TempDir()
+	writeUsageLedger(t, ledgerDir, "patchbay-2026-08-20.jsonl", legacyLedgerLine("2026-08-20T12:00:00Z"))
+	got := invoke(t, map[string]string{envUsageDB: usageDB, envHome: t.TempDir()}, "usage", "import", ledgerDir)
+	if got.code != exitOK {
+		t.Fatalf("usage import with daemon code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
+	}
+	cancel()
+	if code := <-done; code != exitOK {
+		t.Fatalf("serve exited %d; want %d", code, exitOK)
+	}
+}
