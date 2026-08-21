@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,12 +15,6 @@ import (
 
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
-
-// blockedGrace bounds how long a call that must block is watched before it is
-// accepted as blocked. It is a deadline, not a delay: the call it guards would
-// finish in microseconds if it were not blocked, so overrunning the grace is
-// the only way past this check.
-const blockedGrace = 100 * time.Millisecond
 
 // trackerDeadline bounds every call that must NOT block, so a deadlock fails
 // the test instead of hanging the package.
@@ -43,42 +39,6 @@ const brokenRegistry = `{"default_context":"personal","seats":{` +
 	`"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna",` +
 	`"auth_mode":"inject","api_key_env_file":"` + rejectedSecret + `"}},` +
 	`"contexts":{"personal":{"default_seat":"luna","models":{}}}}`
-
-// reportRun drives one concurrent invalidRegistry.reportCurrent, exposing the
-// two moments the ordering rule is about: the instant the current-detail
-// callback runs inside the tracker's critical section, and the instant the
-// whole report has returned.
-type reportRun struct {
-	entered chan struct{}
-	release chan struct{}
-	done    chan struct{}
-	emitted chan error
-}
-
-// startReport begins a report whose current-detail callback blocks until the
-// test releases it, so the test can act while the tracker's lock is held from
-// inside the report.
-func startReport(tracker *invalidRegistry, detail error, emitted chan error) *reportRun {
-	run := &reportRun{
-		entered: make(chan struct{}),
-		release: make(chan struct{}),
-		done:    make(chan struct{}),
-		emitted: emitted,
-	}
-
-	go func() {
-		defer close(run.done)
-
-		tracker.reportCurrent(func() error {
-			close(run.entered)
-			<-run.release
-
-			return detail
-		}, func(err error) { run.emitted <- err })
-	}()
-
-	return run
-}
 
 // await blocks until signal fires or the deadline passes, failing with reason
 // rather than hanging the package.
@@ -154,19 +114,80 @@ func invalidDetails(t *testing.T, output []byte) []string {
 	return found
 }
 
-// TestObserveRegistryIgnoresAStaleValidResolution is the schedule a split
-// report/clear API cannot survive, run in the order that breaks it.
-//
-// A request resolves the registry once and carries that result for the rest of
-// its life. Deciding the diagnostic from that result means a request which
-// resolved a valid document — and then did anything at all before it got to the
-// diagnostic — clears a failure a newer request already reported. The marker is
-// then empty while the registry is still broken, and the very next refusal
-// reports the same failure a second time: an operator reading the log sees one
-// failure logged twice, with a false recovery between them.
-//
-// So there is one operation and it asks the registry, not the caller. Whatever
-// the request resolved, what gets reported is what is wrong right now.
+// TestGatewayPathsObserveRegistryFreshnessOnce counts the filesystem stat that
+// begins a freshness acquisition. Every request path may acquire once, while
+// prefixed introspection must carry that state into document construction rather
+// than asking the registry again.
+func TestGatewayPathsObserveRegistryFreshnessOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistryFile(t, path, staleValidRegistry, time.Now().Add(-time.Hour).Truncate(time.Second))
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := &gateway{registry: reg, logger: slog.Default()}
+
+	var acquisitions int
+	cleanup := reg.ObserveStatsForTest(func(observedPath string) {
+		if observedPath == path {
+			acquisitions++
+		}
+	})
+	t.Cleanup(cleanup)
+
+	assertOne := func(name string, serve http.Handler, target string) {
+		t.Run(name, func(t *testing.T) {
+			before := acquisitions
+			serve.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, target, nil))
+			if got := acquisitions - before; got != 1 {
+				t.Fatalf("freshness acquisitions = %d; want 1", got)
+			}
+		})
+	}
+
+	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	routed := gw.selectContext(next)
+	assertOne("proxy", routed, "/v1/messages")
+	assertOne("models", routed, modelsPath)
+
+	bare := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { gw.document(r.Context()) })
+	assertOne("bare introspection", bare, RegistryEndpoint)
+
+	prefixed := gw.selectContext(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		gw.document(r.Context())
+	}))
+	assertOne("prefixed introspection", prefixed, "/ctx/personal"+RegistryEndpoint)
+}
+
+func TestInvalidRegistryLoggingDoesNotHoldDiagnosticLock(t *testing.T) {
+	t.Parallel()
+
+	failure := errors.New("registry rejected api_key_env_file")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan struct{})
+	secondDone := make(chan struct{})
+	var tracker invalidRegistry
+
+	go func() {
+		defer close(firstDone)
+		tracker.report(registry.Observation{Sequence: 1, Err: failure}, func(error) {
+			close(entered)
+			<-release
+		})
+	}()
+	await(t, entered, "the first report to enter its logger")
+
+	go func() {
+		defer close(secondDone)
+		tracker.report(registry.Observation{Sequence: 2}, func(error) {})
+	}()
+	await(t, secondDone, "a newer observation to progress while logging is blocked")
+
+	close(release)
+	await(t, firstDone, "the blocked logger to return")
+}
+
 func TestObserveRegistryIgnoresAStaleValidResolution(t *testing.T) {
 	t.Parallel()
 
@@ -186,24 +207,23 @@ func TestObserveRegistryIgnoresAStaleValidResolution(t *testing.T) {
 	// The older request resolves while the file is still whole, then stalls
 	// before it observes anything. Its own result says the registry is well, and
 	// goes on saying so for the rest of this schedule.
-	if _, resolveErr := reg.Resolve(registry.Selection{}, "", nil); resolveErr != nil {
-		t.Fatalf("Resolve() = %v; want the valid document the older request saw", resolveErr)
+	_, stale, resolveErr := reg.ResolveObserved(registry.Selection{}, "", nil)
+	if resolveErr != nil {
+		t.Fatalf("ResolveObserved() = %v; want the valid document the older request saw", resolveErr)
 	}
 
 	// The file breaks underneath it, and a newer request observes the
 	// replacement first. That is the one line the operator needs.
 	writeRegistryFile(t, path, brokenRegistry, stamped.Add(time.Hour))
-	gw.observeRegistry(t.Context())
+	_, current := reg.InspectObserved()
+	gw.observeRegistry(t.Context(), current)
 
-	// The older request resumes and makes the same observation every request
-	// makes. It observes the registry as it is now rather than as its own
-	// resolution found it, so the reported failure stands.
-	gw.observeRegistry(t.Context())
+	// The older request resumes with its valid observation. Its lower sequence
+	// cannot clear the newer invalid marker.
+	gw.observeRegistry(t.Context(), stale)
 
-	// Which a third observation of that same failure proves: still nothing new
-	// to tell. Had the resumed request cleared the marker, this would say the
-	// same thing over again.
-	gw.observeRegistry(t.Context())
+	// Repeating the current failure remains deduplicated.
+	gw.observeRegistry(t.Context(), current)
 
 	details := invalidDetails(t, logged.Bytes())
 	if len(details) != 1 {
@@ -239,13 +259,16 @@ func TestObserveRegistryReportsARepairedRegistryBreakingAgain(t *testing.T) {
 	gw := &gateway{registry: reg, logger: slog.New(slog.NewJSONHandler(&logged, nil))}
 
 	writeRegistryFile(t, path, brokenRegistry, stamped.Add(time.Hour))
-	gw.observeRegistry(t.Context())
+	_, observed := reg.InspectObserved()
+	gw.observeRegistry(t.Context(), observed)
 
 	writeRegistryFile(t, path, staleValidRegistry, stamped.Add(2*time.Hour))
-	gw.observeRegistry(t.Context())
+	_, observed = reg.InspectObserved()
+	gw.observeRegistry(t.Context(), observed)
 
 	writeRegistryFile(t, path, brokenRegistry, stamped.Add(3*time.Hour))
-	gw.observeRegistry(t.Context())
+	_, observed = reg.InspectObserved()
+	gw.observeRegistry(t.Context(), observed)
 
 	if details := invalidDetails(t, logged.Bytes()); len(details) != 2 {
 		t.Fatalf("operator log holds %d %q records; want 2, the same failure twice\n%s",
@@ -253,74 +276,33 @@ func TestObserveRegistryReportsARepairedRegistryBreakingAgain(t *testing.T) {
 	}
 }
 
-// TestReportCurrentOrdersRecoveryAgainstAnEarlierObservation is the whole point
-// of folding the current-detail read into the tracker's own critical section.
-//
-// Reading the registry's error outside the lock lets a recovery land between the
-// observation and the report that describes it. The stale report then wins the
-// lock, writes the old detail back over the cleared marker, and every later
-// refusal for that same failure is suppressed as already-told — so the failure
-// an operator is looking at is the one failure the log will not carry.
-//
-// Held under one lock there is one total order and only two arrangements of it.
-// A recovery that arrives while a report is mid-observation waits for that
-// report and lands after it, leaving the marker cleared; a recovery that got
-// there first is simply overwritten by a report that observed the registry after
-// it.
-func TestReportCurrentOrdersRecoveryAgainstAnEarlierObservation(t *testing.T) {
+// TestReportIgnoresOlderObservations pins the sequence ordering that lets the
+// registry perform filesystem work before entering the diagnostic critical section.
+func TestReportIgnoresOlderObservations(t *testing.T) {
 	t.Parallel()
 
 	failure := errors.New("registry rejected api_key_env_file")
 	emitted := make(chan error, 4)
-
 	var tracker invalidRegistry
-
 	emit := func(err error) { emitted <- err }
 
-	run := startReport(&tracker, failure, emitted)
-	await(t, run.entered, "the report to reach its current-detail callback")
-
-	// The report holds the tracker's lock from inside the callback, so a
-	// recovery racing it cannot complete until the report has finished with it.
-	recovered := make(chan struct{})
-	go func() {
-		defer close(recovered)
-
-		tracker.reportCurrent(func() error { return nil }, emit)
-	}()
-
-	select {
-	case <-recovered:
-		t.Fatal("a recovery completed while a report held the tracker lock; the two are not ordered")
-	case <-time.After(blockedGrace):
-	}
-
-	close(run.release)
-	await(t, run.done, "the report to return")
-	await(t, recovered, "the recovery to return once the report released the lock")
-
+	tracker.report(registry.Observation{Sequence: 2, Err: failure}, emit)
 	if got := emission(t, emitted); !errors.Is(got, failure) {
-		t.Fatalf("emitted %v; want the observed failure %v", got, failure)
+		t.Fatalf("emitted %v; want %v", got, failure)
 	}
 
-	// The recovery ran last, so the marker it cleared stays cleared: the same
-	// failure arriving afterwards is news nobody has been told.
-	tracker.reportCurrent(func() error { return failure }, emit)
-
-	if got := emission(t, emitted); !errors.Is(got, failure) {
-		t.Fatalf("the repeat emitted %v; want the same failure %v reported again", got, failure)
-	}
-
+	tracker.report(registry.Observation{Sequence: 1}, emit)
+	tracker.report(registry.Observation{Sequence: 3, Err: failure}, emit)
 	if len(emitted) != 0 {
-		t.Fatalf("%d unexpected extra emissions", len(emitted))
+		t.Fatalf("stale recovery or duplicate failure emitted %d times", len(emitted))
 	}
 }
 
-// TestReportCurrentDedupsAndClearsUnderOneLock covers the rest of the marker's
+// TestReportDedupsAndClearsUnderOneLock covers the rest of the marker's
 // behavior through the single entry point: a repeat of the outstanding failure
-// says nothing, a different failure always does, and a nil current detail is a
-// recovery that clears the marker in the same critical section it was read in.
-func TestReportCurrentDedupsAndClearsUnderOneLock(t *testing.T) {
+// says nothing, a different failure always does, and a nil detail is a recovery
+// that clears the marker in the same critical section.
+func TestReportDedupsAndClearsUnderOneLock(t *testing.T) {
 	t.Parallel()
 
 	first := errors.New("registry rejected api_key_env_file")
@@ -330,8 +312,10 @@ func TestReportCurrentDedupsAndClearsUnderOneLock(t *testing.T) {
 	var tracker invalidRegistry
 
 	emit := func(err error) { emitted <- err }
+	var sequence uint64
 	report := func(detail error) {
-		tracker.reportCurrent(func() error { return detail }, emit)
+		sequence++
+		tracker.report(registry.Observation{Sequence: sequence, Err: detail}, emit)
 	}
 
 	report(first)
@@ -378,24 +362,24 @@ func TestRecoveryBeforeAReportLeavesTheLaterObservationStanding(t *testing.T) {
 
 	emit := func(err error) { emitted <- err }
 
-	tracker.reportCurrent(func() error { return failure }, emit)
+	tracker.report(registry.Observation{Sequence: 1, Err: failure}, emit)
 	if got := emission(t, emitted); !errors.Is(got, failure) {
 		t.Fatalf("emitted %v; want %v", got, failure)
 	}
 
-	tracker.reportCurrent(func() error { return nil }, emit)
+	tracker.report(registry.Observation{Sequence: 2}, emit)
 
 	// Cleared first, observed second: the report speaks even though its detail
 	// is the one that was just forgotten.
-	tracker.reportCurrent(func() error { return failure }, emit)
+	tracker.report(registry.Observation{Sequence: 3, Err: failure}, emit)
 	if got := emission(t, emitted); !errors.Is(got, failure) {
 		t.Fatalf("after a recovery, emitted %v; want %v reported again", got, failure)
 	}
 
 	// And a report whose observation finds nothing wrong clears rather than
 	// marks, so it leaves no marker for the next failure to be mistaken for.
-	tracker.reportCurrent(func() error { return nil }, emit)
-	tracker.reportCurrent(func() error { return failure }, emit)
+	tracker.report(registry.Observation{Sequence: 4}, emit)
+	tracker.report(registry.Observation{Sequence: 5, Err: failure}, emit)
 
 	if got := emission(t, emitted); !errors.Is(got, failure) {
 		t.Fatalf("after a nil observation, emitted %v; want %v reported again", got, failure)

@@ -309,14 +309,68 @@ func assertSanitized(t *testing.T, surface, message, path string) {
 	}
 }
 
+// TestObservedAcquisitionsCarrySnapshotGenerationsAndPairedDiagnostics pins the
+// generation contract: repeated observations of one immutable snapshot share a
+// generation and diagnostic, while installing a changed file advances it.
+func TestObservedAcquisitionsCarrySnapshotGenerationsAndPairedDiagnostics(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, path, validRegistry)
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	chtimes(t, path, base)
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, first, resolveErr := reg.ResolveObserved(registry.Selection{}, "luna-fast", nil)
+	if resolveErr != nil || first.Err != nil {
+		t.Fatalf("ResolveObserved() = %v, observation %+v; want valid", resolveErr, first)
+	}
+	_, repeated, resolveErr := reg.ResolveObserved(registry.Selection{}, "luna-fast", nil)
+	if resolveErr != nil || repeated.Err != nil {
+		t.Fatalf("repeated ResolveObserved() = %v, observation %+v; want valid", resolveErr, repeated)
+	}
+	if first.Sequence == 0 || repeated.Sequence != first.Sequence {
+		t.Fatalf(
+			"unchanged snapshot generations = %d, %d; want one nonzero generation",
+			first.Sequence,
+			repeated.Sequence,
+		)
+	}
+
+	writeRegistry(t, path, secretRegistry)
+	chtimes(t, path, base.Add(time.Hour))
+	state, second := reg.InspectObserved()
+	if second.Sequence <= first.Sequence {
+		t.Fatalf("snapshot generation did not advance: first=%d second=%d", first.Sequence, second.Sequence)
+	}
+	if state.Valid || !errors.Is(second.Err, registry.ErrInvalid) {
+		t.Fatalf("InspectObserved() = %+v, %+v; want paired invalid state and detail", state, second)
+	}
+	_, repeatedInvalid := reg.InspectObserved()
+	if repeatedInvalid.Sequence != second.Sequence || repeatedInvalid.Err.Error() != second.Err.Error() {
+		t.Fatalf(
+			"unchanged invalid observations = %+v, %+v; want one generation and diagnostic",
+			second,
+			repeatedInvalid,
+		)
+	}
+	for _, detail := range []string{rejectedValue, "api_key_env_file", path} {
+		if !strings.Contains(second.Err.Error(), detail) {
+			t.Errorf("InspectObserved() error = %q; want detail %q", second.Err, detail)
+		}
+	}
+}
+
 // TestInspectPairsOneSnapshotWithItsOperatorError pins what an operator surface
 // needs and State and Err cannot give it separately: both halves of one
 // snapshot. Asked one at a time, a registry replaced between the two calls
 // answers each from a different version of the file — a summary of the document
 // that opened beside a refusal from the one that replaced it, or counts printed
-// for a document nothing validated. Inspect refreshes once and reads both under
-// the same lock, so the sanitized snapshot an operator is shown and the detailed
-// error explaining it always describe the same version.
+// for a document nothing validated. Inspect refreshes once and pairs the
+// sanitized snapshot an operator is shown with the detailed error from the same
+// immutable document generation.
 func TestInspectPairsOneSnapshotWithItsOperatorError(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "registry.json")

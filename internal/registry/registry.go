@@ -33,15 +33,27 @@ type State struct {
 	Contexts       map[string]Context
 }
 
+// Observation is the operator diagnostic paired with one immutable registry
+// snapshot generation. Every observation of that snapshot shares its Sequence.
+type Observation struct {
+	Sequence uint64
+	Err      error
+}
+
 // Registry owns the current valid document or fail-closed invalid sentinel.
 type Registry struct {
 	path string
 
-	mu     sync.RWMutex
-	stamp  fileStamp
-	doc    *document
-	err    error
-	loaded bool
+	mu sync.RWMutex
+
+	observerMu   sync.RWMutex
+	statObserver func(string)
+
+	stamp    fileStamp
+	doc      *document
+	err      error
+	loaded   bool
+	sequence uint64
 }
 
 // New validates the initial registry synchronously. No caller should bind a listener before it succeeds.
@@ -53,7 +65,7 @@ func New(path string) (*Registry, error) {
 	if snap.err != nil {
 		return nil, fmt.Errorf("registry %s: %w", path, snap.err)
 	}
-	return &Registry{path: path, stamp: snap.stamp, doc: snap.doc, loaded: true}, nil
+	return &Registry{path: path, stamp: snap.stamp, doc: snap.doc, loaded: true, sequence: 1}, nil
 }
 
 // Resolve selects one Seat using public, marked-subagent, guard, then default precedence.
@@ -69,14 +81,29 @@ func (r *Registry) Resolve(
 	model string,
 	observation *SubagentObservation,
 ) (Resolution, error) {
+	resolution, _, err := r.ResolveObserved(sel, model, observation)
+	return resolution, err
+}
+
+// ResolveObserved resolves against one freshness acquisition and returns the
+// operator diagnostic paired with that same acquisition.
+func (r *Registry) ResolveObserved(
+	sel Selection,
+	model string,
+	subagent *SubagentObservation,
+) (Resolution, Observation, error) {
 	r.refresh()
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.err != nil || r.doc == nil {
-		return Resolution{Context: sel.Name}, ErrInvalid
+	doc, err, sequence := r.doc, r.err, r.sequence
+	r.mu.RUnlock()
+	observed := r.observation(sequence, err)
+
+	if observed.Err != nil || doc == nil {
+		return Resolution{Context: sel.Name}, observed, ErrInvalid
 	}
 
-	return resolveDocument(*r.doc, sel, model, observation)
+	resolution, resolveErr := resolveDocument(*doc, sel, model, subagent)
+	return resolution, observed, resolveErr
 }
 
 // ResolveState applies the runtime resolver to an introspected non-secret snapshot.
@@ -137,9 +164,10 @@ func resolveDocument(
 func (r *Registry) State() State {
 	r.refresh()
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	doc, err := r.doc, r.err
+	r.mu.RUnlock()
 
-	return r.state()
+	return state(doc, err)
 }
 
 // Inspect returns both operator views of one snapshot: the isolated non-secret
@@ -154,17 +182,25 @@ func (r *Registry) State() State {
 // invalid one hands back the same sanitized empty State introspection publishes
 // together with the field and the value that rejected the file.
 func (r *Registry) Inspect() (State, error) {
-	r.refresh()
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.state(), r.invalidErr()
+	state, observed := r.InspectObserved()
+	return state, observed.Err
 }
 
-// state builds the isolated non-secret snapshot with the read lock already
-// held, which is what lets Inspect pair it with the error of the same version.
-func (r *Registry) state() State {
-	if r.err != nil || r.doc == nil {
+// InspectObserved returns the non-secret state and operator diagnostic from one
+// immutable snapshot generation.
+func (r *Registry) InspectObserved() (State, Observation) {
+	r.refresh()
+	r.mu.RLock()
+	doc, err, sequence := r.doc, r.err, r.sequence
+	r.mu.RUnlock()
+
+	return state(doc, err), r.observation(sequence, err)
+}
+
+// state builds an isolated non-secret snapshot from an immutable document after
+// the registry lock has been released.
+func state(doc *document, err error) State {
+	if err != nil || doc == nil {
 		return State{
 			Valid:    false,
 			Error:    ErrInvalid.Error(),
@@ -172,14 +208,14 @@ func (r *Registry) state() State {
 			Contexts: map[string]Context{},
 		}
 	}
-	contexts := make(map[string]Context, len(r.doc.Contexts))
-	for id, ctx := range r.doc.Contexts {
+	contexts := make(map[string]Context, len(doc.Contexts))
+	for id, ctx := range doc.Contexts {
 		contexts[id] = cloneContext(ctx)
 	}
 	return State{
 		Valid:          true,
-		DefaultContext: r.doc.DefaultContext,
-		Seats:          cloneSeats(r.doc.Seats),
+		DefaultContext: doc.DefaultContext,
+		Seats:          cloneSeats(doc.Seats),
 		Contexts:       contexts,
 	}
 }
@@ -217,33 +253,38 @@ func (r *Registry) Path() string { return r.path }
 func (r *Registry) Err() error {
 	r.refresh()
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	err := r.err
+	r.mu.RUnlock()
 
-	return r.invalidErr()
+	return r.invalidErr(err)
 }
 
-// invalidErr renders the current refusal for an operator with the read lock
-// already held, or nil while the registry is valid. It copies nothing: this is
-// on the request path, and what an operator is owed here is a sentence about
-// the file, not a document.
-func (r *Registry) invalidErr() error {
-	if r.err == nil {
+// invalidErr renders one captured snapshot failure for an operator, or nil
+// while that snapshot is valid. The caller may hold the registry read lock while
+// capturing the error, but formatting does not require it.
+func (r *Registry) invalidErr(err error) error {
+	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w: registry %s: %w", ErrInvalid, r.path, r.err)
+	return fmt.Errorf("%w: registry %s: %w", ErrInvalid, r.path, err)
 }
 
-// refresh reloads the document when the file's stamp has moved, and does
-// nothing at all when it has not.
+func (r *Registry) observation(sequence uint64, err error) Observation {
+	return Observation{Sequence: sequence, Err: r.invalidErr(err)}
+}
+
+// refresh reloads the document when the file's stamp has moved and releases all
+// registry locks before returning.
 //
-// The reload keeps whatever loadSnapshot settled on — a document or the detailed
-// error the file produced instead of one — under the stamp of the version it was
-// actually read from. An acquisition that never settled is the one case that
-// stores no stamp: it installs the fail-closed sentinel and clears loaded, so
-// the next request tries again rather than treating a version nothing validated
-// as the current one.
+// The common unchanged-file path takes only the read lock. A stale caller
+// upgrades to the write lock and stats again so a concurrent reload can make it
+// fresh before it reads the file. The reload keeps whatever loadSnapshot settled
+// on — a document or the detailed error the file produced instead of one — under
+// the stamp of the version it actually read from. An acquisition that never
+// settled stores no stamp, so the next request tries again.
 func (r *Registry) refresh() {
-	current := statFile(r.path)
+	current := r.statRegistry()
+
 	r.mu.RLock()
 	fresh := r.loaded && r.stamp.equal(current)
 	r.mu.RUnlock()
@@ -253,19 +294,23 @@ func (r *Registry) refresh() {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	current = r.statRegistry()
 	if r.loaded && r.stamp.equal(current) {
 		return
 	}
 	r.store(loadSnapshot(r.path))
 }
 
-// store installs one acquisition's outcome, with the write lock already held.
+// store installs one acquisition's outcome and advances its snapshot generation,
+// with the write lock already held.
 //
 // A settled acquisition is kept under its own stamp, whichever way it settled.
 // An acquisition that never settled keeps no stamp and clears loaded, which is
 // what sends the next request back to the file: storing the stamp of a version
 // this registry never read whole would mark it current forever.
 func (r *Registry) store(snap snapshot, err error) {
+	r.sequence++
 	if err != nil {
 		r.doc = nil
 		r.err = err
@@ -298,6 +343,31 @@ type snapshot struct {
 	doc   *document
 	err   error
 	stamp fileStamp
+}
+
+// ObserveStatsForTest installs an observer for the outer stat that begins each
+// registry freshness check. It returns a cleanup that restores the prior hook.
+func (r *Registry) ObserveStatsForTest(observer func(string)) func() {
+	r.observerMu.Lock()
+	previous := r.statObserver
+	r.statObserver = observer
+	r.observerMu.Unlock()
+
+	return func() {
+		r.observerMu.Lock()
+		r.statObserver = previous
+		r.observerMu.Unlock()
+	}
+}
+
+func (r *Registry) statRegistry() fileStamp {
+	r.observerMu.RLock()
+	observer := r.statObserver
+	r.observerMu.RUnlock()
+	if observer != nil {
+		observer(r.path)
+	}
+	return statFile(r.path)
 }
 
 // loadSnapshot acquires path's current version consistently.

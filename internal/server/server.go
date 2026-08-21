@@ -103,6 +103,12 @@ type gateway struct {
 	invalid  invalidRegistry
 }
 
+type registryDocumentState struct {
+	state registry.State
+}
+
+type registryDocumentStateKey struct{}
+
 // invalidRegistryMessage is the stable line an operator greps a gateway's logs
 // for. Nothing a caller can read ever carries it.
 const invalidRegistryMessage = "registry invalid; requests fail closed"
@@ -118,44 +124,39 @@ const invalidRegistryMessage = "registry invalid; requests fail closed"
 // news a second time, which is what an observation finding nothing wrong is for.
 type invalidRegistry struct {
 	mu       sync.Mutex
+	sequence uint64
 	reported string
 }
 
-// reportCurrent observes the registry's current failure through current, decides
-// whether it is news, records it and hands it to emit — all inside one critical
-// section. Reporting and forgetting are the same operation because they are the
-// same question asked at different moments, and one entry point is what puts
-// every answer in a single order.
-//
-// The observation has to happen under the lock rather than before it. Asked
-// outside, a report can read a failure, lose the lock to an observation that saw
-// the file repaired, and then take the lock and write its own stale detail back
-// over the cleared marker — after which every refusal for the failure actually
-// in front of the operator is suppressed as already-told. Held throughout, a
-// recovery racing a report either waits for it and lands after it, or lands
-// before the observation that supersedes it; there is no order in which the
-// older reading wins.
-//
-// A nil current detail is that recovery: nothing is emitted, and the marker is
-// forgotten so the next failure is news even when it is the same failure. The
-// empty marker means nothing is outstanding, which no detailed error can be.
-func (i *invalidRegistry) reportCurrent(current func() error, emit func(error)) {
+// report orders an already-acquired registry diagnostic, updates the dedup
+// marker, and decides whether the failure is news. The registry's monotonic
+// snapshot generation prevents an older valid observation from clearing a newer
+// failure.
+// Only that compare/update runs under the mutex; logging happens afterwards so
+// a blocked sink cannot serialize healthy requests. A nil detail is recovery:
+// it clears the marker and re-arms the same failure for a future observation.
+func (i *invalidRegistry) report(observed registry.Observation, emit func(error)) {
 	i.mu.Lock()
-	defer i.mu.Unlock()
+	if observed.Sequence <= i.sequence {
+		i.mu.Unlock()
+		return
+	}
+	i.sequence = observed.Sequence
 
-	detail := current()
+	detail := observed.Err
 	if detail == nil {
 		i.reported = ""
-
+		i.mu.Unlock()
 		return
 	}
 
 	text := detail.Error()
 	if i.reported == text {
+		i.mu.Unlock()
 		return
 	}
-
 	i.reported = text
+	i.mu.Unlock()
 
 	emit(detail)
 }
@@ -171,23 +172,11 @@ func (i *invalidRegistry) reportCurrent(current func() error, emit func(error)) 
 // reading the gateway's own logs is entitled to it, and is the only audience
 // that can act on it.
 //
-// It is one operation, and it asks the registry rather than the caller, because
-// those are the same mistake twice. A request resolves once and carries that
-// result for the rest of its life; a request that resolved a valid document and
-// then did anything at all before reaching this point is holding a fact about a
-// registry that may have been replaced since. Deciding the diagnostic from that
-// fact lets the stale request erase a failure a newer one already reported, and
-// the very next refusal for that same failure then reports it again — one
-// failure logged twice, with a false recovery between them. So every caller asks
-// the same question, and the answer, not the caller, decides whether anything is
-// said.
-//
-// Both the asking and the telling are handed to the tracker rather than done
-// here, so they happen inside its lock: a concurrent observation must not be
-// able to land between this look at the registry and the marker this look
-// produces.
-func (gw *gateway) observeRegistry(ctx context.Context) {
-	gw.invalid.reportCurrent(gw.registry.Err, func(detail error) {
+// The caller passes the diagnostic acquired with its resolution or inspection,
+// so this path performs no second filesystem observation. Generation ordering
+// in the tracker keeps a delayed older request from speaking over newer state.
+func (gw *gateway) observeRegistry(ctx context.Context, observed registry.Observation) {
+	gw.invalid.report(observed, func(detail error) {
 		gw.logger.ErrorContext(ctx, invalidRegistryMessage, slog.Any("error", detail))
 	})
 }
@@ -273,19 +262,31 @@ func (gw *gateway) selectIntrospection(next http.Handler) http.Handler {
 // the detail behind it logged, while a context nothing defines is a request
 // asking for something that was never there.
 //
-// The diagnostic is taken from the registry rather than from the resolution
-// above it, and taken unconditionally. This request's result describes the
-// registry as it was when the resolution ran; the operator needs the registry as
-// it is, and an older request resuming here with a stale valid result must not
-// be able to speak for it.
+// Resolution and its operator diagnostic come from the same registry freshness
+// acquisition. The diagnostic's snapshot generation orders delayed requests
+// without a second read.
 func (gw *gateway) selectContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sel, stripped := splitContext(r.URL)
 
-		res, err := gw.registry.Resolve(sel, "", nil)
 		ctx := registry.WithSelection(r.Context(), sel)
+		var (
+			res      registry.Resolution
+			observed registry.Observation
+			err      error
+		)
+		if stripped.Path == introspectRoot || strings.HasPrefix(stripped.Path, introspectPrefix) {
+			state, documentObserved := gw.registry.InspectObserved()
+			res, err = registry.ResolveState(state, sel, "", nil)
+			observed = documentObserved
+			ctx = context.WithValue(ctx, registryDocumentStateKey{}, registryDocumentState{
+				state: state,
+			})
+		} else {
+			res, observed, err = gw.registry.ResolveObserved(sel, "", nil)
+		}
 
-		gw.observeRegistry(ctx)
+		gw.observeRegistry(ctx, observed)
 
 		if err != nil {
 			ctx = registry.WithResolutionError(ctx, err)

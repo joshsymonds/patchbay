@@ -113,14 +113,18 @@ func (gw *gateway) checkCallerKey(r *http.Request) (int, error) {
 // contains, and an unauthenticated prober must not be able to make the gateway
 // write that down.
 //
-// The observation is unconditional and reads the registry rather than the state
-// above it, exactly as the request path's does. This document says what was true
-// when it was built; the operator is owed what is true when the operator is
-// told, and one entry point for both surfaces is what keeps a stale reading on
-// either of them from speaking over the other.
+// State and diagnostic are acquired together. Prefixed introspection reuses the
+// acquisition context selection already performed; bare introspection acquires
+// it here.
 func (gw *gateway) document(ctx context.Context) Document {
-	state := gw.registry.State()
-	gw.observeRegistry(ctx)
+	var state registry.State
+	if carried, ok := ctx.Value(registryDocumentStateKey{}).(registryDocumentState); ok {
+		state = carried.state
+	} else {
+		var observed registry.Observation
+		state, observed = gw.registry.InspectObserved()
+		gw.observeRegistry(ctx, observed)
+	}
 	doc := Document{
 		Seats:         map[string]SeatSummary{},
 		Contexts:      map[string]ContextSummary{},
