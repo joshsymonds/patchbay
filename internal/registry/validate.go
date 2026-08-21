@@ -127,6 +127,19 @@ func validateRoutes(routes map[string]Route) error {
 // validateRoute applies every rule to a single route.
 func validateRoute(route Route) error {
 	switch route.Auth {
+	case AuthForward, AuthInject:
+		if err := validateBaseURL(route.BaseURL, route.Insecure); err != nil {
+			return err
+		}
+	case AuthSigV4:
+		// A sigv4 route names no base_url at all — validateSigV4 refuses one — because
+		// its endpoint comes from the region it signs for.
+	default:
+		return fmt.Errorf("%s %q is not a valid auth mode (want %q, %q or %q)",
+			fieldAuth, route.Auth, AuthForward, AuthInject, AuthSigV4)
+	}
+
+	switch route.Auth {
 	case AuthForward:
 		if err := validateForward(route); err != nil {
 			return err
@@ -139,21 +152,10 @@ func validateRoute(route Route) error {
 		if err := validateSigV4(route); err != nil {
 			return err
 		}
-	default:
-		return fmt.Errorf("%s %q is not a valid auth mode (want %q, %q or %q)",
-			fieldAuth, route.Auth, AuthForward, AuthInject, AuthSigV4)
 	}
 
 	if err := validateBilling(route); err != nil {
 		return err
-	}
-
-	// A sigv4 route names no base_url at all — validateSigV4 refuses one — because
-	// its endpoint comes from the region it signs for.
-	if route.Auth != AuthSigV4 {
-		if err := validateBaseURL(route.BaseURL, route.Insecure); err != nil {
-			return err
-		}
 	}
 
 	if err := validateTokenCeilings(route); err != nil {
@@ -204,8 +206,8 @@ func validateTokenCeilings(route Route) error {
 // business naming a key file.
 func validateForward(route Route) error {
 	if route.BaseURL != anthropic.BaseURL {
-		return fmt.Errorf("%s routes must use %s %q, got %q",
-			AuthForward, fieldBaseURL, anthropic.BaseURL, route.BaseURL)
+		return fmt.Errorf("%s routes must use %s %q",
+			AuthForward, fieldBaseURL, anthropic.BaseURL)
 	}
 
 	if route.APIKeyEnvFile != "" {
@@ -336,35 +338,43 @@ func validateInject(route Route) error {
 func validateBaseURL(raw string, insecure bool) error {
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("%s %q is not a valid URL: %w", fieldBaseURL, raw, err)
+		return fmt.Errorf("%s is not a valid URL", fieldBaseURL)
 	}
 
+	if parsed.User != nil {
+		return fmt.Errorf("%s must not contain user information", fieldBaseURL)
+	}
+	if parsed.RawQuery != "" {
+		return fmt.Errorf("%s must not contain query parameters", fieldBaseURL)
+	}
+	if parsed.Fragment != "" {
+		return fmt.Errorf("%s must not contain a fragment", fieldBaseURL)
+	}
 	if !parsed.IsAbs() || parsed.Host == "" {
-		return fmt.Errorf("%s %q must be an absolute URL with a scheme and host", fieldBaseURL, raw)
+		return fmt.Errorf("%s must be an absolute URL with a scheme and host", fieldBaseURL)
 	}
 
 	switch parsed.Scheme {
 	case "https":
 		if insecure {
-			return fmt.Errorf("%s is set but %s %q already uses https",
-				fieldInsecure, fieldBaseURL, raw)
+			return fmt.Errorf("%s is set but %s already uses https", fieldInsecure, fieldBaseURL)
 		}
 
 		return nil
 	case "http":
 		if host := parsed.Hostname(); host == loopbackHost || host == localhostHost {
 			if insecure {
-				return fmt.Errorf("%s is set but %s %q is loopback, where http is already allowed",
-					fieldInsecure, fieldBaseURL, raw)
+				return fmt.Errorf("%s is set but %s is loopback, where http is already allowed",
+					fieldInsecure, fieldBaseURL)
 			}
 		} else if !insecure {
-			return fmt.Errorf("%s %q may only use http for %s or %s, or with %s set",
-				fieldBaseURL, raw, loopbackHost, localhostHost, fieldInsecure)
+			return fmt.Errorf("%s may only use http for %s or %s, or with %s set",
+				fieldBaseURL, loopbackHost, localhostHost, fieldInsecure)
 		}
 
 		return nil
 	default:
-		return fmt.Errorf("%s %q must use https", fieldBaseURL, raw)
+		return fmt.Errorf("%s must use https", fieldBaseURL)
 	}
 }
 

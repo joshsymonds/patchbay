@@ -28,7 +28,8 @@ const (
 
 // Store is a local SQLite usage store.
 type Store struct {
-	db *sql.DB
+	db          *sql.DB
+	writePermit chan struct{}
 }
 
 // Open opens path and applies all pending schema migrations.
@@ -67,7 +68,23 @@ func Open(path string) (*Store, error) {
 		return nil, closeAfterError(db, fmt.Errorf("open usage database %q: migrate: %w", path, migrateErr))
 	}
 
-	return &Store{db: db}, nil
+	return &Store{
+		db:          db,
+		writePermit: make(chan struct{}, 1),
+	}, nil
+}
+
+func (store *Store) acquireWritePermit(ctx context.Context) error {
+	select {
+	case store.writePermit <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("wait for usage write permit: %w", ctx.Err())
+	}
+}
+
+func (store *Store) releaseWritePermit() {
+	<-store.writePermit
 }
 
 func ensureWAL(ctx context.Context, db *sql.DB) error {

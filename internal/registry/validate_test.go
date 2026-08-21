@@ -33,16 +33,29 @@ func assertErrMentions(t *testing.T, err error, wants []string) {
 	}
 }
 
+// assertErrOmits fails when err exposes any forbidden fragment.
+func assertErrOmits(t *testing.T, err error, forbids []string) {
+	t.Helper()
+
+	for _, forbid := range forbids {
+		if strings.Contains(err.Error(), forbid) {
+			t.Errorf("Err() = %q; must not mention %q", err.Error(), forbid)
+		}
+	}
+}
+
 // assertRejected checks the fail-closed contract: the whole file is discarded,
 // both aliases fall through to the default route, and Err explains why.
-func assertRejected(t *testing.T, body, alias string, wants []string) {
+func assertRejected(t *testing.T, body, alias string, wants []string) error {
 	t.Helper()
 
 	reg := newRegistry(t, body)
 
 	assertDefault(t, reg, alias)
 	assertDefault(t, reg, "sibling-ok")
-	assertErrMentions(t, reg.Err(), wants)
+	err := reg.Err()
+	assertErrMentions(t, err, wants)
+	return err
 }
 
 // assertAccepted checks the file loads and alias resolves to its own route.
@@ -66,10 +79,11 @@ func assertAccepted(t *testing.T, body, alias string) {
 
 // validationCase is one route object judged against the whole-file rules.
 type validationCase struct {
-	name  string
-	alias string
-	route string
-	wants []string // error fragments; empty means the route must be accepted
+	name    string
+	alias   string
+	route   string
+	wants   []string // error fragments; empty means the route must be accepted
+	forbids []string // sensitive fragments that must not appear in the error
 }
 
 func runValidationCases(t *testing.T, tests []validationCase) {
@@ -86,7 +100,8 @@ func runValidationCases(t *testing.T, tests []validationCase) {
 				return
 			}
 
-			assertRejected(t, body, tc.alias, tc.wants)
+			err := assertRejected(t, body, tc.alias, tc.wants)
+			assertErrOmits(t, err, tc.forbids)
 		})
 	}
 }
@@ -134,10 +149,11 @@ func TestValidateForwardBaseURLIsAnthropicOnly(t *testing.T) {
 
 	runValidationCases(t, []validationCase{
 		{
-			name:  "foreign host rejected",
-			alias: "probe",
-			route: `{"base_url":"https://evil.example","auth":"forward"}`,
-			wants: []string{`"probe"`, "forward", "base_url", "https://evil.example"},
+			name:    "foreign host rejected",
+			alias:   "probe",
+			route:   `{"base_url":"https://evil.example","auth":"forward"}`,
+			wants:   []string{`"probe"`, "forward", "base_url", "https://api.anthropic.com"},
+			forbids: []string{"https://evil.example"},
 		},
 		{
 			name:  "trailing slash rejected",
@@ -284,16 +300,18 @@ func TestValidateBaseURL(t *testing.T) {
 			wants: []string{`"probe"`, "base_url"},
 		},
 		{
-			name:  "relative path rejected",
-			alias: "probe",
-			route: `{"base_url":"/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "base_url", "/api"},
+			name:    "relative path rejected",
+			alias:   "probe",
+			route:   `{"base_url":"/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url", "absolute URL"},
+			forbids: []string{"/api"},
 		},
 		{
-			name:  "bare host rejected",
-			alias: "probe",
-			route: `{"base_url":"openrouter.ai","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "base_url", "openrouter.ai"},
+			name:    "bare host rejected",
+			alias:   "probe",
+			route:   `{"base_url":"openrouter.ai","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url", "absolute URL"},
+			forbids: []string{"openrouter.ai"},
 		},
 		{
 			name:  "scheme without a host rejected",
@@ -302,22 +320,25 @@ func TestValidateBaseURL(t *testing.T) {
 			wants: []string{`"probe"`, "base_url"},
 		},
 		{
-			name:  "unparsable url rejected",
-			alias: "probe",
-			route: `{"base_url":"https://%zz","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "base_url"},
+			name:    "unparsable url rejected",
+			alias:   "probe",
+			route:   `{"base_url":"https://%zz","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url", "not a valid URL"},
+			forbids: []string{"https://%zz", "%zz"},
 		},
 		{
-			name:  "non-http scheme rejected",
-			alias: "probe",
-			route: `{"base_url":"ftp://files.example","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "base_url", "ftp://files.example"},
+			name:    "non-http scheme rejected",
+			alias:   "probe",
+			route:   `{"base_url":"ftp://files.example","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url", "must use https"},
+			forbids: []string{"ftp://files.example"},
 		},
 		{
-			name:  "plain http rejected for a public host",
-			alias: "probe",
-			route: `{"base_url":"http://openrouter.ai","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "base_url", "http://openrouter.ai"},
+			name:    "plain http rejected for a public host",
+			alias:   "probe",
+			route:   `{"base_url":"http://openrouter.ai","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url", "may only use http"},
+			forbids: []string{"http://openrouter.ai"},
 		},
 		{
 			name:  "https accepted",
@@ -333,6 +354,240 @@ func TestValidateBaseURL(t *testing.T) {
 			name:  "http accepted for localhost",
 			alias: "probe",
 			route: `{"base_url":"http://localhost:1234/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+		},
+	})
+}
+
+// Base URLs carry only endpoint identity. Credential material and request-specific
+// routing belong elsewhere and must never survive registry validation.
+func TestValidateBaseURLRejectsUserinfo(t *testing.T) {
+	t.Parallel()
+
+	runValidationCases(t, []validationCase{
+		{
+			name:    "https username rejected",
+			alias:   "probe",
+			route:   `{"base_url":"https://ledgeruser@example.test/v1","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must not contain user information"},
+			forbids: []string{"ledgeruser"},
+		},
+		{
+			name:    "https username and password rejected",
+			alias:   "probe",
+			route:   `{"base_url":"https://ledgeruser:ledgerpass@example.test/v1","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must not contain user information"},
+			forbids: []string{"ledgeruser", "ledgerpass"},
+		},
+		{
+			name:    "loopback http username rejected",
+			alias:   "probe",
+			route:   `{"base_url":"http://ledgeruser@127.0.0.1:8080/v1","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must not contain user information"},
+			forbids: []string{"ledgeruser"},
+		},
+		{
+			name:    "loopback http username and password rejected",
+			alias:   "probe",
+			route:   `{"base_url":"http://ledgeruser:ledgerpass@127.0.0.1:8080/v1","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must not contain user information"},
+			forbids: []string{"ledgeruser", "ledgerpass"},
+		},
+		{
+			name:  "insecure http username rejected",
+			alias: "probe",
+			route: `{"base_url":"http://ledgeruser@gpubox.lan:11434/v1","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","insecure":true}`,
+			wants:   []string{`"probe"`, "base_url must not contain user information"},
+			forbids: []string{"ledgeruser"},
+		},
+		{
+			name:  "insecure http username and password rejected",
+			alias: "probe",
+			route: `{"base_url":"http://ledgeruser:ledgerpass@gpubox.lan:11434/v1","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","insecure":true}`,
+			wants:   []string{`"probe"`, "base_url must not contain user information"},
+			forbids: []string{"ledgeruser", "ledgerpass"},
+		},
+	})
+}
+
+func TestValidateBaseURLRejectsQuery(t *testing.T) {
+	t.Parallel()
+
+	runValidationCases(t, []validationCase{
+		{
+			name:  "https query rejected",
+			alias: "probe",
+			route: `{"base_url":"https://example.test/v1?token=sk-query-placeholder","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must not contain query parameters"},
+			forbids: []string{"sk-query-placeholder"},
+		},
+		{
+			name:  "loopback http query rejected",
+			alias: "probe",
+			route: `{"base_url":"http://127.0.0.1:8080/v1?token=sk-query-placeholder","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must not contain query parameters"},
+			forbids: []string{"sk-query-placeholder"},
+		},
+		{
+			name:  "insecure http query rejected",
+			alias: "probe",
+			route: `{"base_url":"http://gpubox.lan:11434/v1?token=sk-query-placeholder","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","insecure":true}`,
+			wants:   []string{`"probe"`, "base_url must not contain query parameters"},
+			forbids: []string{"sk-query-placeholder"},
+		},
+	})
+}
+
+func TestValidateBaseURLRejectsFragment(t *testing.T) {
+	t.Parallel()
+
+	runValidationCases(t, []validationCase{
+		{
+			name:  "https fragment rejected",
+			alias: "probe",
+			route: `{"base_url":"https://example.test/v1#fragment-placeholder","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must not contain a fragment"},
+			forbids: []string{"fragment-placeholder"},
+		},
+		{
+			name:  "loopback http fragment rejected",
+			alias: "probe",
+			route: `{"base_url":"http://127.0.0.1:8080/v1#fragment-placeholder","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must not contain a fragment"},
+			forbids: []string{"fragment-placeholder"},
+		},
+		{
+			name:  "insecure http fragment rejected",
+			alias: "probe",
+			route: `{"base_url":"http://gpubox.lan:11434/v1#fragment-placeholder","auth":"inject",` +
+				`"api_key_env_file":"KEY_FILE","insecure":true}`,
+			wants:   []string{`"probe"`, "base_url must not contain a fragment"},
+			forbids: []string{"fragment-placeholder"},
+		},
+	})
+}
+
+// Base URL validation errors describe the violated rule without exposing the
+// operator-supplied value. Registries may carry credentials or request routing
+// material in a rejected URL, and Err must remain safe to report.
+func TestValidateBaseURLErrorsOmitSuppliedValues(t *testing.T) {
+	t.Parallel()
+
+	runValidationCases(t, []validationCase{
+		{
+			name:  "forward user information rejected before identity validation",
+			alias: "probe",
+			route: `{"base_url":"https://ledgeruser:ledgerpass@api.anthropic.com","auth":"forward"}`,
+			wants: []string{`"probe"`, "base_url must not contain user information"},
+			forbids: []string{
+				"ledgeruser",
+				"ledgerpass",
+				"https://ledgeruser:ledgerpass@api.anthropic.com",
+			},
+		},
+		{
+			name:  "forward query rejected before identity validation",
+			alias: "probe",
+			route: `{"base_url":"https://api.anthropic.com?token=sk-forward-query-placeholder","auth":"forward"}`,
+			wants: []string{`"probe"`, "base_url must not contain query parameters"},
+			forbids: []string{
+				"sk-forward-query-placeholder",
+				"https://api.anthropic.com?token=sk-forward-query-placeholder",
+			},
+		},
+		{
+			name:  "forward fragment rejected before identity validation",
+			alias: "probe",
+			route: `{"base_url":"https://api.anthropic.com#forward-fragment-placeholder","auth":"forward"}`,
+			wants: []string{`"probe"`, "base_url must not contain a fragment"},
+			forbids: []string{
+				"forward-fragment-placeholder",
+				"https://api.anthropic.com#forward-fragment-placeholder",
+			},
+		},
+		{
+			name:    "relative query rejected before absolute URL validation",
+			alias:   "probe",
+			route:   `{"base_url":"/v1?token=sk-relative-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must not contain query parameters"},
+			forbids: []string{"sk-relative-placeholder", "/v1?token=sk-relative-placeholder"},
+		},
+		{
+			name:    "relative URL rejected without exposing its path",
+			alias:   "probe",
+			route:   `{"base_url":"/relative-url-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must be an absolute URL with a scheme and host"},
+			forbids: []string{"relative-url-placeholder", "/relative-url-placeholder"},
+		},
+		{
+			name:    "scheme URL without a host rejected without exposing its path",
+			alias:   "probe",
+			route:   `{"base_url":"https:/missing-host-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url must be an absolute URL with a scheme and host"},
+			forbids: []string{"missing-host-placeholder", "https:/missing-host-placeholder"},
+		},
+		{
+			name:    "malformed URL parser error omits parser rendering",
+			alias:   "probe",
+			route:   `{"base_url":"https://%zz/secret-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{`"probe"`, "base_url is not a valid URL"},
+			forbids: []string{"secret-placeholder", "https://%zz/secret-placeholder", "%zz"},
+		},
+		{
+			name:  "wrong clean forward URL omits its path",
+			alias: "probe",
+			route: `{"base_url":"https://api.anthropic.com/wrong-forward-path-placeholder","auth":"forward"}`,
+			wants: []string{`"probe"`, "forward", "base_url", "https://api.anthropic.com"},
+			forbids: []string{
+				"wrong-forward-path-placeholder",
+				"https://api.anthropic.com/wrong-forward-path-placeholder",
+			},
+		},
+		{
+			name:  "unsupported scheme omits its path",
+			alias: "probe",
+			route: `{"base_url":"ftp://files.example/unsupported-scheme-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants: []string{`"probe"`, "base_url must use https"},
+			forbids: []string{
+				"unsupported-scheme-placeholder",
+				"ftp://files.example/unsupported-scheme-placeholder",
+			},
+		},
+		{
+			name:  "public HTTP rejection omits its path",
+			alias: "probe",
+			route: `{"base_url":"http://files.example/public-http-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
+			wants: []string{`"probe"`, "base_url may only use http", "insecure"},
+			forbids: []string{
+				"public-http-placeholder",
+				"http://files.example/public-http-placeholder",
+			},
+		},
+		{
+			name:  "insecure loopback conflict omits its path",
+			alias: "probe",
+			route: `{"base_url":"http://127.0.0.1:8080/loopback-insecure-placeholder","auth":"inject","api_key_env_file":"KEY_FILE","insecure":true}`,
+			wants: []string{`"probe"`, "insecure is set", "loopback"},
+			forbids: []string{
+				"loopback-insecure-placeholder",
+				"http://127.0.0.1:8080/loopback-insecure-placeholder",
+			},
+		},
+		{
+			name:  "insecure HTTPS conflict omits its path",
+			alias: "probe",
+			route: `{"base_url":"https://files.example/insecure-https-placeholder","auth":"inject","api_key_env_file":"KEY_FILE","insecure":true}`,
+			wants: []string{`"probe"`, "insecure is set", "base_url already uses https"},
+			forbids: []string{
+				"insecure-https-placeholder",
+				"https://files.example/insecure-https-placeholder",
+			},
 		},
 	})
 }
@@ -428,8 +683,11 @@ func TestStrictDecodeRejectsMalformedRegistries(t *testing.T) {
 		wants []string
 	}{
 		{
-			name:  "unknown field inside a route",
-			body:  fixture("probe", `{"base_url":"https://api.anthropic.com","auth":"forward","bogus":1}`),
+			name: "unknown field inside a route",
+			body: fixture(
+				"probe",
+				`{"base_url":"https://api.anthropic.com","auth":"forward","bogus":1}`,
+			),
 			wants: []string{`"probe"`, "unknown field", "bogus"},
 		},
 		{
@@ -727,21 +985,24 @@ func TestValidateInsecure(t *testing.T) {
 			alias: "probe",
 			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
 				`"insecure":true}`,
-			wants: []string{`"probe"`, "insecure", "https://openrouter.ai/api"},
+			wants:   []string{`"probe"`, "insecure", "base_url already uses https"},
+			forbids: []string{"https://openrouter.ai/api"},
 		},
 		{
 			name:  "insecure on a loopback http route rejected",
 			alias: "probe",
 			route: `{"base_url":"http://127.0.0.1:8080","auth":"inject","api_key_env_file":"KEY_FILE",` +
 				`"insecure":true}`,
-			wants: []string{`"probe"`, "insecure", "http://127.0.0.1:8080"},
+			wants:   []string{`"probe"`, "insecure", "base_url is loopback"},
+			forbids: []string{"http://127.0.0.1:8080"},
 		},
 		{
 			name:  "insecure on a localhost http route rejected",
 			alias: "probe",
 			route: `{"base_url":"http://localhost:1234/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
 				`"insecure":true}`,
-			wants: []string{`"probe"`, "insecure", "http://localhost:1234/api"},
+			wants:   []string{`"probe"`, "insecure", "base_url is loopback"},
+			forbids: []string{"http://localhost:1234/api"},
 		},
 		{
 			name:  "insecure on a sigv4 route rejected",
