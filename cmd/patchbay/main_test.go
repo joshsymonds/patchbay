@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // envMap turns a fixed map into a lookup function, so a test resolves
@@ -132,6 +133,86 @@ func TestResolveConfig(t *testing.T) {
 				t.Fatalf("resolveConfig() = %+v; want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadRateCardsFileParsesExactJSONRates(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "rates.json")
+	if err := os.WriteFile(path, []byte(`[
+		{
+			"model":"openrouter/model",
+			"effective_from":"2026-05-01T12:00:00Z",
+			"source":"provider price sheet",
+			"rates_usd_per_million":{
+				"input":"3.00","output":"15.00","cache_read":"0.30",
+				"cache_creation":"3.75","cache_creation_5m":"3.75","cache_creation_1h":"6.00"
+			}
+		}
+	]`), 0o600); err != nil {
+		t.Fatalf("write rate cards: %v", err)
+	}
+	cards, err := loadRateCardsFile(path)
+	if err != nil {
+		t.Fatalf("loadRateCardsFile() returned error: %v", err)
+	}
+	if len(cards) != 1 || cards[0].InputNanoUSDPerMillion != 3_000_000_000 ||
+		cards[0].EffectiveFrom.Format(time.RFC3339) != "2026-05-01T12:00:00Z" {
+		t.Fatalf("parsed cards = %#v; want exact rate and timestamp", cards)
+	}
+}
+
+func TestLoadRateCardsFileRejectsMissingOrNonStringRates(t *testing.T) {
+	t.Parallel()
+
+	for _, contents := range []string{
+		`[{"model":"model","effective_from":"2026-05-01T12:00:00Z","source":"test","rates_usd_per_million":{}}]`,
+		`[{"model":"model","effective_from":"2026-05-01T12:00:00Z","source":"test","rates_usd_per_million":{"input":3}}]`,
+	} {
+		path := filepath.Join(t.TempDir(), "rates.json")
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatalf("write rate cards: %v", err)
+		}
+		if _, err := loadRateCardsFile(path); err == nil {
+			t.Fatal("loadRateCardsFile() returned nil error")
+		}
+	}
+}
+
+func TestServeGatewayFailsClosedOnNullRateCardsFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	rateCards := filepath.Join(dir, "rates.json")
+	if err := os.WriteFile(rateCards, []byte("null"), 0o600); err != nil {
+		t.Fatalf("write null rate cards: %v", err)
+	}
+	err := serveGateway(t.Context(), envMap(map[string]string{
+		"PATCHBAY_LISTEN":     "127.0.0.1:0",
+		"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
+		"PATCHBAY_LEDGER_DIR": filepath.Join(dir, "ledger"),
+		"PATCHBAY_USAGE_DB":   filepath.Join(dir, "usage.sqlite"),
+		"PATCHBAY_RATE_CARDS": rateCards,
+	}), quietLogger(), nil)
+	if err == nil || !strings.Contains(err.Error(), "load rate cards") {
+		t.Fatalf("serveGateway() error = %v; want fatal null rate-card error", err)
+	}
+}
+
+func TestServeGatewayFailsClosedOnInvalidRateCardsFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	err := serveGateway(t.Context(), envMap(map[string]string{
+		"PATCHBAY_LISTEN":     "127.0.0.1:0",
+		"PATCHBAY_REGISTRY":   filepath.Join(dir, "routes.json"),
+		"PATCHBAY_LEDGER_DIR": filepath.Join(dir, "ledger"),
+		"PATCHBAY_USAGE_DB":   filepath.Join(dir, "usage.sqlite"),
+		"PATCHBAY_RATE_CARDS": filepath.Join(dir, "missing-rates.json"),
+	}), quietLogger(), nil)
+	if err == nil || !strings.Contains(err.Error(), "load rate cards") {
+		t.Fatalf("serveGateway() error = %v; want fatal rate-card load error", err)
 	}
 }
 

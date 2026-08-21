@@ -20,6 +20,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +33,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joshsymonds/patchbay/internal/accounting"
 	"github.com/joshsymonds/patchbay/internal/buildinfo"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/proxy"
@@ -85,6 +87,7 @@ const (
 	envRegistry  = "PATCHBAY_REGISTRY"
 	envLedgerDir = "PATCHBAY_LEDGER_DIR"
 	envUsageDB   = "PATCHBAY_USAGE_DB"
+	envRateCards = "PATCHBAY_RATE_CARDS"
 	envConfigXDG = "XDG_CONFIG_HOME"
 	envStateXDG  = "XDG_STATE_HOME"
 	envHome      = "HOME"
@@ -128,6 +131,7 @@ type config struct {
 	registry  string
 	ledgerDir string
 	usageDB   string
+	rateCards string
 }
 
 // cli is everything one invocation needs from the process it runs in. A test
@@ -275,6 +279,16 @@ func serveGatewayWithHostname(
 	if usageErr != nil {
 		return fmt.Errorf("open usage database %s: %w", cfg.usageDB, usageErr)
 	}
+	if cfg.rateCards != "" {
+		cards, loadErr := loadRateCardsFile(cfg.rateCards)
+		if loadErr != nil {
+			return closeUsageAfterRateCardError(usageStore, cfg.rateCards, loadErr)
+		}
+		storeLoadErr := usageStore.LoadRateCards(ctx, cards)
+		if storeLoadErr != nil {
+			return closeUsageAfterRateCardError(usageStore, cfg.rateCards, storeLoadErr)
+		}
+	}
 	// Registered before drainRecords below, so LIFO defer order closes the usage
 	// store only after Drain returns. Rows still pending at a bounded drain timeout
 	// are the durable, auditable crash-equivalent signal for later inspection.
@@ -346,6 +360,89 @@ func drainRecords(pipeline *proxy.Proxy) {
 	pipeline.Drain(ctx)
 }
 
+type rateCardFileEntry struct {
+	Model              string `json:"model"`
+	EffectiveFrom      string `json:"effective_from"`
+	Source             string `json:"source"`
+	RatesUSDPerMillion struct {
+		Input           string `json:"input"`
+		Output          string `json:"output"`
+		CacheRead       string `json:"cache_read"`
+		CacheCreation   string `json:"cache_creation"`
+		CacheCreation5m string `json:"cache_creation_5m"`
+		CacheCreation1h string `json:"cache_creation_1h"`
+	} `json:"rates_usd_per_million"`
+}
+
+func loadRateCardsFile(path string) ([]usage.RateCard, error) {
+	contents, readErr := os.ReadFile(filepath.Clean(path))
+	if readErr != nil {
+		return nil, fmt.Errorf("read rate cards: %w", readErr)
+	}
+	var entries []rateCardFileEntry
+	if unmarshalErr := json.Unmarshal(contents, &entries); unmarshalErr != nil {
+		return nil, fmt.Errorf("parse JSON: %w", unmarshalErr)
+	}
+	if entries == nil {
+		return nil, errors.New("rate cards must be a JSON array")
+	}
+	cards := make([]usage.RateCard, 0, len(entries))
+	for index, entry := range entries {
+		effectiveFrom, parseErr := time.Parse(time.RFC3339, entry.EffectiveFrom)
+		if parseErr != nil {
+			return nil, fmt.Errorf("card %d effective_from: %w", index, parseErr)
+		}
+		rates := entry.RatesUSDPerMillion
+		input, err := parseRate(index, "input", rates.Input)
+		if err != nil {
+			return nil, err
+		}
+		output, err := parseRate(index, "output", rates.Output)
+		if err != nil {
+			return nil, err
+		}
+		cacheRead, err := parseRate(index, "cache_read", rates.CacheRead)
+		if err != nil {
+			return nil, err
+		}
+		cacheCreation, err := parseRate(index, "cache_creation", rates.CacheCreation)
+		if err != nil {
+			return nil, err
+		}
+		cacheCreation5m, err := parseRate(index, "cache_creation_5m", rates.CacheCreation5m)
+		if err != nil {
+			return nil, err
+		}
+		cacheCreation1h, err := parseRate(index, "cache_creation_1h", rates.CacheCreation1h)
+		if err != nil {
+			return nil, err
+		}
+		cards = append(cards, usage.RateCard{
+			Model:                            entry.Model,
+			EffectiveFrom:                    effectiveFrom,
+			InputNanoUSDPerMillion:           input,
+			OutputNanoUSDPerMillion:          output,
+			CacheReadNanoUSDPerMillion:       cacheRead,
+			CacheCreationNanoUSDPerMillion:   cacheCreation,
+			CacheCreation5mNanoUSDPerMillion: cacheCreation5m,
+			CacheCreation1hNanoUSDPerMillion: cacheCreation1h,
+			Source:                           entry.Source,
+		})
+	}
+	return cards, nil
+}
+
+func parseRate(index int, name, value string) (accounting.NanoUSD, error) {
+	if value == "" {
+		return 0, fmt.Errorf("card %d rate %q is required", index, name)
+	}
+	rate, err := accounting.ParseUSD(value)
+	if err != nil {
+		return 0, fmt.Errorf("card %d rate %q: %w", index, name, err)
+	}
+	return rate, nil
+}
+
 // resolveConfig reads the environment into a configuration. An explicit
 // setting always wins; otherwise the XDG directories decide, falling back to
 // the home directory's conventional paths. With none of the three there is
@@ -357,6 +454,7 @@ func resolveConfig(lookupEnv lookupEnvFunc) (config, error) {
 		registry:  value(lookupEnv, envRegistry),
 		ledgerDir: value(lookupEnv, envLedgerDir),
 		usageDB:   value(lookupEnv, envUsageDB),
+		rateCards: value(lookupEnv, envRateCards),
 	}
 
 	if cfg.registry == "" {
@@ -465,6 +563,14 @@ func closeLedger(ctx context.Context, led *ledger.Ledger, logger *slog.Logger) {
 	if err := led.Close(); err != nil {
 		logger.ErrorContext(ctx, "closing the ledger failed", slog.Any("error", err))
 	}
+}
+
+func closeUsageAfterRateCardError(store *usage.Store, path string, cause error) error {
+	cause = fmt.Errorf("load rate cards %s: %w", path, cause)
+	if err := store.Close(); err != nil {
+		return errors.Join(cause, fmt.Errorf("close usage database after rate-card load failure: %w", err))
+	}
+	return cause
 }
 
 // closeUsage releases the usage store after record goroutines have drained.

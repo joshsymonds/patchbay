@@ -10,6 +10,8 @@ import (
 
 const finalizedResponseAccountingMigrationVersion = 2
 
+const rateCardsAndFinalCostMigrationVersion = 3
+
 type migration struct {
 	version    int
 	name       string
@@ -97,6 +99,43 @@ func declaredMigrations() []migration {
 				END`,
 				`CREATE UNIQUE INDEX accounting_requests_finalized_response_id ON accounting_requests(response_id) WHERE lifecycle_state = 'finalized' AND response_id IS NOT NULL AND response_id <> ''`,
 			},
+		},
+		rateCardsAndFinalCostMigration(),
+	}
+}
+
+func rateCardsAndFinalCostMigration() migration {
+	return migration{
+		version: rateCardsAndFinalCostMigrationVersion,
+		name:    "rate_cards_and_final_cost",
+		statements: []string{
+			`CREATE TABLE rate_cards (
+				id INTEGER PRIMARY KEY,
+				model TEXT NOT NULL,
+				effective_from INTEGER NOT NULL,
+				input_nano_usd_per_million INTEGER NOT NULL CHECK (input_nano_usd_per_million >= 0),
+				output_nano_usd_per_million INTEGER NOT NULL CHECK (output_nano_usd_per_million >= 0),
+				cache_read_nano_usd_per_million INTEGER NOT NULL CHECK (cache_read_nano_usd_per_million >= 0),
+				cache_creation_nano_usd_per_million INTEGER NOT NULL CHECK (cache_creation_nano_usd_per_million >= 0),
+				cache_creation_5m_nano_usd_per_million INTEGER NOT NULL CHECK (cache_creation_5m_nano_usd_per_million >= 0),
+				cache_creation_1h_nano_usd_per_million INTEGER NOT NULL CHECK (cache_creation_1h_nano_usd_per_million >= 0),
+				source TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				UNIQUE(model, effective_from)
+			)`,
+			`CREATE TRIGGER rate_cards_forbid_update
+			BEFORE UPDATE ON rate_cards
+			BEGIN
+				SELECT RAISE(ABORT, 'rate cards are immutable');
+			END`,
+			`CREATE TRIGGER rate_cards_forbid_delete
+			BEFORE DELETE ON rate_cards
+			BEGIN
+				SELECT RAISE(ABORT, 'rate cards are immutable');
+			END`,
+			`ALTER TABLE accounting_requests ADD COLUMN cost_basis TEXT CHECK (cost_basis IS NULL OR cost_basis IN ('provider_reported', 'rate_card', 'zero_marginal', 'unknown'))`,
+			`ALTER TABLE accounting_requests ADD COLUMN final_cost_nano_usd INTEGER CHECK (final_cost_nano_usd IS NULL OR final_cost_nano_usd >= 0)`,
+			`ALTER TABLE accounting_requests ADD COLUMN rate_card_id INTEGER CHECK (rate_card_id IS NULL OR rate_card_id > 0) REFERENCES rate_cards(id)`,
 		},
 	}
 }

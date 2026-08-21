@@ -238,6 +238,14 @@ overrides the durable accounting database, which defaults to
 `$HOME/.local/state/patchbay/usage.sqlite`). Unlike the ledger, Patchbay will
 not start if the accounting database cannot be opened.
 
+`PATCHBAY_RATE_CARDS` optionally names a JSON file containing immutable,
+effective-dated per-million-token rates. Each entry has `model`, RFC3339
+`effective_from`, `source`, and string-valued `rates_usd_per_million` fields:
+`input`, `output`, `cache_read`, `cache_creation`, `cache_creation_5m`, and
+`cache_creation_1h`. Patchbay parses rates exactly as decimal USD, and will not
+start if the file cannot be read or parsed or conflicts with a card already
+recorded in the usage database.
+
 ## Security model
 
 patchbay binds `127.0.0.1:4100` by default, and that default matters: the

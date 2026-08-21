@@ -215,7 +215,10 @@ func (store *Store) InsertPending(ctx context.Context, request PendingRequest) (
 	return id, nil
 }
 
-const finalizeUpdateArgumentCount = 41
+const (
+	finalizeUpdateArgumentCount = 44
+	finalizedLifecycleState     = "finalized"
+)
 
 type finalizedSnapshot struct {
 	completedAt                int64
@@ -239,8 +242,16 @@ type finalizedSnapshot struct {
 	costStatus                 string
 }
 
+type finalCost struct {
+	basis      sql.NullString
+	amount     sql.NullInt64
+	rateCardID sql.NullInt64
+}
+
 type finalizationState struct {
 	startedAt            int64
+	resolvedModel        string
+	billingClass         sql.NullString
 	upstreamDispatchedAt sql.NullInt64
 	upstreamContacted    int64
 	lifecycleState       string
@@ -265,12 +276,22 @@ func (store *Store) Finalize(ctx context.Context, id int64, finalized FinalizedR
 	if validationErr := validateFinalizationState(id, state, snapshot); validationErr != nil {
 		return validationErr
 	}
+	if state.lifecycleState == finalizedLifecycleState {
+		return nil
+	}
+	cost, err := store.deriveFinalCost(ctx, state, snapshot)
+	if err != nil {
+		return fmt.Errorf("finalize request %d: derive final cost: %w", id, err)
+	}
 
 	result, err := store.db.ExecContext(ctx, `UPDATE accounting_requests SET
 		completed_at = ?,
 		lifecycle_state = 'finalized',
 		outcome = ?,
 		cost_status = ?,
+		cost_basis = CASE WHEN lifecycle_state = 'pending' THEN ? ELSE cost_basis END,
+		final_cost_nano_usd = CASE WHEN lifecycle_state = 'pending' THEN ? ELSE final_cost_nano_usd END,
+		rate_card_id = CASE WHEN lifecycle_state = 'pending' THEN ? ELSE rate_card_id END,
 		response_id = ?,
 		http_status = ?,
 		normalization_complete = ?,
@@ -313,7 +334,7 @@ func (store *Store) Finalize(ctx context.Context, id int64, finalized FinalizedR
 			AND block_shape IS ?
 			AND duration_ms IS ?
 			AND upstream_ms IS ?)
-	)`, snapshot.updateArguments(id)...)
+	)`, snapshot.updateArguments(id, cost)...)
 	if err != nil {
 		return fmt.Errorf("finalize request %d: update finalized snapshot: %w", id, err)
 	}
@@ -519,12 +540,15 @@ func boolInteger(value bool) int64 {
 	return 0
 }
 
-func (snapshot finalizedSnapshot) updateArguments(id int64) []any {
+func (snapshot finalizedSnapshot) updateArguments(id int64, cost finalCost) []any {
 	values := make([]any, 0, finalizeUpdateArgumentCount)
 	values = append(values,
 		snapshot.completedAt,
 		snapshot.outcome,
 		snapshot.costStatus,
+		nullableValue(cost.basis),
+		nullableValue(cost.amount),
+		nullableValue(cost.rateCardID),
 		nullableValue(snapshot.responseID),
 		nullableValue(snapshot.httpStatus),
 		snapshot.normalizationComplete,
@@ -590,6 +614,8 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 	var outcome, stopReason, blockShape sql.NullString
 	err := store.db.QueryRowContext(ctx, `SELECT
 		started_at,
+		resolved_model,
+		billing_class,
 		upstream_dispatched_at,
 		upstream_contacted,
 		lifecycle_state,
@@ -614,6 +640,8 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 		cost_status
 	FROM accounting_requests WHERE id = ?`, id).Scan(
 		&state.startedAt,
+		&state.resolvedModel,
+		&state.billingClass,
 		&state.upstreamDispatchedAt,
 		&state.upstreamContacted,
 		&state.lifecycleState,
@@ -643,7 +671,7 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 	if err != nil {
 		return finalizationState{}, fmt.Errorf("finalize request %d: inspect request state: %w", id, err)
 	}
-	if state.lifecycleState != "finalized" {
+	if state.lifecycleState != finalizedLifecycleState {
 		return state, nil
 	}
 	if !completedAt.Valid || !outcome.Valid || !normalizationComplete.Valid ||
@@ -662,6 +690,94 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 	state.snapshot.durationMS = durationMS.Int64
 	state.snapshot.upstreamMS = upstreamMS.Int64
 	return state, nil
+}
+
+func (store *Store) deriveFinalCost(
+	ctx context.Context,
+	state finalizationState,
+	snapshot finalizedSnapshot,
+) (finalCost, error) {
+	if snapshot.providerCostPresent == 1 && snapshot.providerCostValid == 1 {
+		return finalCost{
+			basis:  sql.NullString{String: "provider_reported", Valid: true},
+			amount: sql.NullInt64{Int64: snapshot.providerCostNanoUSD, Valid: true},
+		}, nil
+	}
+	if state.billingClass.Valid &&
+		(state.billingClass.String == billing.ClassSubscription.String() ||
+			state.billingClass.String == billing.ClassSelfHosted.String()) {
+		return finalCost{
+			basis:  sql.NullString{String: "zero_marginal", Valid: true},
+			amount: sql.NullInt64{Int64: 0, Valid: true},
+		}, nil
+	}
+	if snapshot.outcome != OutcomeSuccess.String() || snapshot.normalizationComplete != 1 ||
+		!snapshot.inputTokens.Valid || !snapshot.outputTokens.Valid {
+		return unknownFinalCost(), nil
+	}
+	card, found, err := store.lookupEffectiveRateCard(ctx, state.resolvedModel, state.startedAt)
+	if err != nil {
+		return finalCost{}, err
+	}
+	if !found {
+		return unknownFinalCost(), nil
+	}
+	amount, priced := priceRateCard(card, snapshot)
+	if !priced {
+		return unknownFinalCost(), nil
+	}
+	return finalCost{
+		basis:      sql.NullString{String: "rate_card", Valid: true},
+		amount:     sql.NullInt64{Int64: int64(amount), Valid: true},
+		rateCardID: sql.NullInt64{Int64: card.id, Valid: true},
+	}, nil
+}
+
+func unknownFinalCost() finalCost {
+	return finalCost{basis: sql.NullString{String: "unknown", Valid: true}}
+}
+
+type pricedTokens struct {
+	rate   accounting.NanoUSD
+	tokens sql.NullInt64
+}
+
+func priceRateCard(card storedRateCard, snapshot finalizedSnapshot) (accounting.NanoUSD, bool) {
+	amount, priced := addPricedTokens(0, []pricedTokens{
+		{card.InputNanoUSDPerMillion, snapshot.inputTokens},
+		{card.OutputNanoUSDPerMillion, snapshot.outputTokens},
+		{card.CacheReadNanoUSDPerMillion, snapshot.cacheReadInputTokens},
+	})
+	if !priced {
+		return 0, false
+	}
+	if snapshot.cacheCreation5mInputTokens.Valid || snapshot.cacheCreation1hInputTokens.Valid {
+		return addPricedTokens(amount, []pricedTokens{
+			{card.CacheCreation5mNanoUSDPerMillion, snapshot.cacheCreation5mInputTokens},
+			{card.CacheCreation1hNanoUSDPerMillion, snapshot.cacheCreation1hInputTokens},
+		})
+	}
+	return addPricedTokens(amount, []pricedTokens{
+		{card.CacheCreationNanoUSDPerMillion, snapshot.cacheCreationInputTokens},
+	})
+}
+
+func addPricedTokens(amount accounting.NanoUSD, entries []pricedTokens) (accounting.NanoUSD, bool) {
+	for _, entry := range entries {
+		if !entry.tokens.Valid {
+			continue
+		}
+		priced, multiplyErr := accounting.MultiplyPerMillion(entry.rate, entry.tokens.Int64)
+		if multiplyErr != nil {
+			return 0, false
+		}
+		var addErr error
+		amount, addErr = accounting.Add(amount, priced)
+		if addErr != nil {
+			return 0, false
+		}
+	}
+	return amount, true
 }
 
 func validateFinalizationState(id int64, state finalizationState, snapshot finalizedSnapshot) error {
@@ -694,7 +810,7 @@ func validateFinalizationState(id int64, state finalizationState, snapshot final
 	switch state.lifecycleState {
 	case "pending":
 		return nil
-	case "finalized":
+	case finalizedLifecycleState:
 		if state.snapshot == snapshot {
 			return nil
 		}

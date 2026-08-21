@@ -67,6 +67,9 @@ type storedRequest struct {
 	blockShape                 sql.NullString
 	durationMS                 sql.NullInt64
 	upstreamMS                 sql.NullInt64
+	costBasis                  sql.NullString
+	finalCostNanoUSD           sql.NullInt64
+	rateCardID                 sql.NullInt64
 }
 
 func TestRequestKindClosedVocabulary(t *testing.T) {
@@ -2295,7 +2298,10 @@ func readStoredRequest(t *testing.T, db *sql.DB, id int64) storedRequest {
 		stop_reason,
 		block_shape,
 		duration_ms,
-		upstream_ms
+		upstream_ms,
+		cost_basis,
+		final_cost_nano_usd,
+		rate_card_id
 	FROM accounting_requests
 	WHERE id = ?`, id).Scan(
 		&request.id,
@@ -2333,6 +2339,9 @@ func readStoredRequest(t *testing.T, db *sql.DB, id int64) storedRequest {
 		&request.blockShape,
 		&request.durationMS,
 		&request.upstreamMS,
+		&request.costBasis,
+		&request.finalCostNanoUSD,
+		&request.rateCardID,
 	); err != nil {
 		t.Fatalf("read accounting request %d: %v", id, err)
 	}

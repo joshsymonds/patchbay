@@ -69,8 +69,8 @@ func TestOpenCreatesSecureMigratedDatabase(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read migration version: %v", err)
 	}
-	if version != 2 {
-		t.Fatalf("migration version = %d; want 2", version)
+	if version != rateCardsAndFinalCostMigrationVersion {
+		t.Fatalf("migration version = %d; want %d", version, rateCardsAndFinalCostMigrationVersion)
 	}
 
 	var table string
@@ -244,8 +244,9 @@ func TestOpenIsIdempotent(t *testing.T) {
 		Scan(&count, &version); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 || version != 2 {
-		t.Fatalf("migration rows = %d, max version = %d; want 2, 2", count, version)
+	if count != rateCardsAndFinalCostMigrationVersion || version != rateCardsAndFinalCostMigrationVersion {
+		t.Fatalf("migration rows = %d, max version = %d; want %d, %d",
+			count, version, rateCardsAndFinalCostMigrationVersion, rateCardsAndFinalCostMigrationVersion)
 	}
 }
 
@@ -298,6 +299,9 @@ func TestAccountingRequestsSchema(t *testing.T) {
 		{"block_shape", "TEXT", 0, 0},
 		{"duration_ms", "INTEGER", 0, 0},
 		{"upstream_ms", "INTEGER", 0, 0},
+		{"cost_basis", "TEXT", 0, 0},
+		{"final_cost_nano_usd", "INTEGER", 0, 0},
+		{"rate_card_id", "INTEGER", 0, 0},
 	}
 
 	rows, err := db.Query(`PRAGMA table_info(accounting_requests)`)
@@ -452,13 +456,13 @@ func TestFinalizedSnapshotTriggerPreservesPendingRows(t *testing.T) {
 	}
 }
 
-func TestMigrationTwoPreservesExistingPendingData(t *testing.T) {
+func TestRateCardsMigrationPreservesExistingPendingData(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "usage.sqlite")
 	db := inspectDB(t, path)
-	if err := applyMigrations(db, declaredMigrations()[:1]); err != nil {
-		t.Fatalf("apply migration 1: %v", err)
+	if err := applyMigrations(db, declaredMigrations()[:2]); err != nil {
+		t.Fatalf("apply migrations 1-2: %v", err)
 	}
 	const startedAt int64 = 1_776_912_345_678_901_234
 	if _, err := db.Exec(`INSERT INTO accounting_requests (
@@ -478,16 +482,27 @@ func TestMigrationTwoPreservesExistingPendingData(t *testing.T) {
 	store := openStore(t, path)
 	var gotStartedAt int64
 	var lifecycle, costStatus string
-	var responseID sql.NullString
-	if err := store.db.QueryRow(`SELECT started_at, lifecycle_state, cost_status, response_id
+	var responseID, costBasis sql.NullString
+	var finalCost, rateCardID sql.NullInt64
+	if err := store.db.QueryRow(`SELECT started_at, lifecycle_state, cost_status, response_id,
+		cost_basis, final_cost_nano_usd, rate_card_id
 		FROM accounting_requests WHERE id = 1`).Scan(
-		&gotStartedAt, &lifecycle, &costStatus, &responseID,
+		&gotStartedAt, &lifecycle, &costStatus, &responseID, &costBasis, &finalCost, &rateCardID,
 	); err != nil {
 		t.Fatalf("read migrated pending row: %v", err)
 	}
-	if gotStartedAt != startedAt || lifecycle != "pending" || costStatus != "pending" || responseID.Valid {
-		t.Fatalf("migrated row = start %d lifecycle %q cost %q response %#v; want preserved pending row",
-			gotStartedAt, lifecycle, costStatus, responseID)
+	if gotStartedAt != startedAt || lifecycle != "pending" || costStatus != "pending" || responseID.Valid ||
+		costBasis.Valid || finalCost.Valid || rateCardID.Valid {
+		t.Fatalf(
+			"migrated row = start %d lifecycle %q cost %q response %#v basis %#v amount %#v card %#v; want preserved pending row",
+			gotStartedAt,
+			lifecycle,
+			costStatus,
+			responseID,
+			costBasis,
+			finalCost,
+			rateCardID,
+		)
 	}
 }
 
@@ -591,7 +606,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	}
 	defer db.Close()
 
-	failing := migration{version: 3, name: "fail", statements: []string{
+	failing := migration{version: 4, name: "fail", statements: []string{
 		`CREATE TABLE must_not_survive (id INTEGER)`,
 		`THIS IS NOT SQL`,
 	}}
@@ -608,7 +623,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	if count != 0 {
 		t.Fatal("failed migration published partial schema")
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 3`).
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 4`).
 		Scan(&count); err != nil {
 		t.Fatal(err)
 	}
