@@ -66,11 +66,11 @@ func TestOpenCreatesSecureMigratedDatabase(t *testing.T) {
 	assertConnectionPragmas(t, db)
 
 	var version int
-	if err := db.QueryRow(`SELECT version FROM schema_migrations`).Scan(&version); err != nil {
+	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read migration version: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("migration version = %d; want 1", version)
+	if version != 2 {
+		t.Fatalf("migration version = %d; want 2", version)
 	}
 
 	var table string
@@ -244,8 +244,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 		Scan(&count, &version); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 || version != 1 {
-		t.Fatalf("migration rows = %d, max version = %d; want 1, 1", count, version)
+	if count != 2 || version != 2 {
+		t.Fatalf("migration rows = %d, max version = %d; want 2, 2", count, version)
 	}
 }
 
@@ -282,6 +282,22 @@ func TestAccountingRequestsSchema(t *testing.T) {
 		{"billing_policy", "TEXT", 1, 0},
 		{"billing_class", "TEXT", 0, 0},
 		{"cost_status", "TEXT", 1, 0},
+		{"response_id", "TEXT", 0, 0},
+		{"http_status", "INTEGER", 0, 0},
+		{"normalization_complete", "INTEGER", 0, 0},
+		{"input_tokens", "INTEGER", 0, 0},
+		{"output_tokens", "INTEGER", 0, 0},
+		{"cache_creation_input_tokens", "INTEGER", 0, 0},
+		{"cache_read_input_tokens", "INTEGER", 0, 0},
+		{"cache_creation_5m_input_tokens", "INTEGER", 0, 0},
+		{"cache_creation_1h_input_tokens", "INTEGER", 0, 0},
+		{"provider_cost_present", "INTEGER", 0, 0},
+		{"provider_cost_valid", "INTEGER", 0, 0},
+		{"provider_cost_nano_usd", "INTEGER", 0, 0},
+		{"stop_reason", "TEXT", 0, 0},
+		{"block_shape", "TEXT", 0, 0},
+		{"duration_ms", "INTEGER", 0, 0},
+		{"upstream_ms", "INTEGER", 0, 0},
 	}
 
 	rows, err := db.Query(`PRAGMA table_info(accounting_requests)`)
@@ -311,6 +327,167 @@ func TestAccountingRequestsSchema(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("schema mismatch:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestFinalizedResponseAccountingMigrationDeclarationAndIndex(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+
+	var name string
+	if err := store.db.QueryRow(
+		`SELECT name FROM schema_migrations WHERE version = 2`,
+	).Scan(&name); err != nil {
+		t.Fatalf("read migration 2 name: %v", err)
+	}
+	if name != "finalized_response_accounting" {
+		t.Fatalf("migration 2 name = %q; want %q", name, "finalized_response_accounting")
+	}
+
+	var indexSQL string
+	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master
+		WHERE type = 'index' AND name = 'accounting_requests_finalized_response_id'`).Scan(&indexSQL); err != nil {
+		t.Fatalf("read finalized response ID index: %v", err)
+	}
+	want := "CREATE UNIQUE INDEX accounting_requests_finalized_response_id ON accounting_requests(response_id) WHERE lifecycle_state = 'finalized' AND response_id IS NOT NULL AND response_id <> ''"
+	if indexSQL != want {
+		t.Fatalf("finalized response ID index SQL = %q; want %q", indexSQL, want)
+	}
+}
+
+func TestFinalizedAccountingColumnConstraints(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name   string
+		column string
+		value  int64
+	}{
+		{name: "normalization boolean below range", column: "normalization_complete", value: -1},
+		{name: "normalization boolean above range", column: "normalization_complete", value: 2},
+		{name: "provider present boolean", column: "provider_cost_present", value: 2},
+		{name: "provider valid boolean", column: "provider_cost_valid", value: -1},
+		{name: "input tokens", column: "input_tokens", value: -1},
+		{name: "output tokens", column: "output_tokens", value: -1},
+		{name: "cache creation tokens", column: "cache_creation_input_tokens", value: -1},
+		{name: "cache read tokens", column: "cache_read_input_tokens", value: -1},
+		{name: "cache 5m tokens", column: "cache_creation_5m_input_tokens", value: -1},
+		{name: "cache 1h tokens", column: "cache_creation_1h_input_tokens", value: -1},
+		{name: "provider cost", column: "provider_cost_nano_usd", value: -1},
+		{name: "duration", column: "duration_ms", value: -1},
+		{name: "upstream duration", column: "upstream_ms", value: -1},
+		{name: "HTTP below range", column: "http_status", value: 99},
+		{name: "HTTP above range", column: "http_status", value: 600},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "usage.sqlite")
+			store := openStore(t, path)
+			id, err := store.InsertPending(context.Background(), validPendingRequest())
+			if err != nil {
+				t.Fatalf("InsertPending() returned error: %v", err)
+			}
+
+			query := fmt.Sprintf(`UPDATE accounting_requests SET %s = ? WHERE id = ?`, test.column)
+			if _, err := store.db.Exec(query, test.value, id); err == nil {
+				t.Fatalf("setting %s to %d returned nil error", test.column, test.value)
+			}
+			var stored sql.NullInt64
+			query = fmt.Sprintf(`SELECT %s FROM accounting_requests WHERE id = ?`, test.column)
+			if err := store.db.QueryRow(query, id).Scan(&stored); err != nil {
+				t.Fatalf("read %s: %v", test.column, err)
+			}
+			if stored.Valid {
+				t.Fatalf("%s = %#v after rejected update; want NULL", test.column, stored)
+			}
+		})
+	}
+}
+
+func TestFinalizedSnapshotTriggerPreservesPendingRows(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+	id := insertPendingRequest(t, store)
+
+	if _, err := store.db.Exec(`UPDATE accounting_requests
+		SET lifecycle_state = 'finalized' WHERE id = ?`, id); err == nil {
+		t.Fatal("incomplete finalized snapshot update returned nil error")
+	}
+	var lifecycle string
+	if err := store.db.QueryRow(`SELECT lifecycle_state FROM accounting_requests WHERE id = ?`, id).
+		Scan(&lifecycle); err != nil {
+		t.Fatalf("read lifecycle after trigger failure: %v", err)
+	}
+	if lifecycle != "pending" {
+		t.Fatalf("lifecycle after trigger failure = %q; want pending", lifecycle)
+	}
+
+	if _, err := store.db.Exec(`UPDATE accounting_requests SET
+		completed_at = started_at,
+		lifecycle_state = 'finalized',
+		outcome = 'success',
+		cost_status = 'known',
+		normalization_complete = 1,
+		provider_cost_present = 0,
+		provider_cost_valid = 1,
+		provider_cost_nano_usd = 0,
+		stop_reason = '',
+		block_shape = '[]',
+		duration_ms = 0,
+		upstream_ms = 0
+		WHERE id = ?`, id); err == nil {
+		t.Fatal("invalid provider-cost tuple update returned nil error")
+	}
+	if err := store.db.QueryRow(`SELECT lifecycle_state FROM accounting_requests WHERE id = ?`, id).
+		Scan(&lifecycle); err != nil {
+		t.Fatalf("read lifecycle after tuple trigger failure: %v", err)
+	}
+	if lifecycle != "pending" {
+		t.Fatalf("lifecycle after tuple trigger failure = %q; want pending", lifecycle)
+	}
+}
+
+func TestMigrationTwoPreservesExistingPendingData(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	db := inspectDB(t, path)
+	if err := applyMigrations(db, declaredMigrations()[:1]); err != nil {
+		t.Fatalf("apply migration 1: %v", err)
+	}
+	const startedAt int64 = 1_776_912_345_678_901_234
+	if _, err := db.Exec(`INSERT INTO accounting_requests (
+		started_at, completed_at, upstream_dispatched_at, request_kind, lifecycle_state,
+		outcome, upstream_contacted, route_host, route_context, route_alias, route_upstream,
+		request_model, resolved_model, auth_mode, credential_class, billing_policy,
+		billing_class, cost_status
+	) VALUES (?, NULL, NULL, 'messages', 'pending', NULL, 0, 'gnomon', 'personal', NULL,
+		'https://api.anthropic.com', 'claude-opus-5', 'claude-opus-5', 'forward', 'oauth',
+		'credential_derived', 'subscription', 'pending')`, startedAt); err != nil {
+		t.Fatalf("insert migration-1 pending row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close migration-1 database: %v", err)
+	}
+
+	store := openStore(t, path)
+	var gotStartedAt int64
+	var lifecycle, costStatus string
+	var responseID sql.NullString
+	if err := store.db.QueryRow(`SELECT started_at, lifecycle_state, cost_status, response_id
+		FROM accounting_requests WHERE id = 1`).Scan(
+		&gotStartedAt, &lifecycle, &costStatus, &responseID,
+	); err != nil {
+		t.Fatalf("read migrated pending row: %v", err)
+	}
+	if gotStartedAt != startedAt || lifecycle != "pending" || costStatus != "pending" || responseID.Valid {
+		t.Fatalf("migrated row = start %d lifecycle %q cost %q response %#v; want preserved pending row",
+			gotStartedAt, lifecycle, costStatus, responseID)
 	}
 }
 
@@ -414,7 +591,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	}
 	defer db.Close()
 
-	failing := migration{version: 2, name: "fail", statements: []string{
+	failing := migration{version: 3, name: "fail", statements: []string{
 		`CREATE TABLE must_not_survive (id INTEGER)`,
 		`THIS IS NOT SQL`,
 	}}
@@ -431,7 +608,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	if count != 0 {
 		t.Fatal("failed migration published partial schema")
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 2`).
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 3`).
 		Scan(&count); err != nil {
 		t.Fatal(err)
 	}

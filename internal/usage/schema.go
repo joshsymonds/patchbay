@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const finalizedResponseAccountingMigrationVersion = 2
+
 type migration struct {
 	version    int
 	name       string
@@ -41,6 +43,59 @@ func declaredMigrations() []migration {
 					billing_class TEXT,
 					cost_status TEXT NOT NULL
 				)`,
+			},
+		},
+		{
+			version: finalizedResponseAccountingMigrationVersion,
+			name:    "finalized_response_accounting",
+			statements: []string{
+				`ALTER TABLE accounting_requests ADD COLUMN response_id TEXT`,
+				`ALTER TABLE accounting_requests ADD COLUMN http_status INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599)`,
+				`ALTER TABLE accounting_requests ADD COLUMN normalization_complete INTEGER CHECK (normalization_complete IS NULL OR normalization_complete IN (0, 1))`,
+				`ALTER TABLE accounting_requests ADD COLUMN input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0)`,
+				`ALTER TABLE accounting_requests ADD COLUMN output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0)`,
+				`ALTER TABLE accounting_requests ADD COLUMN cache_creation_input_tokens INTEGER CHECK (cache_creation_input_tokens IS NULL OR cache_creation_input_tokens >= 0)`,
+				`ALTER TABLE accounting_requests ADD COLUMN cache_read_input_tokens INTEGER CHECK (cache_read_input_tokens IS NULL OR cache_read_input_tokens >= 0)`,
+				`ALTER TABLE accounting_requests ADD COLUMN cache_creation_5m_input_tokens INTEGER CHECK (cache_creation_5m_input_tokens IS NULL OR cache_creation_5m_input_tokens >= 0)`,
+				`ALTER TABLE accounting_requests ADD COLUMN cache_creation_1h_input_tokens INTEGER CHECK (cache_creation_1h_input_tokens IS NULL OR cache_creation_1h_input_tokens >= 0)`,
+				`ALTER TABLE accounting_requests ADD COLUMN provider_cost_present INTEGER CHECK (provider_cost_present IS NULL OR provider_cost_present IN (0, 1))`,
+				`ALTER TABLE accounting_requests ADD COLUMN provider_cost_valid INTEGER CHECK (provider_cost_valid IS NULL OR provider_cost_valid IN (0, 1))`,
+				`ALTER TABLE accounting_requests ADD COLUMN provider_cost_nano_usd INTEGER CHECK (provider_cost_nano_usd IS NULL OR provider_cost_nano_usd >= 0)`,
+				`ALTER TABLE accounting_requests ADD COLUMN stop_reason TEXT`,
+				`ALTER TABLE accounting_requests ADD COLUMN block_shape TEXT`,
+				`ALTER TABLE accounting_requests ADD COLUMN duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0)`,
+				`ALTER TABLE accounting_requests ADD COLUMN upstream_ms INTEGER CHECK (upstream_ms IS NULL OR upstream_ms >= 0)`,
+				`CREATE TRIGGER accounting_requests_validate_finalized_snapshot
+				BEFORE UPDATE ON accounting_requests
+				WHEN NEW.lifecycle_state = 'finalized' AND (
+					NEW.completed_at IS NULL
+					OR NEW.completed_at < NEW.started_at
+					OR NEW.outcome IS NULL
+					OR NEW.outcome NOT IN ('success', 'local_rejection', 'upstream_http_failure', 'transport_failure', 'response_interrupted', 'normalization_failure')
+					OR NEW.cost_status NOT IN ('known', 'unknown')
+					OR NEW.normalization_complete IS NULL
+					OR NEW.provider_cost_present IS NULL
+					OR NEW.provider_cost_valid IS NULL
+					OR NEW.provider_cost_nano_usd IS NULL
+					OR NOT (
+						(NEW.provider_cost_present = 0 AND NEW.provider_cost_valid = 0 AND NEW.provider_cost_nano_usd = 0)
+						OR (NEW.provider_cost_present = 1 AND NEW.provider_cost_valid = 0 AND NEW.provider_cost_nano_usd = 0)
+						OR (NEW.provider_cost_present = 1 AND NEW.provider_cost_valid = 1 AND NEW.provider_cost_nano_usd >= 0)
+					)
+					OR NEW.response_id = ''
+					OR NEW.stop_reason IS NULL
+					OR NEW.block_shape IS NULL
+					OR NEW.duration_ms IS NULL
+					OR NEW.upstream_ms IS NULL
+					OR NEW.upstream_contacted NOT IN (0, 1)
+					OR (NEW.upstream_contacted = 0 AND NEW.upstream_dispatched_at IS NOT NULL)
+					OR (NEW.upstream_contacted = 1 AND NEW.upstream_dispatched_at IS NULL)
+					OR (NEW.upstream_dispatched_at IS NOT NULL AND NEW.completed_at < NEW.upstream_dispatched_at)
+				)
+				BEGIN
+					SELECT RAISE(ABORT, 'invalid finalized accounting snapshot');
+				END`,
+				`CREATE UNIQUE INDEX accounting_requests_finalized_response_id ON accounting_requests(response_id) WHERE lifecycle_state = 'finalized' AND response_id IS NOT NULL AND response_id <> ''`,
 			},
 		},
 	}
