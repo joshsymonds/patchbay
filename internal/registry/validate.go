@@ -388,14 +388,13 @@ func validateUpstream(raw string, insecure bool) error {
 	return nil
 }
 
-// validateExtraBody holds the one arbitrary document a Seat carries to the two
-// rules that apply to it.
+// validateExtraBody holds the arbitrary provider document a Seat carries to
+// the rules that make it safe to merge over a request.
 //
-// Its keys are not schema-known — an operator merges whatever the provider
-// takes — so nothing here judges a name or a value. What it must be is an
-// object, because that is what merging over a request means, and canonical: a
-// repeated member is two values under one key, and the merge would carry
-// whichever the decoder happened to keep, at the root or anywhere below it.
+// It must be an object and canonical: a repeated member is two values under one
+// key, and the merge would carry whichever the decoder happened to keep, at the
+// root or anywhere below it. Its top-level model member is reserved because the
+// selected Seat is the sole authority for an upstream model rewrite.
 func validateExtraBody(body json.RawMessage) error {
 	if len(body) == 0 {
 		return nil
@@ -406,6 +405,13 @@ func validateExtraBody(body json.RawMessage) error {
 	}
 	if err := jsonstrict.RejectDuplicateNames(body); err != nil {
 		return fmt.Errorf("%s: %w", fieldExtraBody, err)
+	}
+	fields, err := object(body, fieldExtraBody)
+	if err != nil {
+		return err
+	}
+	if _, reserved := fields[fieldModel]; reserved {
+		return fmt.Errorf("%s must not set reserved member %q", fieldExtraBody, fieldModel)
 	}
 	return nil
 }

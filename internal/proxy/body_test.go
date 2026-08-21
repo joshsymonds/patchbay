@@ -11,6 +11,38 @@ import (
 	"github.com/joshsymonds/patchbay/internal/proxy"
 )
 
+func TestExtraBodyPreservesSeatModelRewrite(t *testing.T) {
+	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message"}`))
+	writeKeyFile(t, testAPIKey)
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistryDocument(t, []byte(fmt.Sprintf(
+			`{"default_context":"personal","seats":{"rewriter":{"upstream":%q,`+
+				`"model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":%q,`+
+				`"extra_body":{"reasoning_effort":"low"}}},`+
+				`"contexts":{"personal":{"default_seat":"rewriter","models":{}}}}`,
+			stub.url(), keyEnvName,
+		))),
+		Client: stub.server.Client(),
+		Host:   testHost,
+	}, messagesRequest(`{"model":"claude-opus-5","messages":[]}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want %d\nbody=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(stub.call(t).body, &body); err != nil {
+		t.Fatalf("decode upstream body: %v", err)
+	}
+	if got := string(body["model"]); got != `"openai/gpt-5.6-luna"` {
+		t.Fatalf("upstream model = %s; want Seat model rewrite", got)
+	}
+	if got := string(body["reasoning_effort"]); got != `"low"` {
+		t.Fatalf("upstream reasoning_effort = %s; want extra_body value", got)
+	}
+}
+
 func TestNullBodyRidesTheDefaultSeatUntouched(t *testing.T) {
 	t.Parallel()
 

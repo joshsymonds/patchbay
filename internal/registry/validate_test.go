@@ -842,6 +842,35 @@ func TestSeatExtraBodyMustBeAnObject(t *testing.T) {
 	})
 }
 
+func TestSeatExtraBodyReservesTopLevelModel(t *testing.T) {
+	t.Parallel()
+	runSeatCases(t, []seatCase{
+		{
+			name:  "inject seat with rewrite",
+			seat:  `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":"KEY_FILE","extra_body":{"model":"x"}}`,
+			wants: []string{"extra_body", "model"},
+		},
+		{
+			name:  "forward seat",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","extra_body":{"model":"x"}}`,
+			wants: []string{"extra_body", "model"},
+		},
+		{
+			name:  "sigv4 seat",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-west-2","model_map_env_file":"MODEL_MAP_FILE","extra_body":{"model":"x"}}`,
+			wants: []string{"extra_body", "model"},
+		},
+		{
+			name: "nested model accepted",
+			seat: `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":"KEY_FILE","extra_body":{"provider":{"model":"x"}}}`,
+		},
+		{
+			name: "case-sensitive Model accepted",
+			seat: `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":"KEY_FILE","extra_body":{"Model":"x"}}`,
+		},
+	})
+}
+
 // TestSeatExtraBodyRefusesRepeatedMembers holds the one arbitrary document the
 // registry carries to the same canonical rule as the document around it.
 //

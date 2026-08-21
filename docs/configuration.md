@@ -97,7 +97,7 @@ The registry rejects:
 - missing required fields;
 - null root, `seats`, `contexts`, Context, `models`, `subagents`, or
   `subagents.models` values;
-- null or non-object `extra_body`;
+- null or non-object `extra_body`, or an exact top-level `model` member within it;
 - unknown fields;
 - incompatible types;
 - malformed JSON or trailing data;
@@ -128,7 +128,7 @@ by ID.
 | `aws_profile` | AWS profile for a `sigv4` Seat. |
 | `aws_region` | AWS region used for signing and the Bedrock endpoint. |
 | `model_map_env_file` | Environment variable whose value is the Bedrock model-map path. |
-| `extra_body` | Object merged over top-level request fields. Seat values win. |
+| `extra_body` | Object merged over top-level request fields. The exact top-level member `model` is reserved; `Seat.model` is the sole model authority. Other Seat values win. |
 | `max_input_tokens` | Non-negative metadata published by model endpoints. It is not enforced. |
 | `max_output_tokens` | Non-negative ceiling applied to numeric request `max_tokens` values. |
 | `insecure` | Allows non-loopback HTTP on an `inject` Seat. |
@@ -152,11 +152,12 @@ those operations. SigV4 always performs an additional Bedrock translation. See
 | `claude` in Seat rewrite | Allowed | Forbidden, case-insensitive | Allowed |
 
 All token ceilings must be non-negative. `extra_body` must be an object when
-present. Its contents are arbitrary: an operator merges whatever the provider
-accepts, so no schema constrains which member names may appear inside it, what
-their values hold, or how deeply they nest. The single rule applied within it is
-uniqueness — no object anywhere inside it, at any depth and including objects
-carried in arrays, may name the same member twice.
+present. Its exact top-level `model` member is reserved so `Seat.model` remains
+the sole model authority; member names are case-sensitive, and nested `model`
+members remain allowed. Other contents are arbitrary: an operator merges
+whatever the provider accepts, so no schema constrains their member names,
+values, or depth. Every object inside `extra_body`, at any depth and including
+objects carried in arrays, must use unique member names.
 
 A public `context.models` selector containing `claude`, case-insensitively,
 cannot bind to an inject Seat. Marked-subagent model selectors are observed input
