@@ -216,11 +216,14 @@ patchbay routes [--ctx <name>]        list one context's aliases
 patchbay resolve <context> <model>    show which route one request would ride
 patchbay project [dir]                show which context a directory selects
 patchbay check [--registry <path>]    validate a registry file, no daemon needed
+patchbay usage snapshot <dest>        write a consistent SQLite usage database snapshot
+patchbay usage export <dest>          write a deterministic JSONL usage database export
 ```
 
-Everything but `serve` and `check` asks the running gateway over its
-introspection endpoint and needs the caller key. Details and worked output in
-[docs/cli.md](docs/cli.md).
+`contexts`, `routes`, `resolve`, and `project` ask the running gateway over its
+introspection endpoint and need the caller key. `usage snapshot` and `usage export`
+operate directly on the usage database and need neither a running gateway nor a
+caller key. Details and worked output in [docs/cli.md](docs/cli.md).
 
 ## Ledger
 
@@ -246,6 +249,21 @@ effective-dated per-million-token rates. Each entry has `model`, RFC3339
 `cache_creation_1h`. Patchbay parses rates exactly as decimal USD, and will not
 start if the file cannot be read or parsed or conflicts with a card already
 recorded in the usage database.
+
+### Usage backup and export
+
+`patchbay usage snapshot <dest>` makes an atomic SQLite snapshot that is
+consistent even while the daemon is writing. `patchbay usage export <dest>`
+writes the same point-in-time data as deterministic JSONL: a version header,
+then `rate_cards` rows and `accounting_requests` rows in ID order. Both commands
+read the database without migrating or changing it, refuse an existing
+destination, and create a 0600 destination file.
+
+The live `PATCHBAY_USAGE_DB` must remain on a local filesystem. Snapshot and
+export destinations can be anywhere. To restore a snapshot, stop the daemon,
+plain-copy the snapshot over the resolved `$PATCHBAY_USAGE_DB` path, then start
+the daemon. `patchbay serve` opens the restored database and automatically
+migrates an older-schema snapshot forward before serving.
 
 ### Usage summary
 

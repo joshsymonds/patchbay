@@ -58,6 +58,9 @@ const (
 	cmdResolve  = "resolve"
 	cmdProject  = "project"
 	cmdCheck    = "check"
+	cmdUsage    = "usage"
+
+	usageToolingArgumentCount = 2
 )
 
 // usageText is the whole command line, in the order an operator meets it.
@@ -70,12 +73,15 @@ commands:
   resolve <context> <model>    show which route one request would ride
   project [dir]                show which context a directory's Claude Code settings select
   check [--registry <path>]    validate a registry file without asking the gateway
+  usage snapshot <dest>        write a consistent SQLite usage database snapshot
+  usage export <dest>          write a deterministic JSONL usage database export
 
   -h, --help                   print this text
 
-The subcommands other than serve and check ask the running gateway, at
-$PATCHBAY_LISTEN (default ` + defaultListen + `), presenting the caller key
-named by $` + proxy.CallerKeyEnvFile + `.
+The contexts, routes, resolve, and project subcommands ask the running gateway,
+at $PATCHBAY_LISTEN (default ` + defaultListen + `), presenting the caller key
+named by $` + proxy.CallerKeyEnvFile + `. Usage snapshot and export operate
+directly on $PATCHBAY_USAGE_DB and need neither a running gateway nor a caller key.
 `
 
 // Environment variables patchbay reads. An unset or empty value takes the
@@ -197,6 +203,8 @@ func dispatch(ctx context.Context, args []string, invocation cli) int {
 		return invocation.project(ctx, rest)
 	case cmdCheck:
 		return invocation.check(rest)
+	case cmdUsage:
+		return invocation.usageTooling(ctx, rest)
 	case "-h", "--help", "help":
 		invocation.usage(invocation.stdout)
 
@@ -212,6 +220,43 @@ func dispatch(ctx context.Context, args []string, invocation cli) int {
 // usage prints the whole command line to w.
 func (c cli) usage(w io.Writer) {
 	fmt.Fprint(w, usageText)
+}
+
+// usageTooling writes a consistent snapshot or deterministic export of the
+// durable usage database without starting a daemon or changing the source.
+func (c cli) usageTooling(ctx context.Context, args []string) int {
+	if len(args) != usageToolingArgumentCount {
+		c.usage(c.stderr)
+
+		return exitUsage
+	}
+	operation, dest := args[0], args[1]
+	if operation != "snapshot" && operation != "export" {
+		c.fail(fmt.Errorf("unknown usage subcommand %q", operation))
+		c.usage(c.stderr)
+
+		return exitUsage
+	}
+	cfg, err := resolveConfig(c.lookupEnv)
+	if err != nil {
+		c.fail(err)
+
+		return exitFailure
+	}
+	var operationErr error
+	if operation == "snapshot" {
+		operationErr = usage.Snapshot(ctx, cfg.usageDB, dest)
+	} else {
+		operationErr = usage.Export(ctx, cfg.usageDB, dest)
+	}
+	if operationErr != nil {
+		c.fail(operationErr)
+
+		return exitFailure
+	}
+	fmt.Fprintf(c.stdout, "OK usage %s: %s\n", operation, dest)
+
+	return exitOK
 }
 
 // fail reports an operational failure on stderr, marked as patchbay's own.

@@ -16,6 +16,7 @@ import (
 	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/registry"
 	"github.com/joshsymonds/patchbay/internal/server"
+	"github.com/joshsymonds/patchbay/internal/usage"
 )
 
 // testCallerKey is the shared secret the CLI presents and the fake daemon
@@ -773,5 +774,90 @@ func TestCheckValidatesTheShippedExampleRegistry(t *testing.T) {
 	want := "OK " + example + ": 2 contexts (personal, work), 4 routes\n"
 	if got.stdout != want {
 		t.Fatalf("stdout = %q; want %q", got.stdout, want)
+	}
+}
+
+func TestUsageCommandsResolveTheDaemonUsageDatabase(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state")
+	source := filepath.Join(state, appDir, usageLeafFile)
+	store, err := usage.Open(source)
+	if err != nil {
+		t.Fatalf("open usage database: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close usage database: %v", err)
+	}
+
+	env := map[string]string{"XDG_STATE_HOME": state, "HOME": t.TempDir()}
+	snapshot := filepath.Join(t.TempDir(), "usage.snapshot.sqlite")
+	got := invoke(t, env, "usage", "snapshot", snapshot)
+	if got.code != exitOK {
+		t.Fatalf("usage snapshot code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
+	}
+	got.contains(t, "stdout", snapshot)
+
+	export := filepath.Join(t.TempDir(), "usage.export.jsonl")
+	got = invoke(t, env, "usage", "export", export)
+	if got.code != exitOK {
+		t.Fatalf("usage export code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
+	}
+	got.contains(t, "stdout", export)
+}
+
+func TestUsageCommandsRequireOneDestination(t *testing.T) {
+	for _, args := range [][]string{
+		{"usage"},
+		{"usage", "snapshot"},
+		{"usage", "export"},
+		{"usage", "snapshot", "one", "two"},
+		{"usage", "export", "one", "two"},
+		{"usage", "unknown", "one"},
+	} {
+		got := invoke(t, nil, args...)
+		if got.code != exitUsage {
+			t.Fatalf("%v code = %d; want %d", args, got.code, exitUsage)
+		}
+	}
+}
+
+func TestUsageSnapshotCoexistsWithServingDaemon(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "routes.json")
+	writeFile(t, registryPath, lunaRegistry)
+	callerKeyFile(t, testCallerKey)
+
+	logs := newLogRecorder()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan int, 1)
+	usageDB := filepath.Join(dir, "usage.sqlite")
+	env := map[string]string{
+		envListen:    "127.0.0.1:0",
+		envRegistry:  registryPath,
+		envLedgerDir: filepath.Join(dir, "ledger"),
+		envUsageDB:   usageDB,
+	}
+	go func() {
+		done <- dispatch(ctx, []string{"serve"}, cli{
+			stdout:    io.Discard,
+			stderr:    io.Discard,
+			lookupEnv: envMap(env),
+			logger:    slog.New(logs),
+		})
+	}()
+	logs.waitFor(t, "patchbay listening")
+
+	dest := filepath.Join(t.TempDir(), "usage.snapshot.sqlite")
+	got := invoke(t, map[string]string{envUsageDB: usageDB, envHome: t.TempDir()}, "usage", "snapshot", dest)
+	if got.code != exitOK {
+		t.Fatalf("usage snapshot with live daemon code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
+	}
+	export := filepath.Join(t.TempDir(), "usage.export.jsonl")
+	got = invoke(t, map[string]string{envUsageDB: usageDB, envHome: t.TempDir()}, "usage", "export", export)
+	if got.code != exitOK {
+		t.Fatalf("usage export with live daemon code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
+	}
+	cancel()
+	if code := <-done; code != exitOK {
+		t.Fatalf("serve exited %d; want %d", code, exitOK)
 	}
 }
