@@ -83,7 +83,7 @@ A Context has exactly:
 A present `subagents` object has exactly:
 
 - required `default_seat`;
-- required `models`.
+- optional `models`, defaulting to an empty exact-binding map.
 
 Every binding value is a Seat ID string. Inline Seat objects are invalid.
 `default_context`, Context IDs, Seat IDs, and all Seat references must resolve.

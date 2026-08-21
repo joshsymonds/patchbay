@@ -217,7 +217,7 @@ func parseSubagents(raw json.RawMessage) (Subagents, error) {
 	if fieldsErr := exactFields(
 		fields,
 		[]string{fieldDefaultSeat, fieldModels},
-		[]string{fieldDefaultSeat, fieldModels},
+		[]string{fieldDefaultSeat},
 	); fieldsErr != nil {
 		return Subagents{}, fieldsErr
 	}
@@ -229,11 +229,14 @@ func parseSubagents(raw json.RawMessage) (Subagents, error) {
 	); decodeErr != nil {
 		return Subagents{}, decodeErr
 	}
-	models, modelsErr := parseBindings(fieldModels, fields[fieldModels])
-	if modelsErr != nil {
-		return Subagents{}, modelsErr
+	out.Models = map[string]string{}
+	if rawModels, ok := fields[fieldModels]; ok {
+		models, modelsErr := parseBindings(fieldModels, rawModels)
+		if modelsErr != nil {
+			return Subagents{}, modelsErr
+		}
+		out.Models = models
 	}
-	out.Models = models
 	return out, nil
 }
 

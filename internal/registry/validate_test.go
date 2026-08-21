@@ -107,6 +107,62 @@ func TestStrictNewGrammarAndLegacyRejection(t *testing.T) {
 	}
 }
 
+func TestSubagentsModelsMayBeOmitted(t *testing.T) {
+	t.Parallel()
+	body := `{"default_context":"personal","seats":{` +
+		`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},` +
+		`"worker":{"upstream":"https://openrouter.ai/api","model":"worker-model",` +
+		`"auth_mode":"inject","api_key_env_file":"WORKER_KEY_FILE"}},` +
+		`"contexts":{"personal":{"default_seat":"anthropic","models":{},` +
+		`"subagents":{"default_seat":"worker"}}}}`
+	reg, err := registry.New(writeRegistry(t, t.TempDir()+"/registry.json", body))
+	if err != nil {
+		t.Fatalf("New() = %v; want default-only subagents admitted", err)
+	}
+
+	state := reg.State()
+	if got := state.Contexts["personal"].Subagents.Models; len(got) != 0 {
+		t.Fatalf("subagents models = %v; want empty exact-binding map", got)
+	}
+	res, err := reg.Resolve(
+		registry.Selection{Name: "personal", Explicit: true},
+		"unbound-model",
+		&registry.SubagentObservation{AgentID: "test-agent"},
+	)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	if res.SeatID != "worker" || res.Match.Kind != registry.SelectionSubagent || res.Match.Model != nil {
+		t.Fatalf("Resolve() = seat %q match %+v; want worker subagent default", res.SeatID, res.Match)
+	}
+}
+
+func TestSubagentsStrictFields(t *testing.T) {
+	t.Parallel()
+	const prefix = `{"default_context":"personal","seats":{"x":{"upstream":"https://api.anthropic.com","auth_mode":"forward"}},"contexts":{"personal":{"default_seat":"x","models":{},"subagents":`
+	for _, tc := range []struct {
+		name, subagents string
+		wants           []string
+	}{
+		{name: "missing default_seat", subagents: `{"models":{}}`, wants: []string{"default_seat"}},
+		{name: "null models", subagents: `{"default_seat":"x","models":null}`, wants: []string{"models", "null"}},
+		{name: "unknown field", subagents: `{"default_seat":"x","bogus":true}`, wants: []string{"unknown field", "bogus"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := registry.New(writeRegistry(t, t.TempDir()+"/registry.json", prefix+tc.subagents+`}}}`))
+			if err == nil {
+				t.Fatal("New() = nil error")
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestReferenceIDAndSelectorValidation(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

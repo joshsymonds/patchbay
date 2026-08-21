@@ -4,7 +4,7 @@
 # particular, publish the port to host loopback ONLY: anything that can reach
 # this socket can spend the caller's credentials.
 #
-# Note the one thing this image cannot do: `sigv4` routes exec the aws CLI,
+# Note the one thing this image cannot do: `sigv4` Seats exec the aws CLI,
 # which is not here. Registries using them need a native install (or the Nix
 # module) — see docs/docker.md.
 

@@ -332,7 +332,7 @@ func TestResolveKeepsOpaqueModelsOnOneLine(t *testing.T) {
 			t.Errorf("resolve %q emitted a blank line, so a value ended one: %q", value, got.stdout)
 		}
 		// One line per field, whatever bytes the selector carries.
-		if want := 18; len(lines(got.stdout)) != want {
+		if want := 19; len(lines(got.stdout)) != want {
 			t.Errorf("resolve %q printed %d lines; want %d\n%s",
 				value, len(lines(got.stdout)), want, got.stdout)
 		}
@@ -448,6 +448,73 @@ func TestSeatsAndBindingsTables(t *testing.T) {
 
 	if got := invoke(t, daemon.env(), "bindings"); got.code != exitUsage {
 		t.Fatalf("bindings without --ctx code=%d", got.code)
+	}
+}
+
+func TestResolvePrintsObservationClass(t *testing.T) {
+	callerKeyFile(t)
+	daemon := newFakeDaemon(t, sampleDocument())
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "ordinary",
+			args: []string{"resolve", "personal", "luna-fast"},
+			want: "context: \"personal\"\n" +
+				"request_model: \"luna-fast\"\n" +
+				"observation: \"none\"\n" +
+				"selection: \"model\"\n" +
+				"selection_model: \"luna-fast\"\n" +
+				"seat: \"luna\"\n" +
+				"auth_mode: \"inject\"\n" +
+				"upstream: \"https://openrouter.ai/api\"\n" +
+				"model: \"openai/gpt-5.6-luna\"\n" +
+				"config_source: \"OPENROUTER_API_KEY_FILE\"\n" +
+				"api_key_env_file: \"OPENROUTER_API_KEY_FILE\"\n" +
+				"aws_profile: null\n" +
+				"aws_region: null\n" +
+				"model_map_env_file: null\n" +
+				"max_input_tokens: 262144\n" +
+				"max_output_tokens: null\n" +
+				"insecure: false\n" +
+				"strip_cache_control: false\n" +
+				"capture_bodies: false\n",
+		},
+		{
+			name: "subagent",
+			args: []string{"resolve", "--subagent", "personal", "requested"},
+			want: "context: \"personal\"\n" +
+				"request_model: \"requested\"\n" +
+				"observation: \"subagent\"\n" +
+				"selection: \"subagent\"\n" +
+				"selection_model: \"requested\"\n" +
+				"seat: \"worker\"\n" +
+				"auth_mode: \"inject\"\n" +
+				"upstream: \"https://openrouter.ai/api\"\n" +
+				"model: \"openrouter/worker\"\n" +
+				"config_source: \"OPENROUTER_API_KEY_FILE\"\n" +
+				"api_key_env_file: \"OPENROUTER_API_KEY_FILE\"\n" +
+				"aws_profile: null\n" +
+				"aws_region: null\n" +
+				"model_map_env_file: null\n" +
+				"max_input_tokens: null\n" +
+				"max_output_tokens: null\n" +
+				"insecure: false\n" +
+				"strip_cache_control: false\n" +
+				"capture_bodies: false\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := invoke(t, daemon.env(), tc.args...)
+			if got.code != exitOK {
+				t.Fatalf("%+v", got)
+			}
+			if got.stdout != tc.want {
+				t.Fatalf("stdout:\n%s\nwant:\n%s", got.stdout, tc.want)
+			}
+		})
 	}
 }
 

@@ -24,8 +24,10 @@ func (c cli) resolve(ctx context.Context, args []string) int {
 		c.fail(err)
 		return exitFailure
 	}
+	observationClass := "none"
 	var observation *registry.SubagentObservation
 	if *subagent {
+		observationClass = "subagent"
 		observation = &registry.SubagentObservation{AgentID: "patchbay-cli"}
 	}
 	res, err := registry.ResolveState(
@@ -38,7 +40,7 @@ func (c cli) resolve(ctx context.Context, args []string) int {
 		c.fail(err)
 		return exitFailure
 	}
-	c.writeResolution(flags.Arg(1), res)
+	c.writeResolution(flags.Arg(1), observationClass, res)
 	return exitOK
 }
 
@@ -50,9 +52,13 @@ func (c cli) resolve(ctx context.Context, args []string) int {
 // used to print the same character, and the point of a resolution is to say
 // exactly which one this is. Booleans and numbers are neither, so they print
 // bare.
-func (c cli) writeResolution(requestModel string, res registry.Resolution) {
+func (c cli) writeResolution(
+	requestModel, observationClass string,
+	res registry.Resolution,
+) {
 	writeLine(c.stdout, "context", quoted(res.Context))
 	writeLine(c.stdout, "request_model", quoted(requestModel))
+	writeLine(c.stdout, "observation", quoted(observationClass))
 	writeLine(c.stdout, "selection", quoted(string(res.Match.Kind)))
 	writeLine(c.stdout, "selection_model", nullableString(res.Match.Model))
 	writeLine(c.stdout, "seat", quoted(res.SeatID))

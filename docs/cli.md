@@ -171,6 +171,7 @@ command does not substitute `default_context`.
 $ patchbay resolve personal openrouter/kimi-k2
 context: "personal"
 request_model: "openrouter/kimi-k2"
+observation: "none"
 selection: "model"
 selection_model: "openrouter/kimi-k2"
 seat: "openrouter-kimi-k2"
@@ -189,7 +190,9 @@ strip_cache_control: true
 capture_bodies: false
 ```
 
-`resolve` uses the same resolution implementation as the gateway, including
+`observation` identifies the input observation class explicitly: `"none"` for
+an ordinary resolution and `"subagent"` when `--subagent` supplies the marked
+observation. `resolve` uses the same resolution implementation as the gateway, including
 public binding precedence and protected foreign rewrite-target refusal. It does
 not read provider-key or model-map files, resolve file paths, export AWS
 credentials, or contact upstreams. SigV4 output shows only the model-map
@@ -205,6 +208,7 @@ binding or the marked-subagent default. The `personal` Context of
 $ patchbay resolve --subagent personal claude-opus-5
 context: "personal"
 request_model: "claude-opus-5"
+observation: "subagent"
 selection: "subagent"
 selection_model: "claude-opus-5"
 seat: "sol-subscription"
@@ -232,6 +236,7 @@ exact marked hit, and it is what ledger v2 stores:
 $ patchbay resolve --subagent personal some-unbound-model
 context: "personal"
 request_model: "some-unbound-model"
+observation: "subagent"
 selection: "subagent"
 selection_model: null
 seat: "sol-subscription"
