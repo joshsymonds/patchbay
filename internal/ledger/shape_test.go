@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 )
 
@@ -117,7 +118,7 @@ func TestDropSignatureMatchesRecordedShape(t *testing.T) {
 			Timestamp:       testTimestamp(t, testDay),
 			Host:            "gnomon",
 			Context:         "personal",
-			CredentialClass: ledger.CredentialOAuth,
+			CredentialClass: billing.CredentialOAuth,
 
 			Upstream:      "https://api.anthropic.com",
 			Model:         "claude-fable-5",

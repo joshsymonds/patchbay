@@ -15,6 +15,7 @@ import (
 	"testing"
 	"testing/iotest"
 
+	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/proxy"
 )
@@ -626,22 +627,22 @@ func TestRecordsTheInboundCredentialClass(t *testing.T) {
 	tests := []struct {
 		name    string
 		headers map[string]string
-		want    string
+		want    billing.CredentialClass
 	}{
 		{
 			name:    "oauth bearer",
 			headers: map[string]string{"Authorization": "Bearer sk-ant-oat01-subscription"},
-			want:    ledger.CredentialOAuth,
+			want:    billing.CredentialOAuth,
 		},
 		{
 			name:    "lowercase bearer scheme",
 			headers: map[string]string{"Authorization": "bearer sk-ant-oat01-subscription"},
-			want:    ledger.CredentialOAuth,
+			want:    billing.CredentialOAuth,
 		},
 		{
 			name:    "api key",
 			headers: map[string]string{"X-Api-Key": "sk-ant-api03-console"},
-			want:    ledger.CredentialAPIKey,
+			want:    billing.CredentialAPIKey,
 		},
 		{
 			name: "both, an oauth session that also sent a key",
@@ -649,17 +650,17 @@ func TestRecordsTheInboundCredentialClass(t *testing.T) {
 				"Authorization": "Bearer sk-ant-oat01-subscription",
 				"X-Api-Key":     "sk-ant-api03-console",
 			},
-			want: ledger.CredentialOAuth,
+			want: billing.CredentialOAuth,
 		},
 		{
 			name:    "an authorization header that is not a bearer",
 			headers: map[string]string{"Authorization": "Basic dXNlcjpwYXNz"},
-			want:    ledger.CredentialNone,
+			want:    billing.CredentialNone,
 		},
 		{
 			name:    "no credential at all",
 			headers: map[string]string{},
-			want:    ledger.CredentialNone,
+			want:    billing.CredentialNone,
 		},
 	}
 
@@ -704,13 +705,13 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 		headers             http.Header
 		secrets             []string
 		wantStatus          int
-		wantCredentialClass string
+		wantCredentialClass billing.CredentialClass
 	}{
 		{
 			name:                "no credential",
 			headers:             http.Header{},
 			wantStatus:          http.StatusUnauthorized,
-			wantCredentialClass: ledger.CredentialNone,
+			wantCredentialClass: billing.CredentialNone,
 		},
 		{
 			name: "empty bearer credential",
@@ -718,7 +719,7 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 				"Authorization": []string{"Bearer "},
 			},
 			wantStatus:          http.StatusUnauthorized,
-			wantCredentialClass: ledger.CredentialNone,
+			wantCredentialClass: billing.CredentialNone,
 		},
 		{
 			name: "whitespace-only bearer credential",
@@ -726,7 +727,7 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 				"Authorization": []string{"Bearer \t "},
 			},
 			wantStatus:          http.StatusUnauthorized,
-			wantCredentialClass: ledger.CredentialNone,
+			wantCredentialClass: billing.CredentialNone,
 		},
 		{
 			name: "empty api key",
@@ -734,7 +735,7 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 				"X-Api-Key": []string{""},
 			},
 			wantStatus:          http.StatusUnauthorized,
-			wantCredentialClass: ledger.CredentialNone,
+			wantCredentialClass: billing.CredentialNone,
 		},
 		{
 			name: "whitespace-only api key",
@@ -742,7 +743,7 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 				"X-Api-Key": []string{" \t "},
 			},
 			wantStatus:          http.StatusUnauthorized,
-			wantCredentialClass: ledger.CredentialNone,
+			wantCredentialClass: billing.CredentialNone,
 		},
 		{
 			name: "unrecognized authorization scheme",
@@ -751,7 +752,7 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 			},
 			secrets:             []string{"basic-payload-sentinel"},
 			wantStatus:          http.StatusUnauthorized,
-			wantCredentialClass: ledger.CredentialNone,
+			wantCredentialClass: billing.CredentialNone,
 		},
 		{
 			name: "bearer followed by basic authorization",
@@ -766,7 +767,7 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 				"basic-after-bearer-sentinel",
 			},
 			wantStatus:          http.StatusUnauthorized,
-			wantCredentialClass: ledger.CredentialOAuth,
+			wantCredentialClass: billing.CredentialOAuth,
 		},
 		{
 			name: "repeated bearer authorization",
@@ -781,7 +782,7 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 				"repeated-bearer-second-sentinel",
 			},
 			wantStatus:          http.StatusUnauthorized,
-			wantCredentialClass: ledger.CredentialOAuth,
+			wantCredentialClass: billing.CredentialOAuth,
 		},
 		{
 			name: "repeated api key",
@@ -796,7 +797,7 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 				"repeated-api-key-second-sentinel",
 			},
 			wantStatus:          http.StatusUnauthorized,
-			wantCredentialClass: ledger.CredentialAPIKey,
+			wantCredentialClass: billing.CredentialAPIKey,
 		},
 		{
 			name: "oauth bearer and api key",
@@ -806,7 +807,7 @@ func TestRecordsRejectedForwardCredentials(t *testing.T) {
 			},
 			secrets:             []string{"mixed-oauth-sentinel", "mixed-api-key-sentinel"},
 			wantStatus:          http.StatusBadRequest,
-			wantCredentialClass: ledger.CredentialOAuth,
+			wantCredentialClass: billing.CredentialOAuth,
 		},
 	}
 
@@ -917,8 +918,8 @@ func TestRecordNeverCarriesACredentialValue(t *testing.T) {
 		}
 	}
 
-	if got.CredentialClass != ledger.CredentialOAuth {
-		t.Fatalf("credential_class = %q, want %q", got.CredentialClass, ledger.CredentialOAuth)
+	if got.CredentialClass != billing.CredentialOAuth {
+		t.Fatalf("credential_class = %q, want %q", got.CredentialClass, billing.CredentialOAuth)
 	}
 }
 

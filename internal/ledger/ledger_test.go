@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 )
 
@@ -44,7 +45,7 @@ func validRecord(t *testing.T) ledger.Record {
 		Timestamp:       testTimestamp(t, testDay),
 		Host:            "gnomon",
 		Context:         "personal",
-		CredentialClass: ledger.CredentialOAuth,
+		CredentialClass: billing.CredentialOAuth,
 
 		Alias:         "bedrock",
 		Upstream:      "https://api.anthropic.com",
@@ -339,12 +340,12 @@ func TestValidate(t *testing.T) {
 		{name: "unknown auth mode", mutate: func(r *ledger.Record) { r.AuthMode = "passthrough" }, wantErr: true},
 		{
 			name:    "credential class api_key",
-			mutate:  func(r *ledger.Record) { r.CredentialClass = ledger.CredentialAPIKey },
+			mutate:  func(r *ledger.Record) { r.CredentialClass = billing.CredentialAPIKey },
 			wantErr: false,
 		},
 		{
 			name:    "credential class none",
-			mutate:  func(r *ledger.Record) { r.CredentialClass = ledger.CredentialNone },
+			mutate:  func(r *ledger.Record) { r.CredentialClass = billing.CredentialNone },
 			wantErr: false,
 		},
 		{
@@ -636,7 +637,7 @@ func TestConcurrentAppendLosesNothing(t *testing.T) {
 					Timestamp:       testTimestamp(t, testDay),
 					Host:            "gnomon",
 					Context:         "personal",
-					CredentialClass: ledger.CredentialOAuth,
+					CredentialClass: billing.CredentialOAuth,
 					Alias:           fmt.Sprintf("w%d-r%d", writer, seq),
 					Upstream:        "https://api.anthropic.com",
 					Model:           "claude-fable-5",
@@ -688,7 +689,7 @@ func TestRecordCarriesContextAndCredentialClass(t *testing.T) {
 
 	rec := validRecord(t)
 	rec.Context = "work"
-	rec.CredentialClass = ledger.CredentialAPIKey
+	rec.CredentialClass = billing.CredentialAPIKey
 
 	if err := led.Append(rec); err != nil {
 		t.Fatalf("Append returned error: %v", err)
@@ -717,34 +718,8 @@ func TestRecordCarriesContextAndCredentialClass(t *testing.T) {
 		t.Fatalf("Scan returned error: %v", scanErr)
 	}
 
-	if len(records) != 1 || records[0].Context != "work" || records[0].CredentialClass != ledger.CredentialAPIKey {
+	if len(records) != 1 || records[0].Context != "work" || records[0].CredentialClass != billing.CredentialAPIKey {
 		t.Fatalf("Scan returned %+v; want the record's own context and credential class", records)
-	}
-}
-
-// TestCredentialClassVocabularyIsClosed names the only three classifications a
-// record may carry, so no future caller can smuggle a credential in as one.
-func TestCredentialClassVocabularyIsClosed(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		got  string
-		want string
-	}{
-		{name: "oauth", got: ledger.CredentialOAuth, want: "oauth"},
-		{name: "api key", got: ledger.CredentialAPIKey, want: "api_key"},
-		{name: "none", got: ledger.CredentialNone, want: "none"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			if tc.got != tc.want {
-				t.Fatalf("credential class = %q; want %q", tc.got, tc.want)
-			}
-		})
 	}
 }
 
@@ -758,7 +733,7 @@ func TestRecordSchemaCarriesNoAuthHeaders(t *testing.T) {
 		Timestamp:       testTimestamp(t, testDay),
 		Host:            "gnomon",
 		Context:         "work",
-		CredentialClass: ledger.CredentialOAuth,
+		CredentialClass: billing.CredentialOAuth,
 
 		Alias:         "bedrock",
 		Upstream:      "https://api.anthropic.com",

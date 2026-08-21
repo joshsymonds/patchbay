@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/joshsymonds/patchbay/internal/anthropic"
+	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
@@ -42,7 +43,7 @@ const (
 type exchange struct {
 	route           registry.Route
 	context         string
-	credentialClass string
+	credentialClass billing.CredentialClass
 	requestModel    string
 	start           time.Time
 	status          int
@@ -55,7 +56,13 @@ type exchange struct {
 
 // newExchange starts recording a request that arrived at start in the named
 // context under credentialClass, asking for requestModel and resolved to route.
-func newExchange(route registry.Route, ctxName, credentialClass, requestModel string, start time.Time) *exchange {
+func newExchange(
+	route registry.Route,
+	ctxName string,
+	credentialClass billing.CredentialClass,
+	requestModel string,
+	start time.Time,
+) *exchange {
 	return &exchange{
 		route:           route,
 		context:         ctxName,
@@ -108,18 +115,18 @@ func classifyCredential(header http.Header) credentialShape {
 	}
 }
 
-// ledgerClass maps the complete inbound shape onto the ledger's existing
+// ledgerClass maps the complete inbound shape onto the canonical credential
 // attribution vocabulary. Ambiguous OAuth-plus-key requests retain the OAuth
 // classification the old precedence rule recorded; unrecognized Authorization
 // remains none.
-func (c credentialShape) ledgerClass() string {
+func (c credentialShape) ledgerClass() billing.CredentialClass {
 	switch c {
 	case credentialOAuth, credentialOAuthAndAPIKey, credentialRepeatedOAuthAuthorization:
-		return ledger.CredentialOAuth
+		return billing.CredentialOAuth
 	case credentialAPIKey, credentialRepeatedAPIKey:
-		return ledger.CredentialAPIKey
+		return billing.CredentialAPIKey
 	default:
-		return ledger.CredentialNone
+		return billing.CredentialNone
 	}
 }
 

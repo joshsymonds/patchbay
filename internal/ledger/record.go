@@ -7,6 +7,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
@@ -25,17 +26,6 @@ const (
 	authModeSigV4   = "sigv4"
 )
 
-// The credential classes a record may carry. They classify the credential the
-// CLIENT presented — an OAuth bearer, an API key, or nothing at all — and are
-// deliberately a closed vocabulary of three constants. A classification is not
-// a credential: no header value can ever become one of these, which is what
-// keeps the attribution field on the safe side of the no-headers rule.
-const (
-	CredentialOAuth  = "oauth"
-	CredentialAPIKey = "api_key"
-	CredentialNone   = "none"
-)
-
 // Record is one proxied request, stored as a single JSONL line.
 //
 // The schema deliberately has no field for headers of any kind. Request and
@@ -50,8 +40,8 @@ type Record struct {
 	Context string `json:"context"`
 
 	// CredentialClass says which kind of credential the client presented, never
-	// which credential. See the constants above.
-	CredentialClass string `json:"credential_class"`
+	// which credential.
+	CredentialClass billing.CredentialClass `json:"credential_class"`
 
 	Alias         string   `json:"alias"`
 	Upstream      string   `json:"upstream"`
@@ -95,12 +85,10 @@ func (r Record) Validate() error {
 	default:
 		return fmt.Errorf("ledger record has invalid auth_mode %q", r.AuthMode)
 	}
-	// The allowlist is what keeps a credential from being recorded as its own
-	// classification: a value outside these three is refused, never stored. The
-	// empty case is read-side leniency — see validateAttribution.
-	switch r.CredentialClass {
-	case "", CredentialOAuth, CredentialAPIKey, CredentialNone:
-	default:
+	// The closed vocabulary keeps a credential from being recorded as its own
+	// classification: a value outside it is refused, never stored. Empty is
+	// read-side leniency for records written before attribution existed.
+	if r.CredentialClass != "" && !r.CredentialClass.Valid() {
 		return errors.New("ledger record has an invalid credential_class")
 	}
 	if err := validateContextName(r.Context); err != nil {

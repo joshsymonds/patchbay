@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 )
 
@@ -406,9 +407,9 @@ func assertRecorded(t *testing.T, ledgerDir string) {
 			t.Fatalf("record %d context = %q; want %q", i, records[i].Context, want)
 		}
 
-		if records[i].CredentialClass != ledger.CredentialOAuth {
+		if records[i].CredentialClass != billing.CredentialOAuth {
 			t.Fatalf("record %d credential_class = %q; want %q",
-				i, records[i].CredentialClass, ledger.CredentialOAuth)
+				i, records[i].CredentialClass, billing.CredentialOAuth)
 		}
 	}
 }

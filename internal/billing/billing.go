@@ -45,6 +45,48 @@ func (class Class) String() string {
 	return string(class)
 }
 
+// CredentialClass classifies the credential a caller presented without
+// retaining the credential itself.
+type CredentialClass string
+
+const (
+	// CredentialOAuth means the caller presented an OAuth bearer token.
+	CredentialOAuth CredentialClass = "oauth"
+
+	// CredentialAPIKey means the caller presented an API key.
+	CredentialAPIKey CredentialClass = "api_key"
+
+	// CredentialNone means the caller presented no recognized credential.
+	CredentialNone CredentialClass = "none"
+)
+
+// ParseCredentialClass returns the credential class named by raw, rejecting
+// every value outside the closed vocabulary.
+func ParseCredentialClass(raw string) (CredentialClass, error) {
+	credential := CredentialClass(raw)
+	if !credential.Valid() {
+		return "", fmt.Errorf("credential class %q is not valid (want %q, %q or %q)",
+			raw, CredentialOAuth, CredentialAPIKey, CredentialNone)
+	}
+
+	return credential, nil
+}
+
+// Valid reports whether credential is in the closed credential-class vocabulary.
+func (credential CredentialClass) Valid() bool {
+	switch credential {
+	case CredentialOAuth, CredentialAPIKey, CredentialNone:
+		return true
+	default:
+		return false
+	}
+}
+
+// String returns the wire form of credential.
+func (credential CredentialClass) String() string {
+	return string(credential)
+}
+
 // Policy says how a route determines the billing class of a request.
 type Policy string
 
@@ -86,4 +128,45 @@ func (policy Policy) Valid() bool {
 // String returns the wire form of policy.
 func (policy Policy) String() string {
 	return string(policy)
+}
+
+// RealizeClass maps a route's billing policy and a validated caller credential
+// class to the billing class attributed to the request.
+func RealizeClass(policy Policy, explicit Class, credential CredentialClass) (Class, error) {
+	if !policy.Valid() {
+		return "", fmt.Errorf("cannot realize billing class with invalid policy %q", policy)
+	}
+	if !credential.Valid() {
+		return "", fmt.Errorf("cannot realize billing class with invalid credential class %q", credential)
+	}
+
+	switch policy {
+	case PolicyExplicit:
+		if !explicit.Valid() {
+			return "", fmt.Errorf("explicit billing policy requires a valid class, got %q", explicit)
+		}
+
+		return explicit, nil
+	case PolicyCallerDerived:
+		if explicit != "" {
+			return "", fmt.Errorf("caller-derived billing policy cannot declare explicit class %q", explicit)
+		}
+
+		switch credential {
+		case CredentialOAuth:
+			return ClassSubscription, nil
+		case CredentialAPIKey:
+			return ClassMetered, nil
+		case CredentialNone:
+			return "", fmt.Errorf("caller-derived billing policy requires a credential")
+		}
+	case PolicySigV4Metered:
+		if explicit != "" {
+			return "", fmt.Errorf("sigv4-metered billing policy cannot declare explicit class %q", explicit)
+		}
+
+		return ClassMetered, nil
+	}
+
+	return "", fmt.Errorf("cannot realize billing class with invalid policy %q", policy)
 }
