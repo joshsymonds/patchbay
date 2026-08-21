@@ -15,7 +15,7 @@ chosen per project by a path prefix on the base URL, so a work checkout can bill
 a company Bedrock account while everything else stays on your personal
 subscription.
 
-It is a single Go binary with no dependencies outside the standard library.
+It is a single static Go binary with a pure-Go SQLite dependency.
 
 ## How it works
 
@@ -70,7 +70,7 @@ Request flow, in order:
 
 ## Quickstart
 
-Build it — stdlib only, no module downloads:
+Build it — Go downloads the pinned pure-Go SQLite module on first build:
 
 ```console
 $ go build ./cmd/patchbay

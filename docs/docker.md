@@ -1,6 +1,6 @@
 # Docker
 
-For hosts without Nix. The image is the same static stdlib-only binary on a
+For hosts without Nix. The image is the same static CGO-free binary on a
 distroless base — no shell, no package manager — published multi-arch
 (amd64, arm64) to GHCR:
 

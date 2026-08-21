@@ -1,4 +1,4 @@
-# patchbay as a container. The binary is static (stdlib-only, CGO off), so the
+# patchbay as a container. The binary is static (pure Go, CGO off), so the
 # runtime image is distroless: no shell, no package manager, CA certificates
 # and a nonroot user included. See docs/docker.md for how to run it — in
 # particular, publish the port to host loopback ONLY: anything that can reach
@@ -11,7 +11,9 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY cmd/ cmd/
 COPY internal/ internal/
 

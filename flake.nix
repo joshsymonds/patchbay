@@ -24,9 +24,8 @@
             version = "dev";
 
             src = ./.;
-            # Stdlib-only module with no external dependencies: there is nothing
-            # to vendor, so a nil vendorHash is correct.
-            vendorHash = null;
+            # Vendor the pure-Go SQLite dependency for sandboxed builds.
+            vendorHash = "sha256-isqeSOokeSJQrrjhDz3fh77WhQ1tI/KOPBAHCcqL3wM=";
 
             go = pkgs.go_1_26;
             subPackages = [ "cmd/patchbay" ];
