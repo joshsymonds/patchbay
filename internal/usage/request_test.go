@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -750,6 +751,487 @@ func TestInsertPendingPersistsResolvedRouteBillingMatrix(t *testing.T) {
 				t.Fatalf("stored request mismatch:\n got %#v\nwant %#v", got, want)
 			}
 		})
+	}
+}
+
+func TestMarkUpstreamDispatchedTransitionsPendingRequestDurablyAndIdempotently(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+	id, err := store.InsertPending(context.Background(), validPendingRequest())
+	if err != nil {
+		t.Fatalf("InsertPending() returned error: %v", err)
+	}
+	before := readStoredRequest(t, store.db, id)
+	dispatchedAt := time.Unix(1_776_912_346, 987_654_321).UTC()
+
+	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err != nil {
+		t.Fatalf("MarkUpstreamDispatched() returned error: %v", err)
+	}
+	want := before
+	want.upstreamContacted = 1
+	want.upstreamDispatchedAt = sql.NullInt64{Int64: dispatchedAt.UnixNano(), Valid: true}
+	if got := readStoredRequest(t, store.db, id); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored request after first dispatch mismatch:\n got %#v\nwant %#v", got, want)
+	}
+
+	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err != nil {
+		t.Fatalf("idempotent MarkUpstreamDispatched() returned error: %v", err)
+	}
+	if got := readStoredRequest(t, store.db, id); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored request after idempotent dispatch mismatch:\n got %#v\nwant %#v", got, want)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+	reopened := openStore(t, path)
+	if got := readStoredRequest(t, reopened.db, id); !reflect.DeepEqual(got, want) {
+		t.Fatalf("reopened stored request mismatch:\n got %#v\nwant %#v", got, want)
+	}
+	if err := reopened.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err != nil {
+		t.Fatalf("reopened idempotent MarkUpstreamDispatched() returned error: %v", err)
+	}
+	if got := readStoredRequest(t, reopened.db, id); !reflect.DeepEqual(got, want) {
+		t.Fatalf("reopened stored request after idempotent dispatch mismatch:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestMarkUpstreamDispatchedRejectsDifferentTimestampWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+	id, err := store.InsertPending(context.Background(), validPendingRequest())
+	if err != nil {
+		t.Fatalf("InsertPending() returned error: %v", err)
+	}
+	first := time.Unix(1_776_912_346, 111_222_333).UTC()
+	if err := store.MarkUpstreamDispatched(context.Background(), id, first); err != nil {
+		t.Fatalf("first MarkUpstreamDispatched() returned error: %v", err)
+	}
+	want := readStoredRequest(t, store.db, id)
+
+	second := first.Add(time.Nanosecond)
+	err = store.MarkUpstreamDispatched(context.Background(), id, second)
+	if err == nil || !strings.Contains(err.Error(), "already dispatched at") ||
+		!strings.Contains(err.Error(), "cannot replace with") {
+		t.Fatalf("different-time MarkUpstreamDispatched() error = %v; want immutable timestamp error", err)
+	}
+	if got := readStoredRequest(t, store.db, id); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored request after rejected timestamp mismatch:\n got %#v\nwant %#v", got, want)
+	}
+	assertWritePermitAvailable(t, store)
+}
+
+func TestMarkUpstreamDispatchedRejectsUnknownIDWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+	id, err := store.InsertPending(context.Background(), validPendingRequest())
+	if err != nil {
+		t.Fatalf("InsertPending() returned error: %v", err)
+	}
+	want := readStoredRequest(t, store.db, id)
+
+	err = store.MarkUpstreamDispatched(
+		context.Background(),
+		id+1_000,
+		time.Unix(1_776_912_346, 111_222_333).UTC(),
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("unknown-ID MarkUpstreamDispatched() error = %v; want missing request error", err)
+	}
+	if got := readStoredRequest(t, store.db, id); !reflect.DeepEqual(got, want) {
+		t.Fatalf("existing request after unknown ID mismatch:\n got %#v\nwant %#v", got, want)
+	}
+	assertWritePermitAvailable(t, store)
+}
+
+func TestMarkUpstreamDispatchedRejectsInvalidInputsBeforeWritePermit(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+	id, err := store.InsertPending(context.Background(), validPendingRequest())
+	if err != nil {
+		t.Fatalf("InsertPending() returned error: %v", err)
+	}
+	want := readStoredRequest(t, store.db, id)
+	validTime := time.Unix(1_776_912_346, 111_222_333).UTC()
+	if err := store.acquireWritePermit(context.Background()); err != nil {
+		t.Fatalf("acquireWritePermit() returned error: %v", err)
+	}
+	t.Cleanup(store.releaseWritePermit)
+
+	var nilContext context.Context
+	if err := store.MarkUpstreamDispatched(nilContext, id, validTime); err == nil ||
+		!strings.Contains(err.Error(), "context is nil") {
+		t.Fatalf("nil-context MarkUpstreamDispatched() error = %v; want nil context error", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = store.MarkUpstreamDispatched(canceledCtx, 0, time.Time{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled invalid MarkUpstreamDispatched() error = %v; want context.Canceled", err)
+	}
+	expiredCtx, cancelExpired := context.WithDeadline(context.Background(), time.Unix(1, 0))
+	defer cancelExpired()
+	err = store.MarkUpstreamDispatched(expiredCtx, 0, time.Time{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired invalid MarkUpstreamDispatched() error = %v; want context.DeadlineExceeded", err)
+	}
+
+	tests := []struct {
+		name         string
+		id           int64
+		dispatchedAt time.Time
+		wantContains string
+	}{
+		{name: "zero ID", id: 0, dispatchedAt: validTime, wantContains: "ID must be positive"},
+		{name: "negative ID", id: -1, dispatchedAt: validTime, wantContains: "ID must be positive"},
+		{name: "zero time", id: id, dispatchedAt: time.Time{}, wantContains: "time is zero"},
+		{
+			name:         "time above UnixNano range",
+			id:           id,
+			dispatchedAt: time.Date(2500, time.January, 1, 0, 0, 0, 0, time.UTC),
+			wantContains: "UnixNano",
+		},
+		{
+			name:         "time below UnixNano range",
+			id:           id,
+			dispatchedAt: time.Date(1600, time.January, 1, 0, 0, 0, 0, time.UTC),
+			wantContains: "UnixNano",
+		},
+	}
+	for _, test := range tests {
+		ctx, cancelCall := context.WithTimeout(context.Background(), time.Second)
+		err := store.MarkUpstreamDispatched(ctx, test.id, test.dispatchedAt)
+		cancelCall()
+		if err == nil || !strings.Contains(err.Error(), test.wantContains) {
+			t.Errorf("%s: MarkUpstreamDispatched() error = %v; want substring %q",
+				test.name, err, test.wantContains)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("%s: validation waited for write permit: %v", test.name, err)
+		}
+	}
+
+	if got := readStoredRequest(t, store.db, id); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored request after invalid calls mismatch:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestMarkUpstreamDispatchedRejectsIneligibleStoredStatesWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		lifecycleState    string
+		upstreamContacted int
+		dispatchedAt      any
+		wantContains      string
+	}{
+		{
+			name:              "non-pending lifecycle",
+			lifecycleState:    "completed",
+			upstreamContacted: 0,
+			wantContains:      `lifecycle state "completed" is not pending`,
+		},
+		{
+			name:              "uncontacted with timestamp",
+			lifecycleState:    "pending",
+			upstreamContacted: 0,
+			dispatchedAt:      int64(1_776_912_346_111_222_333),
+			wantContains:      "inconsistent upstream dispatch evidence",
+		},
+		{
+			name:              "contacted without timestamp",
+			lifecycleState:    "pending",
+			upstreamContacted: 1,
+			wantContains:      "inconsistent upstream dispatch evidence",
+		},
+		{
+			name:              "invalid contacted marker without timestamp",
+			lifecycleState:    "pending",
+			upstreamContacted: 2,
+			wantContains:      "inconsistent upstream dispatch evidence",
+		},
+		{
+			name:              "invalid contacted marker with timestamp",
+			lifecycleState:    "pending",
+			upstreamContacted: 2,
+			dispatchedAt:      int64(1_776_912_346_111_222_333),
+			wantContains:      "inconsistent upstream dispatch evidence",
+		},
+	}
+
+	for _, test := range tests {
+		name := fmt.Sprintf(
+			"%s/contacted=%d/time=%v",
+			test.name,
+			test.upstreamContacted,
+			test.dispatchedAt,
+		)
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "usage.sqlite")
+			store := openStore(t, path)
+			id, err := store.InsertPending(context.Background(), validPendingRequest())
+			if err != nil {
+				t.Fatalf("InsertPending() returned error: %v", err)
+			}
+			setStoredDispatchState(
+				t,
+				store.db,
+				id,
+				test.lifecycleState,
+				test.upstreamContacted,
+				test.dispatchedAt,
+			)
+			want := readStoredRequest(t, store.db, id)
+
+			err = store.MarkUpstreamDispatched(
+				context.Background(),
+				id,
+				time.Unix(1_776_912_347, 444_555_666).UTC(),
+			)
+			if err == nil || !strings.Contains(err.Error(), test.wantContains) {
+				t.Fatalf("MarkUpstreamDispatched() error = %v; want substring %q", err, test.wantContains)
+			}
+			if got := readStoredRequest(t, store.db, id); !reflect.DeepEqual(got, want) {
+				t.Fatalf("stored request after rejected state mismatch:\n got %#v\nwant %#v", got, want)
+			}
+			assertWritePermitAvailable(t, store)
+		})
+	}
+}
+
+func TestMarkUpstreamDispatchedCanceledWhileQueuedDoesNotMutateOrPoisonPermit(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+	id, err := store.InsertPending(context.Background(), validPendingRequest())
+	if err != nil {
+		t.Fatalf("InsertPending() returned error: %v", err)
+	}
+	want := readStoredRequest(t, store.db, id)
+	if err := store.acquireWritePermit(context.Background()); err != nil {
+		t.Fatalf("acquireWritePermit() returned error: %v", err)
+	}
+	permitHeld := true
+	t.Cleanup(func() {
+		if permitHeld {
+			store.releaseWritePermit()
+		}
+	})
+
+	baseCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &observedDoneContext{
+		Context:  baseCtx,
+		observed: make(chan struct{}),
+	}
+	result := make(chan error, 1)
+	dispatchedAt := time.Unix(1_776_912_346, 111_222_333).UTC()
+	go func() {
+		result <- store.MarkUpstreamDispatched(ctx, id, dispatchedAt)
+	}()
+	select {
+	case <-ctx.observed:
+	case <-time.After(time.Second):
+		t.Fatal("MarkUpstreamDispatched() did not begin waiting for the held write permit")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("queued MarkUpstreamDispatched() error = %v; want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("MarkUpstreamDispatched() did not return after queued context cancellation")
+	}
+	if got := readStoredRequest(t, store.db, id); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored request after queued cancellation mismatch:\n got %#v\nwant %#v", got, want)
+	}
+
+	store.releaseWritePermit()
+	permitHeld = false
+	followupCtx, cancelFollowup := context.WithTimeout(context.Background(), time.Second)
+	defer cancelFollowup()
+	if err := store.MarkUpstreamDispatched(followupCtx, id, dispatchedAt); err != nil {
+		t.Fatalf("follow-up MarkUpstreamDispatched() returned error: %v", err)
+	}
+}
+
+func TestMarkUpstreamDispatchedOnClosedStoreReleasesPermit(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+	id, err := store.InsertPending(context.Background(), validPendingRequest())
+	if err != nil {
+		t.Fatalf("InsertPending() returned error: %v", err)
+	}
+	want := readStoredRequest(t, store.db, id)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+	dispatchedAt := time.Unix(1_776_912_346, 111_222_333).UTC()
+
+	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err == nil ||
+		!strings.Contains(err.Error(), "update dispatch evidence") {
+		t.Fatalf("closed-store MarkUpstreamDispatched() error = %v; want wrapped update failure", err)
+	}
+	followupCtx, cancelFollowup := context.WithTimeout(context.Background(), time.Second)
+	defer cancelFollowup()
+	if err := store.MarkUpstreamDispatched(followupCtx, id, dispatchedAt); err == nil ||
+		!strings.Contains(err.Error(), "update dispatch evidence") ||
+		errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("closed-store follow-up error = %v; want prompt wrapped update failure", err)
+	}
+
+	db := inspectDB(t, path)
+	if got := readStoredRequest(t, db, id); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored request after closed-store calls mismatch:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestMarkUpstreamDispatchedConcurrentSameTimestampAllSucceed(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+	id, err := store.InsertPending(context.Background(), validPendingRequest())
+	if err != nil {
+		t.Fatalf("InsertPending() returned error: %v", err)
+	}
+	dispatchedAt := time.Unix(1_776_912_346, 111_222_333).UTC()
+	const writers = 64
+
+	errs := make(chan error, writers)
+	var wait sync.WaitGroup
+	for range writers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errs <- store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt)
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent same-time MarkUpstreamDispatched() returned error: %v", err)
+		}
+	}
+
+	got := readStoredRequest(t, store.db, id)
+	if got.upstreamContacted != 1 ||
+		got.upstreamDispatchedAt != (sql.NullInt64{Int64: dispatchedAt.UnixNano(), Valid: true}) {
+		t.Fatalf("stored dispatch evidence = contacted %d, time %#v; want 1 and %d",
+			got.upstreamContacted, got.upstreamDispatchedAt, dispatchedAt.UnixNano())
+	}
+}
+
+func TestMarkUpstreamDispatchedConcurrentDistinctTimestampsHaveOneWinner(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, path)
+	id, err := store.InsertPending(context.Background(), validPendingRequest())
+	if err != nil {
+		t.Fatalf("InsertPending() returned error: %v", err)
+	}
+	const writers = 64
+	base := time.Unix(1_776_912_346, 111_222_000).UTC()
+	type dispatchResult struct {
+		dispatchedAt time.Time
+		err          error
+	}
+	results := make(chan dispatchResult, writers)
+	var wait sync.WaitGroup
+	for writer := range writers {
+		wait.Add(1)
+		go func(writer int) {
+			defer wait.Done()
+			dispatchedAt := base.Add(time.Duration(writer))
+			results <- dispatchResult{
+				dispatchedAt: dispatchedAt,
+				err:          store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt),
+			}
+		}(writer)
+	}
+	wait.Wait()
+	close(results)
+
+	var winner time.Time
+	winnerCount := 0
+	loserCount := 0
+	for result := range results {
+		if result.err == nil {
+			winner = result.dispatchedAt
+			winnerCount++
+			continue
+		}
+		loserCount++
+		if !strings.Contains(result.err.Error(), "already dispatched at") ||
+			!strings.Contains(result.err.Error(), "cannot replace with") {
+			t.Errorf("concurrent distinct-time error = %v; want immutable timestamp error", result.err)
+		}
+	}
+	if winnerCount != 1 || loserCount != writers-1 {
+		t.Fatalf("concurrent results = %d winners, %d losers; want 1 and %d",
+			winnerCount, loserCount, writers-1)
+	}
+
+	got := readStoredRequest(t, store.db, id)
+	if got.upstreamContacted != 1 ||
+		got.upstreamDispatchedAt != (sql.NullInt64{Int64: winner.UnixNano(), Valid: true}) {
+		t.Fatalf("stored dispatch evidence = contacted %d, time %#v; want winning time %d",
+			got.upstreamContacted, got.upstreamDispatchedAt, winner.UnixNano())
+	}
+}
+
+func assertWritePermitAvailable(t *testing.T, store *Store) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := store.acquireWritePermit(ctx); err != nil {
+		t.Fatalf("acquireWritePermit() after rejected dispatch returned error: %v", err)
+	}
+	store.releaseWritePermit()
+}
+
+func setStoredDispatchState(
+	t *testing.T,
+	db *sql.DB,
+	id int64,
+	lifecycleState string,
+	upstreamContacted int,
+	dispatchedAt any,
+) {
+	t.Helper()
+
+	result, err := db.Exec(`UPDATE accounting_requests
+		SET lifecycle_state = ?, upstream_contacted = ?, upstream_dispatched_at = ?
+		WHERE id = ?`, lifecycleState, upstreamContacted, dispatchedAt, id)
+	if err != nil {
+		t.Fatalf("set stored dispatch state: %v", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		t.Fatalf("read affected rows after setting stored dispatch state: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("set stored dispatch state affected %d rows; want 1", rows)
 	}
 }
 

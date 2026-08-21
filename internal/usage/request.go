@@ -2,6 +2,8 @@ package usage
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -114,6 +116,127 @@ func (store *Store) InsertPending(ctx context.Context, request PendingRequest) (
 		return 0, fmt.Errorf("inserted pending request ID is not positive: %d", id)
 	}
 	return id, nil
+}
+
+// MarkUpstreamDispatched durably records the first provider HTTP dispatch.
+func (store *Store) MarkUpstreamDispatched(
+	ctx context.Context,
+	id int64,
+	dispatchedAt time.Time,
+) error {
+	dispatchedUnixNano, err := validateUpstreamDispatch(ctx, id, dispatchedAt)
+	if err != nil {
+		return err
+	}
+
+	if err = store.acquireWritePermit(ctx); err != nil {
+		return fmt.Errorf("mark upstream dispatched request %d: %w", id, err)
+	}
+	defer store.releaseWritePermit()
+
+	result, err := store.db.ExecContext(ctx, `UPDATE accounting_requests
+		SET upstream_contacted = 1, upstream_dispatched_at = ?
+		WHERE id = ?
+			AND lifecycle_state = 'pending'
+			AND (
+				(upstream_contacted = 0 AND upstream_dispatched_at IS NULL)
+				OR (upstream_contacted = 1 AND upstream_dispatched_at = ?)
+			)`, dispatchedUnixNano, id, dispatchedUnixNano)
+	if err != nil {
+		return fmt.Errorf("mark upstream dispatched request %d: update dispatch evidence: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark upstream dispatched request %d: read updated row count: %w", id, err)
+	}
+	if rows == 1 {
+		return nil
+	}
+	if rows != 0 {
+		return fmt.Errorf("mark upstream dispatched request %d: update affected %d rows", id, rows)
+	}
+	return store.diagnoseUpstreamDispatchNoMatch(ctx, id, dispatchedUnixNano)
+}
+
+func validateUpstreamDispatch(ctx context.Context, id int64, dispatchedAt time.Time) (int64, error) {
+	if ctx == nil {
+		return 0, fmt.Errorf("mark upstream dispatched: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("mark upstream dispatched context: %w", err)
+	}
+	if id <= 0 {
+		return 0, fmt.Errorf("mark upstream dispatched request ID must be positive: %d", id)
+	}
+	if dispatchedAt.IsZero() {
+		return 0, fmt.Errorf("mark upstream dispatched time is zero")
+	}
+	dispatchedUnixNano := dispatchedAt.UnixNano()
+	if !time.Unix(0, dispatchedUnixNano).Equal(dispatchedAt) {
+		return 0, fmt.Errorf("mark upstream dispatched time cannot round-trip through UnixNano")
+	}
+	return dispatchedUnixNano, nil
+}
+
+func (store *Store) diagnoseUpstreamDispatchNoMatch(
+	ctx context.Context,
+	id int64,
+	dispatchedUnixNano int64,
+) error {
+	var lifecycleState string
+	var upstreamContacted int
+	var existingDispatchedAt sql.NullInt64
+	err := store.db.QueryRowContext(ctx, `SELECT
+		lifecycle_state,
+		upstream_contacted,
+		upstream_dispatched_at
+	FROM accounting_requests
+	WHERE id = ?`, id).Scan(
+		&lifecycleState,
+		&upstreamContacted,
+		&existingDispatchedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("mark upstream dispatched request %d: request does not exist", id)
+	}
+	if err != nil {
+		return fmt.Errorf("mark upstream dispatched request %d: inspect dispatch evidence: %w", id, err)
+	}
+	if lifecycleState != "pending" {
+		return fmt.Errorf(
+			"mark upstream dispatched request %d: lifecycle state %q is not pending",
+			id,
+			lifecycleState,
+		)
+	}
+	if upstreamContacted == 1 && existingDispatchedAt.Valid {
+		if existingDispatchedAt.Int64 == dispatchedUnixNano {
+			return nil
+		}
+		return fmt.Errorf(
+			"mark upstream dispatched request %d: already dispatched at %d; cannot replace with %d",
+			id,
+			existingDispatchedAt.Int64,
+			dispatchedUnixNano,
+		)
+	}
+	if upstreamContacted == 0 && !existingDispatchedAt.Valid {
+		return fmt.Errorf(
+			"mark upstream dispatched request %d: eligible dispatch evidence was not updated",
+			id,
+		)
+	}
+
+	storedDispatchTime := "NULL"
+	if existingDispatchedAt.Valid {
+		storedDispatchTime = fmt.Sprintf("%d", existingDispatchedAt.Int64)
+	}
+	return fmt.Errorf(
+		"mark upstream dispatched request %d: inconsistent upstream dispatch evidence: contacted=%d, dispatched_at=%s",
+		id,
+		upstreamContacted,
+		storedDispatchTime,
+	)
 }
 
 func derivePendingSnapshot(ctx context.Context, request PendingRequest) (pendingSnapshot, error) {
