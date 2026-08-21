@@ -17,6 +17,7 @@ import (
 
 	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/ledger"
+	"github.com/joshsymonds/patchbay/internal/proxy"
 )
 
 const (
@@ -464,5 +465,96 @@ func TestGatewayReportsABrokenRegistryAtStartup(t *testing.T) {
 
 	if got := listedIDs(t, body); len(got) != 1 || got[0] != "claude-opus-5" {
 		t.Fatalf("model ids = %v; want the upstream alone", got)
+	}
+}
+
+func TestGatewayUsageSummaryReportsProxiedTraffic(t *testing.T) {
+	callerKeyFile(t, testCallerKey)
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "routes.json")
+	ledgerDir := filepath.Join(dir, "state", "ledger")
+	writeFile(t, registryPath, lunaRegistry)
+
+	stub := newStubUpstream(t)
+	gw := startGateway(t, registryPath, ledgerDir, stub.client(t))
+	defer gw.stop()
+
+	if status, body := postBody(
+		t,
+		gw.base+"/v1/messages",
+		`{"max_tokens":16}`,
+	); status != http.StatusOK ||
+		body != upstreamMessage {
+		t.Fatalf(
+			"POST /v1/messages = %d %q; want %d and upstream response",
+			status,
+			body,
+			http.StatusOK,
+		)
+	}
+
+	start := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	end := time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+	var response struct {
+		Summary struct {
+			Requests struct {
+				Messages int64 `json:"messages"`
+			} `json:"requests"`
+			Messages struct {
+				Finalized        int64 `json:"finalized"`
+				InputTokens      int64 `json:"input_tokens"`
+				OutputTokens     int64 `json:"output_tokens"`
+				KnownCostNanoUSD int64 `json:"known_cost_nano_usd"`
+				UnknownCostRows  int64 `json:"unknown_cost_rows"`
+			} `json:"messages"`
+		} `json:"summary"`
+	}
+	deadline := time.Now().Add(waitDeadline)
+	for {
+		req, err := http.NewRequest(
+			http.MethodGet,
+			gw.base+"/_patchbay/usage/summary?since="+start+"&until="+end,
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("build usage summary request: %v", err)
+		}
+		req.Header.Set(proxy.CallerKeyHeader, testCallerKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET usage summary: %v", err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatalf("read usage summary: %v", readErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf(
+				"GET usage summary status = %d; want %d (body %q)",
+				resp.StatusCode,
+				http.StatusOK,
+				body,
+			)
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			t.Fatalf("decode usage summary %q: %v", body, err)
+		}
+		if response.Summary.Messages.Finalized == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("usage summary = %#v; proxied request was never finalized", response)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if response.Summary.Requests.Messages != 1 || response.Summary.Messages.InputTokens != 11 ||
+		response.Summary.Messages.OutputTokens != 3 ||
+		response.Summary.Messages.KnownCostNanoUSD != 0 ||
+		response.Summary.Messages.UnknownCostRows != 0 {
+		t.Fatalf(
+			"usage summary = %#v; want one finalized subscription message with upstream token totals and zero marginal cost",
+			response,
+		)
 	}
 }

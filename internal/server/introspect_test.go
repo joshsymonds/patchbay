@@ -101,7 +101,13 @@ func TestIntrospectionDescribesEveryContext(t *testing.T) {
 	}, introspectRequest(introspectPath, callerKey))
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET %s status = %d; want %d (body %q)", introspectPath, rec.Code, http.StatusOK, rec.Body)
+		t.Fatalf(
+			"GET %s status = %d; want %d (body %q)",
+			introspectPath,
+			rec.Code,
+			http.StatusOK,
+			rec.Body,
+		)
 	}
 
 	if proxied.hits() != 0 {
@@ -138,7 +144,10 @@ func assertPersonalContext(t *testing.T, summary server.ContextSummary) {
 
 	if summary.DefaultRoute.Auth != string(registry.AuthForward) ||
 		summary.DefaultRoute.Upstream != "https://api.anthropic.com" {
-		t.Fatalf("personal default_route = %+v; want the built-in Anthropic forward", summary.DefaultRoute)
+		t.Fatalf(
+			"personal default_route = %+v; want the built-in Anthropic forward",
+			summary.DefaultRoute,
+		)
 	}
 
 	route, ok := summary.Routes["luna-fast"]
@@ -155,7 +164,10 @@ func assertPersonalContext(t *testing.T, summary server.ContextSummary) {
 	}
 
 	if route.KeyEnvFile != "OPENROUTER_API_KEY_FILE" {
-		t.Fatalf("luna-fast api_key_env_file = %q; want the environment variable NAME", route.KeyEnvFile)
+		t.Fatalf(
+			"luna-fast api_key_env_file = %q; want the environment variable NAME",
+			route.KeyEnvFile,
+		)
 	}
 }
 
@@ -166,7 +178,10 @@ func assertWorkContext(t *testing.T, summary server.ContextSummary) {
 
 	if summary.DefaultRoute.Auth != string(registry.AuthSigV4) ||
 		summary.DefaultRoute.Upstream != bedrockEndpoint {
-		t.Fatalf("work default_route = %+v; want the derived Bedrock endpoint", summary.DefaultRoute)
+		t.Fatalf(
+			"work default_route = %+v; want the derived Bedrock endpoint",
+			summary.DefaultRoute,
+		)
 	}
 
 	route, ok := summary.Routes["bedrock-opus"]
@@ -209,7 +224,8 @@ func TestIntrospectionOmitsAWSFieldsForRoutesThatDoNotSign(t *testing.T) {
 		Listen:   listenAddr,
 	}, introspectRequest(introspectPath, callerKey))
 
-	if strings.Contains(rec.Body.String(), "aws_profile") || strings.Contains(rec.Body.String(), "aws_region") {
+	if strings.Contains(rec.Body.String(), "aws_profile") ||
+		strings.Contains(rec.Body.String(), "aws_region") {
 		t.Fatalf("document = %s; an inject route signs nothing and names no AWS fields", rec.Body)
 	}
 }
@@ -240,7 +256,13 @@ func TestIntrospectionReportsBillingPolicyAndExplicitClass(t *testing.T) {
 	}, introspectRequest(introspectPath, callerKey))
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET %s status = %d; want %d (body %q)", introspectPath, rec.Code, http.StatusOK, rec.Body)
+		t.Fatalf(
+			"GET %s status = %d; want %d (body %q)",
+			introspectPath,
+			rec.Code,
+			http.StatusOK,
+			rec.Body,
+		)
 	}
 
 	doc := decodeDocument(t, rec.Body.Bytes())
@@ -256,8 +278,13 @@ func TestIntrospectionReportsBillingPolicyAndExplicitClass(t *testing.T) {
 	paid := personal.Routes["paid"]
 	if paid.BillingPolicy != billing.PolicyExplicit.String() ||
 		paid.BillingClass != billing.ClassSubscription.String() {
-		t.Fatalf("paid billing = policy %q, class %q; want %q and %q",
-			paid.BillingPolicy, paid.BillingClass, billing.PolicyExplicit, billing.ClassSubscription)
+		t.Fatalf(
+			"paid billing = policy %q, class %q; want %q and %q",
+			paid.BillingPolicy,
+			paid.BillingClass,
+			billing.PolicyExplicit,
+			billing.ClassSubscription,
+		)
 	}
 
 	legacy := personal.Routes["legacy"]
@@ -343,7 +370,11 @@ func TestIntrospectionFailsWhenNoKeyFileIsConfigured(t *testing.T) {
 	}, introspectRequest(introspectPath, callerKey))
 
 	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d; want %d for an unconfigured caller key", rec.Code, http.StatusInternalServerError)
+		t.Fatalf(
+			"status = %d; want %d for an unconfigured caller key",
+			rec.Code,
+			http.StatusInternalServerError,
+		)
 	}
 }
 
@@ -359,7 +390,10 @@ func TestIntrospectionTellsTheDegradedTruth(t *testing.T) {
 			reg: func(t *testing.T) *registry.Registry {
 				t.Helper()
 
-				return newRawRegistry(t, `{"contexts":{"personal":{"routes":{"broken":{"auth":"nonsense"}}}}}`)
+				return newRawRegistry(
+					t,
+					`{"contexts":{"personal":{"routes":{"broken":{"auth":"nonsense"}}}}}`,
+				)
 			},
 		},
 		{
@@ -387,7 +421,9 @@ func TestIntrospectionTellsTheDegradedTruth(t *testing.T) {
 			doc := decodeDocument(t, rec.Body.Bytes())
 
 			if doc.RegistryLoaded {
-				t.Fatal("registry_loaded = true; want a broken or absent registry reported as not loaded")
+				t.Fatal(
+					"registry_loaded = true; want a broken or absent registry reported as not loaded",
+				)
 			}
 
 			if len(doc.Contexts) != 1 {
@@ -399,7 +435,8 @@ func TestIntrospectionTellsTheDegradedTruth(t *testing.T) {
 				t.Fatalf("contexts = %v; want the personal context", doc.Contexts)
 			}
 
-			if personal.DefaultRoute.Auth != string(registry.AuthForward) || len(personal.Routes) != 0 {
+			if personal.DefaultRoute.Auth != string(registry.AuthForward) ||
+				len(personal.Routes) != 0 {
 				t.Fatalf("personal = %+v; want the built-in default route and no aliases", personal)
 			}
 		})
@@ -475,6 +512,13 @@ func TestIntrospectionMethods(t *testing.T) {
 			if proxied.hits() != 0 {
 				t.Fatalf("%s %s reached the proxy", tc.method, introspectPath)
 			}
+			if tc.want == http.StatusMethodNotAllowed &&
+				!strings.Contains(
+					rec.Body.String(),
+					"introspection endpoints answer GET and HEAD only",
+				) {
+				t.Fatalf("method refusal = %q; want the shared endpoint-generic message", rec.Body)
+			}
 		})
 	}
 }
@@ -490,8 +534,16 @@ func TestIntrospectionAnswersUnderAContextPrefix(t *testing.T) {
 		target string
 		want   int
 	}{
-		{name: "a context the gateway serves", target: "/ctx/personal" + introspectPath, want: http.StatusOK},
-		{name: "a context it does not", target: "/ctx/bogus" + introspectPath, want: http.StatusNotFound},
+		{
+			name:   "a context the gateway serves",
+			target: "/ctx/personal" + introspectPath,
+			want:   http.StatusOK,
+		},
+		{
+			name:   "a context it does not",
+			target: "/ctx/bogus" + introspectPath,
+			want:   http.StatusNotFound,
+		},
 	}
 
 	for _, tc := range tests {
@@ -504,14 +556,24 @@ func TestIntrospectionAnswersUnderAContextPrefix(t *testing.T) {
 			}, introspectRequest(tc.target, callerKey))
 
 			if rec.Code != tc.want {
-				t.Fatalf("GET %s status = %d; want %d (body %s)", tc.target, rec.Code, tc.want, rec.Body)
+				t.Fatalf(
+					"GET %s status = %d; want %d (body %s)",
+					tc.target,
+					rec.Code,
+					tc.want,
+					rec.Body,
+				)
 			}
 
 			if proxied.hits() != 0 {
-				t.Fatalf("GET %s reached the proxy; a /_patchbay path is never forwarded", tc.target)
+				t.Fatalf(
+					"GET %s reached the proxy; a /_patchbay path is never forwarded",
+					tc.target,
+				)
 			}
 
-			if tc.want == http.StatusOK && decodeDocument(t, rec.Body.Bytes()).Listen != listenAddr {
+			if tc.want == http.StatusOK &&
+				decodeDocument(t, rec.Body.Bytes()).Listen != listenAddr {
 				t.Fatalf("document = %s; want the gateway's own routing", rec.Body)
 			}
 		})

@@ -26,6 +26,7 @@ import (
 
 	"github.com/joshsymonds/patchbay/internal/anthropic"
 	"github.com/joshsymonds/patchbay/internal/registry"
+	"github.com/joshsymonds/patchbay/internal/usage"
 )
 
 // The paths the gateway answers itself. Everything else rides the proxy,
@@ -53,6 +54,12 @@ const fetchTimeout = 5 * time.Second
 // model listing is a few kilobytes; anything past this ceiling is not one.
 const responseLimitBytes = 4 << 20
 
+// UsageSummaryStore supplies the local usage-accounting aggregate the gateway
+// exposes on its caller-key-gated introspection surface.
+type UsageSummaryStore interface {
+	SummarizeUsage(context.Context, usage.SummaryFilter) (usage.Summary, error)
+}
+
 // Config is everything the HTTP surface needs from its host process.
 type Config struct {
 	// Proxy serves every request the gateway does not answer itself, which is
@@ -61,6 +68,10 @@ type Config struct {
 
 	// Registry supplies the aliases the model endpoints advertise. Required.
 	Registry *registry.Registry
+
+	// Usage supplies durable request-accounting summaries. A nil Usage leaves the
+	// gateway available but makes the local usage endpoint report 503.
+	Usage UsageSummaryStore
 
 	// Client fetches from Anthropic on the caller's behalf. A nil Client gets
 	// one with no timeout of its own, since every fetch this package makes is
@@ -83,6 +94,7 @@ type Config struct {
 // concurrent, and every request carries its own state.
 type gateway struct {
 	registry *registry.Registry
+	usage    UsageSummaryStore
 	client   *http.Client
 	logger   *slog.Logger
 	listen   string
@@ -101,6 +113,7 @@ type gateway struct {
 func Handler(cfg Config) http.Handler {
 	gw := &gateway{
 		registry: cfg.Registry,
+		usage:    cfg.Usage,
 		client:   cfg.Client,
 		logger:   cfg.Logger,
 		listen:   cfg.Listen,
@@ -132,7 +145,11 @@ func Handler(cfg Config) http.Handler {
 func (gw *gateway) selectIntrospection(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == introspectRoot || strings.HasPrefix(r.URL.Path, introspectPrefix) {
-			gw.introspect(w, r)
+			if r.URL.Path == UsageSummaryEndpoint {
+				gw.usageSummary(w, r)
+			} else {
+				gw.introspect(w, r)
+			}
 
 			return
 		}

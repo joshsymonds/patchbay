@@ -25,6 +25,8 @@ const (
 // tool and the gateway can never disagree about where the document lives.
 const RegistryEndpoint = introspectPrefix + "registry"
 
+const introspectionMethodRefusal = "introspection endpoints answer GET and HEAD only"
+
 // Document is everything patchbay will say about its own routing: every context
 // it serves, where each route in them goes and how it pays, and where the
 // registry behind them came from. It is built from the same resolution the proxy
@@ -83,8 +85,12 @@ func (gw *gateway) introspect(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", http.MethodGet+", "+http.MethodHead)
-		gw.writeError(r.Context(), w, http.StatusMethodNotAllowed,
-			fmt.Errorf("%s only answers %s", RegistryEndpoint, http.MethodGet))
+		gw.writeError(
+			r.Context(),
+			w,
+			http.StatusMethodNotAllowed,
+			errors.New(introspectionMethodRefusal),
+		)
 
 		return
 	}

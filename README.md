@@ -191,8 +191,9 @@ fallback.
 
 ## The caller key
 
-`inject` and `sigv4` routes, and the `/_patchbay/registry` introspection
-endpoint, require the header `X-Patchbay-Key` to match the contents of the file
+`inject` and `sigv4` routes, the `/_patchbay/registry` introspection endpoint,
+and the `/_patchbay/usage/summary` accounting endpoint require the header
+`X-Patchbay-Key` to match the contents of the file
 named by `$PATCHBAY_CALLER_KEY_FILE`. Both sides are hashed and compared in
 constant time.
 
@@ -245,6 +246,48 @@ effective-dated per-million-token rates. Each entry has `model`, RFC3339
 `cache_creation_1h`. Patchbay parses rates exactly as decimal USD, and will not
 start if the file cannot be read or parsed or conflicts with a card already
 recorded in the usage database.
+
+### Usage summary
+
+`GET /_patchbay/usage/summary?since=<RFC3339>&until=<RFC3339>[&context=<name>]`
+returns the half-open `[since, until)` aggregate from the durable accounting
+database. `since` and `until` are required; `context` limits the aggregate to
+one context when supplied. The caller key is required.
+
+The response has a stable wrapper with canonical UTC window bounds:
+
+```json
+{
+  "since": "2026-08-20T12:00:00Z",
+  "until": "2026-08-20T13:00:00Z",
+  "context": "work",
+  "summary": {
+    "requests": {"messages": 12, "count_tokens": 3, "other": 1},
+    "messages": {
+      "finalized": 10,
+      "pending": 2,
+      "known_cost_nano_usd": 123456789,
+      "unknown_cost_rows": 1,
+      "input_tokens": 1000,
+      "output_tokens": 200,
+      "cache_read_tokens": 50,
+      "cache_creation_total": 25,
+      "by_billing_class": {
+        "metered": {"requests": 8, "known_cost_nano_usd": 123456789, "unknown_cost_rows": 1}
+      },
+      "by_cost_basis": {
+        "provider_reported": {"requests": 7, "known_cost_nano_usd": 123456789, "unknown_cost_rows": 0}
+      }
+    }
+  }
+}
+```
+
+All money is integer nano-USD. `unknown_cost_rows` counts finalized message rows
+whose cost cannot be established; it is never estimated. Null billing classes
+and cost bases are grouped as `"unknown"`. Cache creation totals use 5-minute
+and 1-hour values when either is present, otherwise the base cache-creation
+value, so one request is never counted twice.
 
 ## Security model
 

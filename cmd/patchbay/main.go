@@ -343,6 +343,7 @@ func serveGatewayWithHostname(
 	handler := server.Handler(server.Config{
 		Proxy:    pipeline,
 		Registry: reg,
+		Usage:    usageStore,
 		Client:   client,
 		Logger:   logger,
 		Listen:   listener.Addr().String(),
