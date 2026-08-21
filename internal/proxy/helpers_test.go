@@ -407,7 +407,7 @@ func (permissiveAccountant) InsertPending(context.Context, usage.PendingRequest)
 	return 1, nil
 }
 
-func (permissiveAccountant) MarkUpstreamDispatched(context.Context, int64, time.Time) error {
+func (permissiveAccountant) MarkUpstreamDispatched(context.Context, int64, time.Time, string) error {
 	return nil
 }
 

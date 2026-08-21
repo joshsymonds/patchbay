@@ -14,7 +14,7 @@ import (
 // *usagepkg.Store satisfies it.
 type Accountant interface {
 	InsertPending(context.Context, usagepkg.PendingRequest) (int64, error)
-	MarkUpstreamDispatched(context.Context, int64, time.Time) error
+	MarkUpstreamDispatched(context.Context, int64, time.Time, string) error
 	Finalize(context.Context, int64, usagepkg.FinalizedRequest) error
 }
 

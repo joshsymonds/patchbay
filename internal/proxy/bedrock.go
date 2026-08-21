@@ -79,13 +79,14 @@ func (p *Proxy) bedrockRequest(
 	r *http.Request,
 	route registry.Route,
 	body []byte,
-) (*http.Request, uint64, *gatewayError) {
+	upstreamTarget string,
+) (*http.Request, uint64, string, *gatewayError) {
 	if gwErr := bedrockPathGate(r.URL.Path); gwErr != nil {
-		return nil, 0, gwErr
+		return nil, 0, "", gwErr
 	}
 
 	if keyErr := checkCallerKey(r); keyErr != nil {
-		return nil, 0, keyErr
+		return nil, 0, "", keyErr
 	}
 
 	// The body is decoded exactly once per attempt, and the model, the stream
@@ -94,7 +95,7 @@ func (p *Proxy) bedrockRequest(
 	// disagree about what the caller asked for.
 	document, docErr := bedrockDocument(body)
 	if docErr != nil {
-		return nil, 0, docErr
+		return nil, 0, "", docErr
 	}
 
 	model := route.Model
@@ -102,19 +103,23 @@ func (p *Proxy) bedrockRequest(
 		model = documentModel(document)
 	}
 
-	target, gwErr := bedrockTarget(route, model, documentWantsStream(document))
-	if gwErr != nil {
-		return nil, 0, gwErr
+	if upstreamTarget == "" {
+		var gwErr *gatewayError
+		upstreamTarget, gwErr = bedrockTarget(route, model)
+		if gwErr != nil {
+			return nil, 0, "", gwErr
+		}
 	}
+	target := bedrockInvocationURL(route, upstreamTarget, documentWantsStream(document))
 
 	translated, translateErr := translateBedrockDocument(document)
 	if translateErr != nil {
-		return nil, 0, translateErr
+		return nil, 0, "", translateErr
 	}
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(translated))
 	if err != nil {
-		return nil, 0, &gatewayError{
+		return nil, 0, "", &gatewayError{
 			status:  http.StatusInternalServerError,
 			errType: "",
 			err:     fmt.Errorf("build bedrock request: %w", err),
@@ -131,7 +136,7 @@ func (p *Proxy) bedrockRequest(
 
 	generation, signErr := p.signBedrock(r.Context(), req, route, translated)
 
-	return req, generation, signErr
+	return req, generation, upstreamTarget, signErr
 }
 
 // signBedrock exports the route's AWS credentials and signs req with them,
@@ -189,8 +194,9 @@ func bedrockPathGate(path string) *gatewayError {
 }
 
 // bedrockTarget resolves the model through the route's map file and returns the
-// invocation URL for it, streamed or not.
-func bedrockTarget(route registry.Route, model string, streamed bool) (string, *gatewayError) {
+// mapped Bedrock target. The resolved target is immutable for one relay attempt,
+// including its retry, and is recorded as dispatch evidence before it is sent.
+func bedrockTarget(route registry.Route, model string) (string, *gatewayError) {
 	if model == "" {
 		return "", &gatewayError{
 			status:  http.StatusBadRequest,
@@ -217,13 +223,16 @@ func bedrockTarget(route registry.Route, model string, streamed bool) (string, *
 		}
 	}
 
+	return bedrockModel, nil
+}
+
+func bedrockInvocationURL(route registry.Route, target string, streamed bool) string {
 	suffix := invokeSuffix
 	if streamed {
 		suffix = invokeStreamPath
 	}
 
-	return registry.BedrockEndpoint(route.AWSRegion) + invokePath + awssig.EscapePathSegment(bedrockModel) + suffix,
-		nil
+	return registry.BedrockEndpoint(route.AWSRegion) + invokePath + awssig.EscapePathSegment(target) + suffix
 }
 
 // readModelMap resolves the double indirection a sigv4 route uses for its model

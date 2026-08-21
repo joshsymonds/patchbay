@@ -55,6 +55,7 @@ type exchange struct {
 
 	accountingID         int64
 	accountingDispatched bool
+	upstreamTarget       string
 }
 
 // newExchange starts recording a request that arrived at start in the named

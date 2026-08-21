@@ -111,6 +111,7 @@ type accountingRequestExportRow struct {
 	StartedAt                  int64   `json:"started_at"`
 	CompletedAt                *int64  `json:"completed_at"`
 	UpstreamDispatchedAt       *int64  `json:"upstream_dispatched_at"`
+	UpstreamTarget             *string `json:"upstream_target"`
 	RequestKind                string  `json:"request_kind"`
 	LifecycleState             string  `json:"lifecycle_state"`
 	Outcome                    *string `json:"outcome"`
@@ -219,7 +220,7 @@ func writeRateCardExport(ctx context.Context, tx *sql.Tx, encoder *json.Encoder)
 
 func writeAccountingRequestExport(ctx context.Context, tx *sql.Tx, encoder *json.Encoder) (result error) {
 	rows, queryErr := tx.QueryContext(ctx, `SELECT
-		id, started_at, completed_at, upstream_dispatched_at, request_kind, lifecycle_state,
+		id, started_at, completed_at, upstream_dispatched_at, upstream_target, request_kind, lifecycle_state,
 		outcome, upstream_contacted, route_host, route_context, route_alias, route_upstream,
 		request_model, resolved_model, auth_mode, credential_class, billing_policy, billing_class,
 		cost_status, response_id, http_status, normalization_complete, input_tokens, output_tokens,
@@ -258,6 +259,7 @@ func writeAccountingRequestExport(ctx context.Context, tx *sql.Tx, encoder *json
 func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, error) {
 	var row accountingRequestExportRow
 	var completedAt, upstreamDispatchedAt, httpStatus, normalizationComplete sql.NullInt64
+	var upstreamTarget sql.NullString
 	var inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens sql.NullInt64
 	var cacheCreation5mInputTokens, cacheCreation1hInputTokens sql.NullInt64
 	var providerCostPresent, providerCostValid, providerCostNanoUSD sql.NullInt64
@@ -268,6 +270,7 @@ func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, er
 		&row.StartedAt,
 		&completedAt,
 		&upstreamDispatchedAt,
+		&upstreamTarget,
 		&row.RequestKind,
 		&row.LifecycleState,
 		&outcome,
@@ -309,6 +312,7 @@ func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, er
 	}
 	row.CompletedAt = nullableExportInt(completedAt)
 	row.UpstreamDispatchedAt = nullableExportInt(upstreamDispatchedAt)
+	row.UpstreamTarget = nullableExportString(upstreamTarget)
 	row.Outcome = nullableExportString(outcome)
 	row.RouteAlias = nullableExportString(routeAlias)
 	row.BillingClass = nullableExportString(billingClass)

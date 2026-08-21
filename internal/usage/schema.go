@@ -14,6 +14,8 @@ const rateCardsAndFinalCostMigrationVersion = 3
 
 const importedLedgerProvenanceMigrationVersion = 4
 
+const upstreamTargetDispatchEvidenceMigrationVersion = 5
+
 type migration struct {
 	version    int
 	name       string
@@ -104,6 +106,7 @@ func declaredMigrations() []migration {
 		},
 		rateCardsAndFinalCostMigration(),
 		importedLedgerProvenanceMigration(),
+		upstreamTargetDispatchEvidenceMigration(),
 	}
 }
 
@@ -149,6 +152,18 @@ func importedLedgerProvenanceMigration() migration {
 			BEGIN
 				SELECT RAISE(ABORT, 'invalid finalized accounting snapshot');
 			END`,
+		},
+	}
+}
+
+func upstreamTargetDispatchEvidenceMigration() migration {
+	return migration{
+		version: upstreamTargetDispatchEvidenceMigrationVersion,
+		name:    "upstream_target_dispatch_evidence",
+		statements: []string{
+			`ALTER TABLE accounting_requests ADD COLUMN upstream_target TEXT CHECK (
+				upstream_target IS NULL OR (length(upstream_target) > 0 AND upstream_contacted = 1)
+			)`,
 		},
 	}
 }

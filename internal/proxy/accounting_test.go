@@ -47,7 +47,7 @@ func (s *stubAccountant) InsertPending(_ context.Context, request usage.PendingR
 	return int64(len(s.pending)), nil
 }
 
-func (s *stubAccountant) MarkUpstreamDispatched(_ context.Context, id int64, _ time.Time) error {
+func (s *stubAccountant) MarkUpstreamDispatched(_ context.Context, id int64, _ time.Time, _ string) error {
 	if s.markErr != nil {
 		return s.markErr
 	}
@@ -508,8 +508,13 @@ func (a *delayedStoreAccountant) InsertPending(ctx context.Context, request usag
 	return a.store.InsertPending(ctx, request)
 }
 
-func (a *delayedStoreAccountant) MarkUpstreamDispatched(ctx context.Context, id int64, sent time.Time) error {
-	return a.store.MarkUpstreamDispatched(ctx, id, sent)
+func (a *delayedStoreAccountant) MarkUpstreamDispatched(
+	ctx context.Context,
+	id int64,
+	sent time.Time,
+	target string,
+) error {
+	return a.store.MarkUpstreamDispatched(ctx, id, sent, target)
 }
 
 func (a *delayedStoreAccountant) Finalize(ctx context.Context, id int64, request usage.FinalizedRequest) error {
@@ -571,14 +576,20 @@ func TestAccountingStoreLifecycle(t *testing.T) {
 	var lifecycle string
 	var contacted int
 	var dispatchedAt sql.NullInt64
-	err = db.QueryRow(`SELECT lifecycle_state, upstream_contacted, upstream_dispatched_at
-		FROM accounting_requests`).Scan(&lifecycle, &contacted, &dispatchedAt)
+	var upstreamTarget sql.NullString
+	err = db.QueryRow(`SELECT lifecycle_state, upstream_contacted, upstream_dispatched_at, upstream_target
+		FROM accounting_requests`).Scan(&lifecycle, &contacted, &dispatchedAt, &upstreamTarget)
 	if err != nil {
 		t.Fatalf("query pending accounting lifecycle: %v", err)
 	}
-	if lifecycle != "pending" || contacted != 1 || !dispatchedAt.Valid {
-		t.Fatalf("mid-flight row = lifecycle=%q contacted=%d dispatched_at=%v; want pending, 1, set",
-			lifecycle, contacted, dispatchedAt)
+	if lifecycle != "pending" || contacted != 1 || !dispatchedAt.Valid || upstreamTarget.Valid {
+		t.Fatalf(
+			"mid-flight row = lifecycle=%q contacted=%d dispatched_at=%v upstream_target=%v; want pending, 1, set, NULL",
+			lifecycle,
+			contacted,
+			dispatchedAt,
+			upstreamTarget,
+		)
 	}
 
 	close(release)

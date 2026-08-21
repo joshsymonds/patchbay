@@ -239,12 +239,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		exch.requestBody = string(upstreamBody)
 	}
 
-	req, generation, reqErr := p.upstreamRequest(r, route, upstreamBody)
+	req, generation, upstreamTarget, reqErr := p.upstreamRequest(r, route, upstreamBody, "")
 	if reqErr != nil {
 		p.abort(r.Context(), w, exch, reqErr)
 
 		return
 	}
+	exch.upstreamTarget = upstreamTarget
 
 	sent := time.Now()
 	if accountingErr := p.markDispatched(r.Context(), exch, sent); accountingErr != nil {
@@ -253,7 +254,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, sendErr := p.send(r, route, upstreamBody, req, generation)
+	resp, sendErr := p.send(r, route, upstreamBody, req, generation, upstreamTarget)
 	if sendErr != nil {
 		p.abort(r.Context(), w, exch, sendErr)
 
@@ -307,7 +308,7 @@ func (p *Proxy) insertPending(ctx context.Context, r *http.Request, exch *exchan
 }
 
 func (p *Proxy) markDispatched(ctx context.Context, exch *exchange, sent time.Time) *gatewayError {
-	if err := p.accountant.MarkUpstreamDispatched(ctx, exch.accountingID, sent); err != nil {
+	if err := p.accountant.MarkUpstreamDispatched(ctx, exch.accountingID, sent, exch.upstreamTarget); err != nil {
 		p.logger.ErrorContext(ctx, "usage accounting dispatch mark failed", slog.Any("error", err))
 
 		return &gatewayError{
@@ -519,6 +520,7 @@ func (p *Proxy) send(
 	body []byte,
 	req *http.Request,
 	generation uint64,
+	upstreamTarget string,
 ) (*http.Response, *gatewayError) {
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -536,7 +538,7 @@ func (p *Proxy) send(
 	p.discard(r.Context(), resp)
 	p.credentials.Invalidate(route.AWSProfile, generation)
 
-	retry, _, buildErr := p.upstreamRequest(r, route, body)
+	retry, _, _, buildErr := p.upstreamRequest(r, route, body, upstreamTarget)
 	if buildErr != nil {
 		return nil, buildErr
 	}
@@ -590,11 +592,12 @@ func (p *Proxy) upstreamRequest(
 	r *http.Request,
 	route registry.Route,
 	body []byte,
-) (*http.Request, uint64, *gatewayError) {
+	upstreamTarget string,
+) (*http.Request, uint64, string, *gatewayError) {
 	// A sigv4 route sends a translated, signed request to an endpoint its region
 	// derives, so it shares none of the relay path below.
 	if route.Auth == registry.AuthSigV4 {
-		return p.bedrockRequest(r, route, body)
+		return p.bedrockRequest(r, route, body, upstreamTarget)
 	}
 
 	// Both gates below live only inside the AuthInject branch, so a forward or
@@ -605,7 +608,7 @@ func (p *Proxy) upstreamRequest(
 	// copy below, so it sees the header the caller actually sent.
 	if route.Auth == registry.AuthInject {
 		if !isInjectMessagesPath(r.URL.Path) {
-			return nil, 0, &gatewayError{
+			return nil, 0, "", &gatewayError{
 				status: http.StatusNotFound,
 				err: fmt.Errorf("route %q injects a key and only relays the Messages endpoints, not %s",
 					route.Alias, r.URL.Path),
@@ -613,7 +616,7 @@ func (p *Proxy) upstreamRequest(
 		}
 
 		if keyErr := checkCallerKey(r); keyErr != nil {
-			return nil, 0, keyErr
+			return nil, 0, "", keyErr
 		}
 	}
 
@@ -624,7 +627,7 @@ func (p *Proxy) upstreamRequest(
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, &gatewayError{
+		return nil, 0, "", &gatewayError{
 			status: http.StatusInternalServerError,
 			err:    fmt.Errorf("build upstream request: %w", err),
 		}
@@ -635,10 +638,10 @@ func (p *Proxy) upstreamRequest(
 	req.Header.Set(headerAcceptEncoding, encodingIdentity)
 
 	if authErr := applyAuth(req, route); authErr != nil {
-		return nil, 0, authErr
+		return nil, 0, "", authErr
 	}
 
-	return req, 0, nil
+	return req, 0, "", nil
 }
 
 // isInjectMessagesPath reports whether path is one of the Messages endpoints an

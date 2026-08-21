@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/registry"
+	"github.com/joshsymonds/patchbay/internal/usage"
 )
 
 const (
@@ -291,10 +293,18 @@ func TestSigV4RequestIsTranslatedAndSigned(t *testing.T) {
 			`"stop_reason":"end_turn"}`))
 
 	recorder := newRecorder()
+	usagePath := filepath.Join(t.TempDir(), "usage.sqlite")
+	store, err := usage.Open(usagePath)
+	if err != nil {
+		t.Fatalf("open usage store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
 	body := `{"model":"bedrock/sonnet","stream":false,"max_tokens":5,` +
 		`"messages":[{"role":"user","content":"hi"}],"future_field":{"nested":[1,2]}}`
+	cfg := bedrockConfig(t, client, recorder)
+	cfg.Accountant = store
 
-	answer := serve(t, bedrockConfig(t, client, recorder), messagesRequest(body))
+	answer := serve(t, cfg, messagesRequest(body))
 
 	if answer.Code != http.StatusOK {
 		t.Fatalf("status = %d (%s); want 200", answer.Code, answer.Body.String())
@@ -358,6 +368,22 @@ func TestSigV4RequestIsTranslatedAndSigned(t *testing.T) {
 
 	if got := execCount(t, logPath); got != 1 {
 		t.Errorf("aws ran %d times; want 1", got)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+usagePath+"?_foreign_keys=1")
+	if err != nil {
+		t.Fatalf("open usage database for inspection: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	var resolvedModel string
+	var upstreamTarget sql.NullString
+	if err := db.QueryRow(`SELECT resolved_model, upstream_target FROM accounting_requests`).
+		Scan(&resolvedModel, &upstreamTarget); err != nil {
+		t.Fatalf("read Bedrock accounting row: %v", err)
+	}
+	if resolvedModel != bedrockModel || upstreamTarget != (sql.NullString{String: bedrockARN, Valid: true}) {
+		t.Fatalf("Bedrock accounting identity = resolved_model %q upstream_target %#v; want %q and %q",
+			resolvedModel, upstreamTarget, bedrockModel, bedrockARN)
 	}
 
 	rec := recorder.wait(t)
@@ -669,8 +695,17 @@ func TestSigV4RetriesOnceOnRejection(t *testing.T) {
 	// is atomic rather than merely sequential.
 	var attempts atomic.Int64
 
+	const changedARN = "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/replacement"
+	mapPath := filepath.Join(t.TempDir(), "models.json")
 	stub, client, logPath := bedrockSetup(t, func(w http.ResponseWriter, _ *http.Request) {
 		if attempts.Add(1) == 1 {
+			if err := os.WriteFile(
+				mapPath,
+				[]byte(fmt.Sprintf(`{%q:%q}`, bedrockModel, changedARN)),
+				0o600,
+			); err != nil {
+				t.Errorf("replace model map before retry: %v", err)
+			}
 			w.Header().Set("Content-Type", jsonType)
 			w.WriteHeader(http.StatusForbidden)
 			io.WriteString(w, `{"message":"The security token included in the request is expired"}`)
@@ -682,11 +717,22 @@ func TestSigV4RetriesOnceOnRejection(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, `{"id":"msg_2","content":[]}`)
 	})
+	if err := os.WriteFile(mapPath, []byte(fmt.Sprintf(`{%q:%q}`, bedrockModel, bedrockARN)), 0o600); err != nil {
+		t.Fatalf("write initial model map: %v", err)
+	}
+	t.Setenv(mapEnvName, mapPath)
 
 	recorder := newRecorder()
+	usagePath := filepath.Join(t.TempDir(), "usage.sqlite")
+	store, err := usage.Open(usagePath)
+	if err != nil {
+		t.Fatalf("open usage store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	cfg := bedrockConfig(t, client, recorder)
+	cfg.Accountant = store
 
-	answer := serve(t, bedrockConfig(t, client, recorder),
-		messagesRequest(`{"model":"bedrock/sonnet","max_tokens":4}`))
+	answer := serve(t, cfg, messagesRequest(`{"model":"bedrock/sonnet","max_tokens":4}`))
 
 	if answer.Code != http.StatusOK {
 		t.Fatalf("status = %d (%s); want the retry to succeed with 200", answer.Code, answer.Body.String())
@@ -698,6 +744,26 @@ func TestSigV4RetriesOnceOnRejection(t *testing.T) {
 
 	if got := execCount(t, logPath); got != 2 {
 		t.Errorf("aws ran %d times; want 2 — the retry must sign with fresh credentials", got)
+	}
+
+	for attempt := range 2 {
+		call := <-stub.calls
+		if !strings.Contains(call.escapedPath, "application-inference-profile%2Fabcdef123456") ||
+			strings.Contains(call.escapedPath, "replacement") {
+			t.Errorf("attempt %d path = %q; want first mapped target", attempt+1, call.escapedPath)
+		}
+	}
+	db, err := sql.Open("sqlite", "file:"+usagePath+"?_foreign_keys=1")
+	if err != nil {
+		t.Fatalf("open usage database for inspection: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	var target sql.NullString
+	if err := db.QueryRow(`SELECT upstream_target FROM accounting_requests`).Scan(&target); err != nil {
+		t.Fatalf("read retry accounting target: %v", err)
+	}
+	if target != (sql.NullString{String: bedrockARN, Valid: true}) {
+		t.Fatalf("retry accounting upstream_target = %#v; want first mapped target %q", target, bedrockARN)
 	}
 
 	assertNoCredentialMaterial(t, recorder.wait(t))

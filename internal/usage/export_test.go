@@ -32,8 +32,22 @@ func TestExportIsDeterministicAndComplete(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("seed rate card: %v", err)
 	}
-	if _, err := store.InsertPending(t.Context(), validPendingRequest()); err != nil {
+	id, err := store.InsertPending(t.Context(), validPendingRequest())
+	if err != nil {
 		t.Fatalf("seed pending request: %v", err)
+	}
+	const target = "arn:aws:bedrock:us-east-2:123:application-inference-profile/export"
+	if err := store.MarkUpstreamDispatched(
+		t.Context(),
+		id,
+		validPendingRequest().StartedAt.Add(time.Millisecond),
+		target,
+	); err != nil {
+		t.Fatalf("mark dispatched request: %v", err)
+	}
+	undispatchedID, err := store.InsertPending(t.Context(), validPendingRequest())
+	if err != nil {
+		t.Fatalf("seed undispatched request: %v", err)
 	}
 
 	first := filepath.Join(t.TempDir(), "first.jsonl")
@@ -58,8 +72,8 @@ func TestExportIsDeterministicAndComplete(t *testing.T) {
 	}
 
 	lines := exportLines(t, first)
-	if len(lines) != 3 {
-		t.Fatalf("export lines = %d; want header plus both rows", len(lines))
+	if len(lines) != 4 {
+		t.Fatalf("export lines = %d; want header, rate card, and two accounting rows", len(lines))
 	}
 	var header struct {
 		PatchbayUsageExport int `json:"patchbay_usage_export"`
@@ -68,11 +82,12 @@ func TestExportIsDeterministicAndComplete(t *testing.T) {
 	if err := json.Unmarshal(lines[0], &header); err != nil {
 		t.Fatalf("decode header: %v", err)
 	}
-	if header.PatchbayUsageExport != 1 || header.SchemaVersion != importedLedgerProvenanceMigrationVersion {
-		t.Fatalf("header = %+v; want export 1 and schema %d", header, importedLedgerProvenanceMigrationVersion)
+	if header.PatchbayUsageExport != 1 || header.SchemaVersion != upstreamTargetDispatchEvidenceMigrationVersion {
+		t.Fatalf("header = %+v; want export 1 and schema %d", header, upstreamTargetDispatchEvidenceMigrationVersion)
 	}
 
-	rows := map[string]map[string]any{}
+	var rateCardRow map[string]any
+	var accountingRows []map[string]any
 	for _, line := range lines[1:] {
 		var record struct {
 			Table string         `json:"table"`
@@ -81,24 +96,56 @@ func TestExportIsDeterministicAndComplete(t *testing.T) {
 		if err := json.Unmarshal(line, &record); err != nil {
 			t.Fatalf("decode row %q: %v", line, err)
 		}
-		rows[record.Table] = record.Row
-	}
-	for _, table := range []string{"rate_cards", "accounting_requests"} {
-		wantColumns := exportColumnNames(t, store.db, table)
-		gotColumns := mapKeys(rows[table])
-		if !reflect.DeepEqual(wantColumns, gotColumns) {
-			t.Fatalf("%s export fields = %v; want every schema column %v", table, gotColumns, wantColumns)
+		switch record.Table {
+		case "rate_cards":
+			rateCardRow = record.Row
+		case "accounting_requests":
+			accountingRows = append(accountingRows, record.Row)
+		default:
+			t.Fatalf("unexpected export table %q", record.Table)
 		}
 	}
+	rateCardColumns := exportColumnNames(t, store.db, "rate_cards")
+	gotRateCardColumns := mapKeys(rateCardRow)
+	if !reflect.DeepEqual(rateCardColumns, gotRateCardColumns) {
+		t.Fatalf("rate_cards export fields = %v; want every schema column %v", gotRateCardColumns, rateCardColumns)
+	}
+	if len(accountingRows) != 2 {
+		t.Fatalf("accounting export rows = %d; want 2", len(accountingRows))
+	}
+	for _, row := range accountingRows {
+		wantColumns := exportColumnNames(t, store.db, "accounting_requests")
+		gotColumns := mapKeys(row)
+		if !reflect.DeepEqual(wantColumns, gotColumns) {
+			t.Fatalf("accounting_requests export fields = %v; want every schema column %v", gotColumns, wantColumns)
+		}
+	}
+	dispatched := accountingRows[0]
+	undispatched := accountingRows[1]
+	if dispatched["id"] != float64(id) || undispatched["id"] != float64(undispatchedID) {
+		t.Fatalf(
+			"accounting export IDs = %#v, %#v; want %d, %d",
+			dispatched["id"],
+			undispatched["id"],
+			id,
+			undispatchedID,
+		)
+	}
+	if got := dispatched["upstream_target"]; got != target {
+		t.Fatalf("dispatched upstream_target = %#v; want %q", got, target)
+	}
+	if dispatched["upstream_dispatched_at"] == nil {
+		t.Fatal("dispatched upstream_dispatched_at = JSON null; want timestamp")
+	}
 	for _, column := range []string{
-		"completed_at", "upstream_dispatched_at", "outcome", "route_alias", "response_id", "http_status", "normalization_complete", "input_tokens", "output_tokens",
+		"completed_at", "upstream_dispatched_at", "upstream_target", "outcome", "route_alias", "response_id", "http_status", "normalization_complete", "input_tokens", "output_tokens",
 		"cache_creation_input_tokens", "cache_read_input_tokens", "cache_creation_5m_input_tokens",
 		"cache_creation_1h_input_tokens", "provider_cost_present", "provider_cost_valid",
 		"provider_cost_nano_usd", "stop_reason", "block_shape", "duration_ms", "upstream_ms",
 		"cost_basis", "final_cost_nano_usd", "rate_card_id",
 	} {
-		if rows["accounting_requests"][column] != nil {
-			t.Fatalf("pending %s = %#v; want JSON null", column, rows["accounting_requests"][column])
+		if undispatched[column] != nil {
+			t.Fatalf("undispatched %s = %#v; want JSON null", column, undispatched[column])
 		}
 	}
 }

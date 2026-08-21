@@ -70,6 +70,7 @@ type storedRequest struct {
 	costBasis                  sql.NullString
 	finalCostNanoUSD           sql.NullInt64
 	rateCardID                 sql.NullInt64
+	upstreamTarget             sql.NullString
 }
 
 func TestRequestKindClosedVocabulary(t *testing.T) {
@@ -785,7 +786,7 @@ func TestFinalizePersistsCompleteSnapshot(t *testing.T) {
 		t.Fatalf("InsertPending() returned error: %v", err)
 	}
 	dispatchedAt := validPendingRequest().StartedAt.Add(200 * time.Millisecond)
-	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err != nil {
+	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, ""); err != nil {
 		t.Fatalf("MarkUpstreamDispatched() returned error: %v", err)
 	}
 
@@ -1297,7 +1298,7 @@ func TestFinalizeChronology(t *testing.T) {
 			store := openStore(t, path)
 			id := insertPendingRequest(t, store)
 			if test.dispatchedAt != nil {
-				if err := store.MarkUpstreamDispatched(context.Background(), id, *test.dispatchedAt); err != nil {
+				if err := store.MarkUpstreamDispatched(context.Background(), id, *test.dispatchedAt, ""); err != nil {
 					t.Fatalf("MarkUpstreamDispatched() returned error: %v", err)
 				}
 			}
@@ -1456,7 +1457,7 @@ func TestFinalizeRejectsUnknownIDsAndPreservesImmutableColumns(t *testing.T) {
 	store := openStore(t, path)
 	id := insertPendingRequest(t, store)
 	dispatchedAt := validPendingRequest().StartedAt.Add(time.Millisecond)
-	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err != nil {
+	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, ""); err != nil {
 		t.Fatalf("MarkUpstreamDispatched() returned error: %v", err)
 	}
 	before := readStoredRequest(t, store.db, id)
@@ -1706,6 +1707,100 @@ func TestFinalizeConcurrentDifferentSnapshotsAcrossStoresHaveOneWinner(t *testin
 	assertWritePermitAvailable(t, second)
 }
 
+func TestMarkUpstreamDispatchedPersistsImmutableUpstreamTarget(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		target     string
+		wantTarget sql.NullString
+	}{
+		{name: "non-Bedrock target is NULL", target: "", wantTarget: sql.NullString{}},
+		{
+			name:   "Bedrock mapped target",
+			target: "arn:aws:bedrock:us-east-2:123:application-inference-profile/first",
+			wantTarget: sql.NullString{
+				String: "arn:aws:bedrock:us-east-2:123:application-inference-profile/first",
+				Valid:  true,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+			id := insertPendingRequest(t, store)
+			dispatchedAt := time.Unix(1_776_912_346, 111_222_333).UTC()
+			if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, test.target); err != nil {
+				t.Fatalf("MarkUpstreamDispatched() returned error: %v", err)
+			}
+			var got sql.NullString
+			if err := store.db.QueryRow(
+				`SELECT upstream_target FROM accounting_requests WHERE id = ?`,
+				id,
+			).Scan(&got); err != nil {
+				t.Fatalf("read upstream target: %v", err)
+			}
+			if got != test.wantTarget {
+				t.Fatalf("upstream_target = %#v; want %#v", got, test.wantTarget)
+			}
+			if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, test.target); err != nil {
+				t.Fatalf("same-pair MarkUpstreamDispatched() returned error: %v", err)
+			}
+			if err := store.MarkUpstreamDispatched(
+				context.Background(),
+				id,
+				dispatchedAt,
+				"arn:aws:bedrock:us-east-2:123:application-inference-profile/replacement",
+			); err == nil {
+				t.Fatal("different target MarkUpstreamDispatched() returned nil error")
+			}
+			if err := store.db.QueryRow(
+				`SELECT upstream_target FROM accounting_requests WHERE id = ?`,
+				id,
+			).Scan(&got); err != nil {
+				t.Fatalf("read target after rejected replacement: %v", err)
+			}
+			if got != test.wantTarget {
+				t.Fatalf("target after rejected replacement = %#v; want %#v", got, test.wantTarget)
+			}
+			if err := store.MarkUpstreamDispatched(
+				context.Background(),
+				id,
+				dispatchedAt.Add(time.Nanosecond),
+				test.target,
+			); err == nil {
+				t.Fatal("different timestamp MarkUpstreamDispatched() returned nil error")
+			}
+			if err := store.db.QueryRow(
+				`SELECT upstream_target FROM accounting_requests WHERE id = ?`,
+				id,
+			).Scan(&got); err != nil {
+				t.Fatalf("read target after rejected timestamp: %v", err)
+			}
+			if got != test.wantTarget {
+				t.Fatalf("target after rejected timestamp = %#v; want %#v", got, test.wantTarget)
+			}
+		})
+	}
+
+	store := openStore(t, filepath.Join(t.TempDir(), "whitespace.sqlite"))
+	id := insertPendingRequest(t, store)
+	before := readStoredRequest(t, store.db, id)
+	if err := store.MarkUpstreamDispatched(
+		context.Background(),
+		id,
+		time.Unix(1_776_912_346, 111_222_333).UTC(),
+		" \t",
+	); err == nil || !strings.Contains(err.Error(), "target is blank") {
+		t.Fatalf("whitespace-target MarkUpstreamDispatched() error = %v; want blank target rejection", err)
+	}
+	if got := readStoredRequest(t, store.db, id); !reflect.DeepEqual(got, before) {
+		t.Fatalf("row changed after whitespace target rejection:\n got %#v\nwant %#v", got, before)
+	}
+}
+
 func TestMarkUpstreamDispatchedTransitionsPendingRequestDurablyAndIdempotently(t *testing.T) {
 	t.Parallel()
 
@@ -1718,7 +1813,7 @@ func TestMarkUpstreamDispatchedTransitionsPendingRequestDurablyAndIdempotently(t
 	before := readStoredRequest(t, store.db, id)
 	dispatchedAt := time.Unix(1_776_912_346, 987_654_321).UTC()
 
-	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err != nil {
+	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, ""); err != nil {
 		t.Fatalf("MarkUpstreamDispatched() returned error: %v", err)
 	}
 	want := before
@@ -1728,7 +1823,7 @@ func TestMarkUpstreamDispatchedTransitionsPendingRequestDurablyAndIdempotently(t
 		t.Fatalf("stored request after first dispatch mismatch:\n got %#v\nwant %#v", got, want)
 	}
 
-	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err != nil {
+	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, ""); err != nil {
 		t.Fatalf("idempotent MarkUpstreamDispatched() returned error: %v", err)
 	}
 	if got := readStoredRequest(t, store.db, id); !reflect.DeepEqual(got, want) {
@@ -1742,7 +1837,7 @@ func TestMarkUpstreamDispatchedTransitionsPendingRequestDurablyAndIdempotently(t
 	if got := readStoredRequest(t, reopened.db, id); !reflect.DeepEqual(got, want) {
 		t.Fatalf("reopened stored request mismatch:\n got %#v\nwant %#v", got, want)
 	}
-	if err := reopened.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err != nil {
+	if err := reopened.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, ""); err != nil {
 		t.Fatalf("reopened idempotent MarkUpstreamDispatched() returned error: %v", err)
 	}
 	if got := readStoredRequest(t, reopened.db, id); !reflect.DeepEqual(got, want) {
@@ -1760,13 +1855,13 @@ func TestMarkUpstreamDispatchedRejectsDifferentTimestampWithoutMutation(t *testi
 		t.Fatalf("InsertPending() returned error: %v", err)
 	}
 	first := time.Unix(1_776_912_346, 111_222_333).UTC()
-	if err := store.MarkUpstreamDispatched(context.Background(), id, first); err != nil {
+	if err := store.MarkUpstreamDispatched(context.Background(), id, first, ""); err != nil {
 		t.Fatalf("first MarkUpstreamDispatched() returned error: %v", err)
 	}
 	want := readStoredRequest(t, store.db, id)
 
 	second := first.Add(time.Nanosecond)
-	err = store.MarkUpstreamDispatched(context.Background(), id, second)
+	err = store.MarkUpstreamDispatched(context.Background(), id, second, "")
 	if err == nil || !strings.Contains(err.Error(), "already dispatched at") ||
 		!strings.Contains(err.Error(), "cannot replace with") {
 		t.Fatalf("different-time MarkUpstreamDispatched() error = %v; want immutable timestamp error", err)
@@ -1792,6 +1887,7 @@ func TestMarkUpstreamDispatchedRejectsUnknownIDWithoutMutation(t *testing.T) {
 		context.Background(),
 		id+1_000,
 		time.Unix(1_776_912_346, 111_222_333).UTC(),
+		"",
 	)
 	if err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("unknown-ID MarkUpstreamDispatched() error = %v; want missing request error", err)
@@ -1819,20 +1915,20 @@ func TestMarkUpstreamDispatchedRejectsInvalidInputsBeforeWritePermit(t *testing.
 	t.Cleanup(store.releaseWritePermit)
 
 	var nilContext context.Context
-	if err := store.MarkUpstreamDispatched(nilContext, id, validTime); err == nil ||
+	if err := store.MarkUpstreamDispatched(nilContext, id, validTime, ""); err == nil ||
 		!strings.Contains(err.Error(), "context is nil") {
 		t.Fatalf("nil-context MarkUpstreamDispatched() error = %v; want nil context error", err)
 	}
 
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err = store.MarkUpstreamDispatched(canceledCtx, 0, time.Time{})
+	err = store.MarkUpstreamDispatched(canceledCtx, 0, time.Time{}, "")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled invalid MarkUpstreamDispatched() error = %v; want context.Canceled", err)
 	}
 	expiredCtx, cancelExpired := context.WithDeadline(context.Background(), time.Unix(1, 0))
 	defer cancelExpired()
-	err = store.MarkUpstreamDispatched(expiredCtx, 0, time.Time{})
+	err = store.MarkUpstreamDispatched(expiredCtx, 0, time.Time{}, "")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expired invalid MarkUpstreamDispatched() error = %v; want context.DeadlineExceeded", err)
 	}
@@ -1861,7 +1957,7 @@ func TestMarkUpstreamDispatchedRejectsInvalidInputsBeforeWritePermit(t *testing.
 	}
 	for _, test := range tests {
 		ctx, cancelCall := context.WithTimeout(context.Background(), time.Second)
-		err := store.MarkUpstreamDispatched(ctx, test.id, test.dispatchedAt)
+		err := store.MarkUpstreamDispatched(ctx, test.id, test.dispatchedAt, "")
 		cancelCall()
 		if err == nil || !strings.Contains(err.Error(), test.wantContains) {
 			t.Errorf("%s: MarkUpstreamDispatched() error = %v; want substring %q",
@@ -1951,6 +2047,7 @@ func TestMarkUpstreamDispatchedRejectsIneligibleStoredStatesWithoutMutation(t *t
 				context.Background(),
 				id,
 				time.Unix(1_776_912_347, 444_555_666).UTC(),
+				"",
 			)
 			if err == nil || !strings.Contains(err.Error(), test.wantContains) {
 				t.Fatalf("MarkUpstreamDispatched() error = %v; want substring %q", err, test.wantContains)
@@ -1992,7 +2089,7 @@ func TestMarkUpstreamDispatchedCanceledWhileQueuedDoesNotMutateOrPoisonPermit(t 
 	result := make(chan error, 1)
 	dispatchedAt := time.Unix(1_776_912_346, 111_222_333).UTC()
 	go func() {
-		result <- store.MarkUpstreamDispatched(ctx, id, dispatchedAt)
+		result <- store.MarkUpstreamDispatched(ctx, id, dispatchedAt, "")
 	}()
 	select {
 	case <-ctx.observed:
@@ -2017,7 +2114,7 @@ func TestMarkUpstreamDispatchedCanceledWhileQueuedDoesNotMutateOrPoisonPermit(t 
 	permitHeld = false
 	followupCtx, cancelFollowup := context.WithTimeout(context.Background(), time.Second)
 	defer cancelFollowup()
-	if err := store.MarkUpstreamDispatched(followupCtx, id, dispatchedAt); err != nil {
+	if err := store.MarkUpstreamDispatched(followupCtx, id, dispatchedAt, ""); err != nil {
 		t.Fatalf("follow-up MarkUpstreamDispatched() returned error: %v", err)
 	}
 }
@@ -2037,13 +2134,13 @@ func TestMarkUpstreamDispatchedOnClosedStoreReleasesPermit(t *testing.T) {
 	}
 	dispatchedAt := time.Unix(1_776_912_346, 111_222_333).UTC()
 
-	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt); err == nil ||
+	if err := store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, ""); err == nil ||
 		!strings.Contains(err.Error(), "update dispatch evidence") {
 		t.Fatalf("closed-store MarkUpstreamDispatched() error = %v; want wrapped update failure", err)
 	}
 	followupCtx, cancelFollowup := context.WithTimeout(context.Background(), time.Second)
 	defer cancelFollowup()
-	if err := store.MarkUpstreamDispatched(followupCtx, id, dispatchedAt); err == nil ||
+	if err := store.MarkUpstreamDispatched(followupCtx, id, dispatchedAt, ""); err == nil ||
 		!strings.Contains(err.Error(), "update dispatch evidence") ||
 		errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("closed-store follow-up error = %v; want prompt wrapped update failure", err)
@@ -2073,7 +2170,7 @@ func TestMarkUpstreamDispatchedConcurrentSameTimestampAllSucceed(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			errs <- store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt)
+			errs <- store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, "")
 		}()
 	}
 	wait.Wait()
@@ -2116,7 +2213,7 @@ func TestMarkUpstreamDispatchedConcurrentDistinctTimestampsHaveOneWinner(t *test
 			dispatchedAt := base.Add(time.Duration(writer))
 			results <- dispatchResult{
 				dispatchedAt: dispatchedAt,
-				err:          store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt),
+				err:          store.MarkUpstreamDispatched(context.Background(), id, dispatchedAt, ""),
 			}
 		}(writer)
 	}
@@ -2301,7 +2398,8 @@ func readStoredRequest(t *testing.T, db *sql.DB, id int64) storedRequest {
 		upstream_ms,
 		cost_basis,
 		final_cost_nano_usd,
-		rate_card_id
+		rate_card_id,
+		upstream_target
 	FROM accounting_requests
 	WHERE id = ?`, id).Scan(
 		&request.id,
@@ -2342,6 +2440,7 @@ func readStoredRequest(t *testing.T, db *sql.DB, id int64) storedRequest {
 		&request.costBasis,
 		&request.finalCostNanoUSD,
 		&request.rateCardID,
+		&request.upstreamTarget,
 	); err != nil {
 		t.Fatalf("read accounting request %d: %v", id, err)
 	}

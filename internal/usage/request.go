@@ -840,8 +840,13 @@ func (store *Store) MarkUpstreamDispatched(
 	ctx context.Context,
 	id int64,
 	dispatchedAt time.Time,
+	upstreamTarget string,
 ) error {
 	dispatchedUnixNano, err := validateUpstreamDispatch(ctx, id, dispatchedAt)
+	if err != nil {
+		return err
+	}
+	target, err := validateUpstreamTarget(upstreamTarget)
 	if err != nil {
 		return err
 	}
@@ -852,13 +857,13 @@ func (store *Store) MarkUpstreamDispatched(
 	defer store.releaseWritePermit()
 
 	result, err := store.db.ExecContext(ctx, `UPDATE accounting_requests
-		SET upstream_contacted = 1, upstream_dispatched_at = ?
+		SET upstream_contacted = 1, upstream_dispatched_at = ?, upstream_target = ?
 		WHERE id = ?
 			AND lifecycle_state = 'pending'
 			AND (
-				(upstream_contacted = 0 AND upstream_dispatched_at IS NULL)
-				OR (upstream_contacted = 1 AND upstream_dispatched_at = ?)
-			)`, dispatchedUnixNano, id, dispatchedUnixNano)
+				(upstream_contacted = 0 AND upstream_dispatched_at IS NULL AND upstream_target IS NULL)
+				OR (upstream_contacted = 1 AND upstream_dispatched_at = ? AND upstream_target IS ?)
+			)`, dispatchedUnixNano, nullableValue(target), id, dispatchedUnixNano, nullableValue(target))
 	if err != nil {
 		return fmt.Errorf("mark upstream dispatched request %d: update dispatch evidence: %w", id, err)
 	}
@@ -872,7 +877,7 @@ func (store *Store) MarkUpstreamDispatched(
 	if rows != 0 {
 		return fmt.Errorf("mark upstream dispatched request %d: update affected %d rows", id, rows)
 	}
-	return store.diagnoseUpstreamDispatchNoMatch(ctx, id, dispatchedUnixNano)
+	return store.diagnoseUpstreamDispatchNoMatch(ctx, id, dispatchedUnixNano, target)
 }
 
 func validateUpstreamDispatch(ctx context.Context, id int64, dispatchedAt time.Time) (int64, error) {
@@ -895,23 +900,57 @@ func validateUpstreamDispatch(ctx context.Context, id int64, dispatchedAt time.T
 	return dispatchedUnixNano, nil
 }
 
+func validateUpstreamTarget(upstreamTarget string) (sql.NullString, error) {
+	if upstreamTarget == "" {
+		return sql.NullString{}, nil
+	}
+	if strings.TrimSpace(upstreamTarget) == "" {
+		return sql.NullString{}, errors.New("mark upstream dispatched target is blank")
+	}
+	return sql.NullString{String: upstreamTarget, Valid: true}, nil
+}
+
+func diagnoseExistingUpstreamDispatch(
+	id int64,
+	existingDispatchedAt sql.NullInt64,
+	existingTarget sql.NullString,
+	dispatchedUnixNano int64,
+	upstreamTarget sql.NullString,
+) error {
+	if existingDispatchedAt.Int64 == dispatchedUnixNano && existingTarget == upstreamTarget {
+		return nil
+	}
+	return fmt.Errorf(
+		"mark upstream dispatched request %d: already dispatched at %d to %q; cannot replace with %d to %q",
+		id,
+		existingDispatchedAt.Int64,
+		existingTarget.String,
+		dispatchedUnixNano,
+		upstreamTarget.String,
+	)
+}
+
 func (store *Store) diagnoseUpstreamDispatchNoMatch(
 	ctx context.Context,
 	id int64,
 	dispatchedUnixNano int64,
+	upstreamTarget sql.NullString,
 ) error {
 	var lifecycleState string
 	var upstreamContacted int
 	var existingDispatchedAt sql.NullInt64
+	var existingTarget sql.NullString
 	err := store.db.QueryRowContext(ctx, `SELECT
 		lifecycle_state,
 		upstream_contacted,
-		upstream_dispatched_at
+		upstream_dispatched_at,
+		upstream_target
 	FROM accounting_requests
 	WHERE id = ?`, id).Scan(
 		&lifecycleState,
 		&upstreamContacted,
 		&existingDispatchedAt,
+		&existingTarget,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("mark upstream dispatched request %d: request does not exist", id)
@@ -927,17 +966,15 @@ func (store *Store) diagnoseUpstreamDispatchNoMatch(
 		)
 	}
 	if upstreamContacted == 1 && existingDispatchedAt.Valid {
-		if existingDispatchedAt.Int64 == dispatchedUnixNano {
-			return nil
-		}
-		return fmt.Errorf(
-			"mark upstream dispatched request %d: already dispatched at %d; cannot replace with %d",
+		return diagnoseExistingUpstreamDispatch(
 			id,
-			existingDispatchedAt.Int64,
+			existingDispatchedAt,
+			existingTarget,
 			dispatchedUnixNano,
+			upstreamTarget,
 		)
 	}
-	if upstreamContacted == 0 && !existingDispatchedAt.Valid {
+	if upstreamContacted == 0 && !existingDispatchedAt.Valid && !existingTarget.Valid {
 		return fmt.Errorf(
 			"mark upstream dispatched request %d: eligible dispatch evidence was not updated",
 			id,
@@ -948,11 +985,16 @@ func (store *Store) diagnoseUpstreamDispatchNoMatch(
 	if existingDispatchedAt.Valid {
 		storedDispatchTime = fmt.Sprintf("%d", existingDispatchedAt.Int64)
 	}
+	storedTarget := "NULL"
+	if existingTarget.Valid {
+		storedTarget = fmt.Sprintf("%q", existingTarget.String)
+	}
 	return fmt.Errorf(
-		"mark upstream dispatched request %d: inconsistent upstream dispatch evidence: contacted=%d, dispatched_at=%s",
+		"mark upstream dispatched request %d: inconsistent upstream dispatch evidence: contacted=%d, dispatched_at=%s, upstream_target=%s",
 		id,
 		upstreamContacted,
 		storedDispatchTime,
+		storedTarget,
 	)
 }
 

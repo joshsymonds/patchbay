@@ -69,8 +69,8 @@ func TestOpenCreatesSecureMigratedDatabase(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read migration version: %v", err)
 	}
-	if version != importedLedgerProvenanceMigrationVersion {
-		t.Fatalf("migration version = %d; want %d", version, importedLedgerProvenanceMigrationVersion)
+	if version != upstreamTargetDispatchEvidenceMigrationVersion {
+		t.Fatalf("migration version = %d; want %d", version, upstreamTargetDispatchEvidenceMigrationVersion)
 	}
 
 	var table string
@@ -244,9 +244,14 @@ func TestOpenIsIdempotent(t *testing.T) {
 		Scan(&count, &version); err != nil {
 		t.Fatal(err)
 	}
-	if count != importedLedgerProvenanceMigrationVersion || version != importedLedgerProvenanceMigrationVersion {
+	if count != upstreamTargetDispatchEvidenceMigrationVersion ||
+		version != upstreamTargetDispatchEvidenceMigrationVersion {
 		t.Fatalf("migration rows = %d, max version = %d; want %d, %d",
-			count, version, importedLedgerProvenanceMigrationVersion, importedLedgerProvenanceMigrationVersion)
+			count,
+			version,
+			upstreamTargetDispatchEvidenceMigrationVersion,
+			upstreamTargetDispatchEvidenceMigrationVersion,
+		)
 	}
 }
 
@@ -304,6 +309,7 @@ func TestAccountingRequestsSchema(t *testing.T) {
 		{"rate_card_id", "INTEGER", 0, 0},
 		{"import_source", "TEXT", 0, 0},
 		{"import_line", "INTEGER", 0, 0},
+		{"upstream_target", "TEXT", 0, 0},
 	}
 
 	rows, err := db.Query(`PRAGMA table_info(accounting_requests)`)
@@ -392,6 +398,49 @@ func TestImportedLedgerProvenanceMigrationAndInsertTrigger(t *testing.T) {
 	) VALUES (1, 'other', 'finalized', 0, 'host', '', 'upstream', 'model', 'model',
 		'inject', '', 'explicit', 'unknown')`); err == nil || !strings.Contains(err.Error(), "invalid finalized accounting snapshot") {
 		t.Fatalf("incomplete finalized INSERT error = %v; want finalized snapshot rejection", err)
+	}
+}
+
+func TestUpstreamTargetDispatchEvidenceMigrationPreservesVersionFourRows(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	db := inspectDB(t, path)
+	if err := applyMigrations(db, declaredMigrations()[:4]); err != nil {
+		t.Fatalf("apply migrations 1-4: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO accounting_requests (
+		started_at, completed_at, upstream_dispatched_at, request_kind, lifecycle_state,
+		outcome, upstream_contacted, route_host, route_context, route_alias, route_upstream,
+		request_model, resolved_model, auth_mode, credential_class, billing_policy,
+		billing_class, cost_status
+	) VALUES (123, NULL, NULL, 'messages', 'pending', NULL, 0, 'gnomon', 'personal', NULL,
+		'https://api.anthropic.com', 'claude-sonnet-5', 'claude-sonnet-5', 'forward', 'oauth',
+		'credential_derived', 'subscription', 'pending')`); err != nil {
+		t.Fatalf("insert version-4 row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version-4 database: %v", err)
+	}
+
+	store := openStore(t, path)
+	var startedAt int64
+	var target sql.NullString
+	if err := store.db.QueryRow(
+		`SELECT started_at, upstream_target FROM accounting_requests WHERE id = 1`,
+	).Scan(&startedAt, &target); err != nil {
+		t.Fatalf("read upgraded row: %v", err)
+	}
+	if startedAt != 123 || target.Valid {
+		t.Fatalf("upgraded row = start %d target %#v; want preserved start and NULL target", startedAt, target)
+	}
+	if _, err := store.db.Exec(`UPDATE accounting_requests SET upstream_target = '' WHERE id = 1`); err == nil {
+		t.Fatal("empty upstream target update returned nil error")
+	}
+	if _, err := store.db.Exec(
+		`UPDATE accounting_requests SET upstream_target = 'arn:example' WHERE id = 1`,
+	); err == nil {
+		t.Fatal("target without upstream contact update returned nil error")
 	}
 }
 
@@ -640,7 +689,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	}
 	defer db.Close()
 
-	failing := migration{version: 5, name: "fail", statements: []string{
+	failing := migration{version: 6, name: "fail", statements: []string{
 		`CREATE TABLE must_not_survive (id INTEGER)`,
 		`THIS IS NOT SQL`,
 	}}
@@ -657,7 +706,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	if count != 0 {
 		t.Fatal("failed migration published partial schema")
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 5`).
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 6`).
 		Scan(&count); err != nil {
 		t.Fatal(err)
 	}
