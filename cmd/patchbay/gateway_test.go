@@ -250,11 +250,19 @@ func getBody(t *testing.T, url string) (int, string) {
 	return resp.StatusCode, string(body)
 }
 
-// postBody performs a POST and returns the status and body.
+// postBody performs an authenticated POST and returns the status and body.
 func postBody(t *testing.T, url, payload string) (int, string) {
 	t.Helper()
 
-	resp, err := http.Post(url, "application/json", strings.NewReader(payload))
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("build POST %s: %v", url, err)
+	}
+
+	req.Header.Set("Authorization", "Bearer gateway-test-caller")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST %s: %v", url, err)
 	}
@@ -398,9 +406,9 @@ func assertRecorded(t *testing.T, ledgerDir string) {
 			t.Fatalf("record %d context = %q; want %q", i, records[i].Context, want)
 		}
 
-		if records[i].CredentialClass != ledger.CredentialNone {
+		if records[i].CredentialClass != ledger.CredentialOAuth {
 			t.Fatalf("record %d credential_class = %q; want %q",
-				i, records[i].CredentialClass, ledger.CredentialNone)
+				i, records[i].CredentialClass, ledger.CredentialOAuth)
 		}
 	}
 }

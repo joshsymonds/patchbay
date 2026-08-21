@@ -1,6 +1,11 @@
 package proxy
 
-import "github.com/joshsymonds/patchbay/internal/anthropic"
+import (
+	"errors"
+	"net/http"
+
+	"github.com/joshsymonds/patchbay/internal/anthropic"
+)
 
 // gatewayError is a failure patchbay originated, carrying the HTTP status that
 // honestly describes it. An upstream's own error is never one of these: it is
@@ -14,6 +19,45 @@ type gatewayError struct {
 	errType string
 
 	err error
+}
+
+// forwardError maps a resolved forward route's credential shape to the local
+// refusal it requires. Inject and SigV4 routes never call it.
+func (c credentialShape) forwardError() *gatewayError {
+	switch c {
+	case credentialOAuth, credentialAPIKey:
+		return nil
+	case credentialOAuthAndAPIKey:
+		return &gatewayError{
+			status:  http.StatusBadRequest,
+			errType: anthropic.ErrorTypeInvalidRequest,
+			err:     errors.New("forward route received both OAuth and API key credentials"),
+		}
+	case credentialUnrecognizedAuthorization:
+		return &gatewayError{
+			status:  http.StatusUnauthorized,
+			errType: anthropic.ErrorTypeAuthentication,
+			err:     errors.New("forward route received an unrecognized Authorization scheme"),
+		}
+	case credentialRepeatedOAuthAuthorization, credentialRepeatedAuthorization:
+		return &gatewayError{
+			status:  http.StatusUnauthorized,
+			errType: anthropic.ErrorTypeAuthentication,
+			err:     errors.New("forward route received repeated Authorization values"),
+		}
+	case credentialRepeatedAPIKey:
+		return &gatewayError{
+			status:  http.StatusUnauthorized,
+			errType: anthropic.ErrorTypeAuthentication,
+			err:     errors.New("forward route received repeated API key values"),
+		}
+	default:
+		return &gatewayError{
+			status:  http.StatusUnauthorized,
+			errType: anthropic.ErrorTypeAuthentication,
+			err:     errors.New("forward route requires an OAuth bearer or API key credential"),
+		}
+	}
 }
 
 // anthropicType is the error type this failure is described by on the wire.

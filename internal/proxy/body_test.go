@@ -16,11 +16,14 @@ func TestNullBodyRidesTheDefaultRouteUntouched(t *testing.T) {
 	// document would otherwise be written into.
 	stub := newTLSUpstream(t, jsonHandler(http.StatusBadRequest, `{"type":"error"}`))
 
+	req := messagesRequest("null")
+	req.Header.Set("Authorization", "Bearer caller-oauth-token")
+
 	rec := serve(t, proxy.Config{
 		Registry: newRegistry(t, identityRoute(stub.url())),
 		Client:   anthropicClient(t, stub),
 		Host:     testHost,
-	}, messagesRequest("null"))
+	}, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d; want the upstream's own %d", rec.Code, http.StatusBadRequest)

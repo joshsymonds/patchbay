@@ -157,7 +157,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// strips the prefix that named it before the pipeline sees the path. A
 	// request that named none selects the personal context.
 	sel := registry.SelectionFrom(r.Context())
-	class := credentialClass(r.Header)
+	credential := classifyCredential(r.Header)
+	class := credential.ledgerClass()
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, requestLimitBytes))
 	if err != nil {
@@ -197,6 +198,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	route := res.Route
 	exch := newExchange(route, res.Context, class, requestModel, start)
+
+	if route.Auth == registry.AuthForward {
+		if credentialErr := credential.forwardError(); credentialErr != nil {
+			p.abort(r.Context(), w, exch, credentialErr)
+
+			return
+		}
+	}
 
 	upstreamBody, bodyErr := forwardBody(body, route)
 	if bodyErr != nil {

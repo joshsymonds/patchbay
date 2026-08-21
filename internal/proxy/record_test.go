@@ -694,6 +694,188 @@ func TestRecordsTheInboundCredentialClass(t *testing.T) {
 	}
 }
 
+// TestRecordsRejectedForwardCredentials proves every credential shape refused
+// locally still leaves an auditable record carrying the refusal sent to the
+// caller, without extending the ledger's credential vocabulary or retaining a
+// bare credential payload anywhere in the serialized record or response.
+func TestRecordsRejectedForwardCredentials(t *testing.T) {
+	tests := []struct {
+		name                string
+		headers             http.Header
+		secrets             []string
+		wantStatus          int
+		wantCredentialClass string
+	}{
+		{
+			name:                "no credential",
+			headers:             http.Header{},
+			wantStatus:          http.StatusUnauthorized,
+			wantCredentialClass: ledger.CredentialNone,
+		},
+		{
+			name: "empty bearer credential",
+			headers: http.Header{
+				"Authorization": []string{"Bearer "},
+			},
+			wantStatus:          http.StatusUnauthorized,
+			wantCredentialClass: ledger.CredentialNone,
+		},
+		{
+			name: "whitespace-only bearer credential",
+			headers: http.Header{
+				"Authorization": []string{"Bearer \t "},
+			},
+			wantStatus:          http.StatusUnauthorized,
+			wantCredentialClass: ledger.CredentialNone,
+		},
+		{
+			name: "empty api key",
+			headers: http.Header{
+				"X-Api-Key": []string{""},
+			},
+			wantStatus:          http.StatusUnauthorized,
+			wantCredentialClass: ledger.CredentialNone,
+		},
+		{
+			name: "whitespace-only api key",
+			headers: http.Header{
+				"X-Api-Key": []string{" \t "},
+			},
+			wantStatus:          http.StatusUnauthorized,
+			wantCredentialClass: ledger.CredentialNone,
+		},
+		{
+			name: "unrecognized authorization scheme",
+			headers: http.Header{
+				"Authorization": []string{"Basic basic-payload-sentinel"},
+			},
+			secrets:             []string{"basic-payload-sentinel"},
+			wantStatus:          http.StatusUnauthorized,
+			wantCredentialClass: ledger.CredentialNone,
+		},
+		{
+			name: "bearer followed by basic authorization",
+			headers: http.Header{
+				"Authorization": []string{
+					"Bearer bearer-before-basic-sentinel",
+					"Basic basic-after-bearer-sentinel",
+				},
+			},
+			secrets: []string{
+				"bearer-before-basic-sentinel",
+				"basic-after-bearer-sentinel",
+			},
+			wantStatus:          http.StatusUnauthorized,
+			wantCredentialClass: ledger.CredentialOAuth,
+		},
+		{
+			name: "repeated bearer authorization",
+			headers: http.Header{
+				"Authorization": []string{
+					"Bearer repeated-bearer-first-sentinel",
+					"Bearer repeated-bearer-second-sentinel",
+				},
+			},
+			secrets: []string{
+				"repeated-bearer-first-sentinel",
+				"repeated-bearer-second-sentinel",
+			},
+			wantStatus:          http.StatusUnauthorized,
+			wantCredentialClass: ledger.CredentialOAuth,
+		},
+		{
+			name: "repeated api key",
+			headers: http.Header{
+				"X-Api-Key": []string{
+					"repeated-api-key-first-sentinel",
+					"repeated-api-key-second-sentinel",
+				},
+			},
+			secrets: []string{
+				"repeated-api-key-first-sentinel",
+				"repeated-api-key-second-sentinel",
+			},
+			wantStatus:          http.StatusUnauthorized,
+			wantCredentialClass: ledger.CredentialAPIKey,
+		},
+		{
+			name: "oauth bearer and api key",
+			headers: http.Header{
+				"Authorization": []string{"Bearer mixed-oauth-sentinel"},
+				"X-Api-Key":     []string{"mixed-api-key-sentinel"},
+			},
+			secrets:             []string{"mixed-oauth-sentinel", "mixed-api-key-sentinel"},
+			wantStatus:          http.StatusBadRequest,
+			wantCredentialClass: ledger.CredentialOAuth,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newTLSUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+			recorder := newRecorder()
+
+			req := messagesRequest(`{"model":"claude-sonnet-5","max_tokens":16}`)
+			for name, values := range tc.headers {
+				for _, value := range values {
+					req.Header.Add(name, value)
+				}
+			}
+
+			answer := serve(t, proxy.Config{
+				Registry: newRegistry(t, ""),
+				Recorder: recorder,
+				Client:   anthropicClient(t, stub),
+				Host:     testHost,
+			}, req)
+
+			if answer.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body %q)", answer.Code, tc.wantStatus, answer.Body.String())
+			}
+
+			if stub.hits() != 0 {
+				t.Errorf("upstream received %d requests; want none", stub.hits())
+			}
+
+			got := recorder.wait(t)
+			if got.Status != tc.wantStatus {
+				t.Errorf("record status = %d, want %d", got.Status, tc.wantStatus)
+			}
+
+			if got.AuthMode != "forward" {
+				t.Errorf("auth_mode = %q, want %q", got.AuthMode, "forward")
+			}
+
+			if got.CredentialClass != tc.wantCredentialClass {
+				t.Errorf("credential_class = %q, want %q", got.CredentialClass, tc.wantCredentialClass)
+			}
+
+			if got.ErrorBody != answer.Body.String() {
+				t.Errorf("error_body = %q, want response body %q", got.ErrorBody, answer.Body.String())
+			}
+
+			encoded, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal refusal record: %v", err)
+			}
+
+			for _, secret := range tc.secrets {
+				if bytes.Contains(encoded, []byte(secret)) {
+					t.Errorf("serialized record contains bare credential payload %q: %s", secret, encoded)
+				}
+
+				if bytes.Contains(answer.Body.Bytes(), []byte(secret)) {
+					t.Errorf("response body contains bare credential payload %q: %s", secret, answer.Body.Bytes())
+				}
+			}
+
+			if err := got.Validate(); err != nil {
+				t.Errorf("refusal record does not validate: %v", err)
+			}
+		})
+	}
+}
+
 // TestRecordNeverCarriesACredentialValue is the safety property behind the
 // classification: a request whose every credential header holds a distinctive
 // secret leaves a record with none of them anywhere in it.

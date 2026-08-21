@@ -27,12 +27,14 @@ const fallbackErrorBody = `{"type":"error","error":{"type":"api_error","message"
 // Error types from Anthropic's own taxonomy. A failure patchbay originates is
 // still described in the vocabulary a client already knows, so nothing has to
 // learn a bespoke type to handle it: ErrorTypeAPI is the generic gateway
-// failure, and ErrorTypeNotFound is what a request naming something patchbay
-// cannot resolve gets, and ErrorTypeInvalidRequest is what a request the
-// gateway refuses on its face — a model no route can reach, a body that is not
-// an object — is answered with.
+// failure, ErrorTypeAuthentication is a credential refusal,
+// ErrorTypeNotFound is what a request naming something patchbay cannot resolve
+// gets, and ErrorTypeInvalidRequest is what a request the gateway refuses on
+// its face — a model no route can reach, a body that is not an object — is
+// answered with.
 const (
 	ErrorTypeAPI            = "api_error"
+	ErrorTypeAuthentication = "authentication_error"
 	ErrorTypeNotFound       = "not_found_error"
 	ErrorTypeInvalidRequest = "invalid_request_error"
 )

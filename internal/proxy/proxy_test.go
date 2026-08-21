@@ -243,33 +243,187 @@ func TestInjectReplacesCallerCredentials(t *testing.T) {
 	}
 }
 
-// TestForwardPassesCallerCredentials proves the default route hands the
-// caller's own subscription credentials to Anthropic untouched.
-func TestForwardPassesCallerCredentials(t *testing.T) {
-	stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
-
-	req := messagesRequest(`{"model":"claude-sonnet-5","max_tokens":16}`)
-	req.Header.Set("Authorization", "Bearer caller-oauth-token")
-	req.Header.Set("X-Api-Key", "caller-api-key")
-
-	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, ""),
-		Client:   anthropicClient(t, stub),
-		Host:     testHost,
-	}, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusOK, rec.Body.String())
+// TestForwardPassesOneRecognizedCredential proves the default route hands one
+// recognized caller credential to Anthropic untouched, for both supported
+// credential shapes.
+func TestForwardPassesOneRecognizedCredential(t *testing.T) {
+	tests := []struct {
+		name              string
+		headers           map[string]string
+		wantAuthorization string
+		wantClientKey     string
+	}{
+		{
+			name:              "oauth bearer",
+			headers:           map[string]string{"Authorization": "Bearer caller-oauth-token"},
+			wantAuthorization: "Bearer caller-oauth-token",
+		},
+		{
+			name:          "api key",
+			headers:       map[string]string{"X-Api-Key": "caller-api-key"},
+			wantClientKey: "caller-api-key",
+		},
 	}
 
-	call := stub.call(t)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
 
-	if got := call.header.Get("Authorization"); got != "Bearer caller-oauth-token" {
-		t.Errorf("authorization = %q, want the caller's token verbatim", got)
+			req := messagesRequest(`{"model":"claude-sonnet-5","max_tokens":16}`)
+			for name, value := range tc.headers {
+				req.Header.Set(name, value)
+			}
+
+			rec := serve(t, proxy.Config{
+				Registry: newRegistry(t, ""),
+				Client:   anthropicClient(t, stub),
+				Host:     testHost,
+			}, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusOK, rec.Body.String())
+			}
+
+			call := stub.call(t)
+			if got := call.header.Get("Authorization"); got != tc.wantAuthorization {
+				t.Errorf("authorization = %q, want %q", got, tc.wantAuthorization)
+			}
+
+			if got := call.header.Get("X-Api-Key"); got != tc.wantClientKey {
+				t.Errorf("x-api-key = %q, want %q", got, tc.wantClientKey)
+			}
+		})
+	}
+}
+
+// TestForwardRejectsInvalidCredentialShapes proves a forward route never
+// contacts Anthropic unless exactly one supported credential is present.
+func TestForwardRejectsInvalidCredentialShapes(t *testing.T) {
+	tests := []struct {
+		name       string
+		headers    http.Header
+		wantStatus int
+		wantType   string
+	}{
+		{
+			name:       "no credential",
+			headers:    http.Header{},
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+		},
+		{
+			name: "empty bearer credential",
+			headers: http.Header{
+				"Authorization": []string{"Bearer "},
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+		},
+		{
+			name: "whitespace-only bearer credential",
+			headers: http.Header{
+				"Authorization": []string{"Bearer \t "},
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+		},
+		{
+			name: "empty api key",
+			headers: http.Header{
+				"X-Api-Key": []string{""},
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+		},
+		{
+			name: "whitespace-only api key",
+			headers: http.Header{
+				"X-Api-Key": []string{" \t "},
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+		},
+		{
+			name: "unrecognized authorization scheme",
+			headers: http.Header{
+				"Authorization": []string{"Basic basic-payload-sentinel"},
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+		},
+		{
+			name: "bearer followed by basic authorization",
+			headers: http.Header{
+				"Authorization": []string{
+					"Bearer bearer-before-basic-sentinel",
+					"Basic basic-after-bearer-sentinel",
+				},
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+		},
+		{
+			name: "repeated bearer authorization",
+			headers: http.Header{
+				"Authorization": []string{
+					"Bearer repeated-bearer-first-sentinel",
+					"Bearer repeated-bearer-second-sentinel",
+				},
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+		},
+		{
+			name: "repeated api key",
+			headers: http.Header{
+				"X-Api-Key": []string{
+					"repeated-api-key-first-sentinel",
+					"repeated-api-key-second-sentinel",
+				},
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+		},
+		{
+			name: "oauth bearer and api key",
+			headers: http.Header{
+				"Authorization": []string{"Bearer caller-oauth-token"},
+				"X-Api-Key":     []string{"caller-api-key"},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantType:   "invalid_request_error",
+		},
 	}
 
-	if got := call.header.Get("X-Api-Key"); got != "caller-api-key" {
-		t.Errorf("x-api-key = %q, want the caller's key verbatim", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
+
+			req := messagesRequest(`{"model":"claude-sonnet-5","max_tokens":16}`)
+			for name, values := range tc.headers {
+				for _, value := range values {
+					req.Header.Add(name, value)
+				}
+			}
+
+			answer := serve(t, proxy.Config{
+				Registry: newRegistry(t, ""),
+				Client:   anthropicClient(t, stub),
+				Host:     testHost,
+			}, req)
+
+			if answer.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body %q)", answer.Code, tc.wantStatus, answer.Body.String())
+			}
+
+			if got := errorType(t, answer.Body.Bytes()); got != tc.wantType {
+				t.Errorf("error type = %q, want %q", got, tc.wantType)
+			}
+
+			if stub.hits() != 0 {
+				t.Errorf("upstream received %d requests; want none", stub.hits())
+			}
+		})
 	}
 }
 
@@ -444,6 +598,7 @@ func TestUnroutableBodyRidesDefaultRoute(t *testing.T) {
 	recorder := newRecorder()
 
 	req := messagesRequest("not json at all")
+	req.Header.Set("Authorization", "Bearer caller-oauth-token")
 
 	rec := serve(t, proxy.Config{
 		Registry: newRegistry(t, identityRoute("http://127.0.0.1:1")),
@@ -820,6 +975,7 @@ func TestForwardRouteSkipsCallerKeyAndStripsIt(t *testing.T) {
 
 	req := messagesRequest(`{"model":"claude-sonnet-5","max_tokens":16}`)
 	req.Header.Set(callerKeyHeader, "whatever-the-caller-sent")
+	req.Header.Set("X-Api-Key", "caller-api-key")
 
 	rec := serve(t, proxy.Config{
 		Registry: newRegistry(t, ""),

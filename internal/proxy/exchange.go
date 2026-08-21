@@ -21,6 +21,22 @@ const modelNone = "(none)"
 // reading the token itself.
 const bearerScheme = "bearer "
 
+// credentialShape is the complete shape of credentials a caller presented.
+// Keeping ambiguous and unrecognized shapes distinct lets a resolved forward
+// route fail closed without changing the ledger's established vocabulary.
+type credentialShape uint8
+
+const (
+	credentialNone credentialShape = iota
+	credentialOAuth
+	credentialAPIKey
+	credentialOAuthAndAPIKey
+	credentialUnrecognizedAuthorization
+	credentialRepeatedOAuthAuthorization
+	credentialRepeatedAuthorization
+	credentialRepeatedAPIKey
+)
+
 // exchange accumulates everything one request contributes to its ledger record.
 // It belongs to a single request and is never shared.
 type exchange struct {
@@ -55,22 +71,56 @@ func newExchange(route registry.Route, ctxName, credentialClass, requestModel st
 	}
 }
 
-// credentialClass classifies the credential the client presented, without ever
-// reading its value: an OAuth bearer is what a Claude Code subscription session
-// sends, x-api-key is what a console key sends, and a request with neither pays
-// for nothing itself. Only the classification is ever recorded.
-func credentialClass(header http.Header) string {
-	if authorization := header.Get(anthropic.HeaderAuthorization); authorization != "" {
-		if strings.HasPrefix(strings.ToLower(authorization), bearerScheme) {
-			return ledger.CredentialOAuth
-		}
+// classifyCredential returns the complete credential shape the client
+// presented, without retaining either credential value. Every repeated value
+// matters because the upstream header copy preserves every one; Authorization
+// is read only far enough to recognize the Bearer scheme.
+func classifyCredential(header http.Header) credentialShape {
+	authorizations := header.Values(anthropic.HeaderAuthorization)
+	apiKeys := header.Values(anthropic.HeaderClientKey)
+
+	var authorization string
+	if len(authorizations) > 0 {
+		authorization = authorizations[0]
 	}
 
-	if header.Get(anthropic.HeaderClientKey) != "" {
+	hasOAuth := len(authorization) >= len(bearerScheme) &&
+		strings.EqualFold(authorization[:len(bearerScheme)], bearerScheme) &&
+		strings.TrimSpace(authorization[len(bearerScheme):]) != ""
+
+	switch {
+	case len(authorizations) > 1 && hasOAuth:
+		return credentialRepeatedOAuthAuthorization
+	case len(authorizations) > 1:
+		return credentialRepeatedAuthorization
+	case hasOAuth && len(apiKeys) > 0:
+		return credentialOAuthAndAPIKey
+	case len(apiKeys) > 1:
+		return credentialRepeatedAPIKey
+	case len(authorizations) == 1 && !hasOAuth:
+		return credentialUnrecognizedAuthorization
+	case hasOAuth:
+		return credentialOAuth
+	case len(apiKeys) == 1 && strings.TrimSpace(apiKeys[0]) != "":
+		return credentialAPIKey
+	default:
+		return credentialNone
+	}
+}
+
+// ledgerClass maps the complete inbound shape onto the ledger's existing
+// attribution vocabulary. Ambiguous OAuth-plus-key requests retain the OAuth
+// classification the old precedence rule recorded; unrecognized Authorization
+// remains none.
+func (c credentialShape) ledgerClass() string {
+	switch c {
+	case credentialOAuth, credentialOAuthAndAPIKey, credentialRepeatedOAuthAuthorization:
+		return ledger.CredentialOAuth
+	case credentialAPIKey, credentialRepeatedAPIKey:
 		return ledger.CredentialAPIKey
+	default:
+		return ledger.CredentialNone
 	}
-
-	return ledger.CredentialNone
 }
 
 // record builds the ledger record for the finished exchange. capt is the
