@@ -34,8 +34,9 @@ type ImportResult struct {
 	SkippedExisting int
 }
 
-// ImportBoundary returns the first live accounting timestamp. Legacy records at
-// or after it overlap the SQLite accounting window and are not imported.
+// ImportBoundary returns the earliest live started_at, or the boundary-read time
+// when no live rows exist. Legacy records at or after it overlap the SQLite
+// accounting window and are not imported.
 func (store *Store) ImportBoundary(ctx context.Context) (int64, error) {
 	if ctx == nil {
 		return 0, errors.New("import boundary: context is nil")
@@ -43,13 +44,17 @@ func (store *Store) ImportBoundary(ctx context.Context) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, fmt.Errorf("import boundary context: %w", err)
 	}
+	// An empty live table means the daemon has recorded nothing yet. The instant
+	// this read begins is therefore the truthful start of live coverage: older
+	// ledger rows are historical, while rows starting from here belong to SQLite.
+	boundaryReadAt := time.Now().UnixNano()
 	var boundary sql.NullInt64
 	if err := store.db.QueryRowContext(ctx, `SELECT MIN(started_at)
 		FROM accounting_requests WHERE import_source IS NULL`).Scan(&boundary); err != nil {
 		return 0, fmt.Errorf("import boundary: read live accounting timestamp: %w", err)
 	}
 	if !boundary.Valid {
-		return 0, nil
+		return boundaryReadAt, nil
 	}
 	return boundary.Int64, nil
 }
@@ -544,11 +549,14 @@ func importedOutcome(status int, contacted int64) string {
 // vocabulary rather than a literal, so a renamed class can never quietly stop
 // matching here and start pricing subscription traffic as unknown.
 func importedCost(class any) (string, string, any) {
+	basis := CostStatusUnknown.String()
+	var amount any
 	if class == billing.ClassSubscription.String() {
-		return CostStatusKnown.String(), "zero_marginal", int64(0)
+		basis = "zero_marginal"
+		amount = int64(0)
 	}
 	// Imports intentionally never rate-card price incomplete normalization data.
-	return CostStatusUnknown.String(), "unknown", nil
+	return costStatusForBasis(basis), basis, amount
 }
 
 func nullableImportedAlias(alias string) any {

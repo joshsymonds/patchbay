@@ -317,10 +317,16 @@ importing a different file with the same basename, retains the originally
 imported accounting row for that basename and line number.
 
 Before the first file, Patchbay fixes one overlap boundary at the earliest live
-SQLite `started_at`. Ledger records at or after that instant are skipped, so the
-period where both ledger and SQLite accounting ran is never double-counted.
-The command prints imported, boundary-skipped, and already-present counts for
-each file. It can run while the daemon is serving.
+SQLite `started_at`. If the live table is empty, the boundary is the instant the
+boundary read begins: older ledger records import, while records starting at or
+after that instant are skipped. The command prints imported, boundary-skipped,
+and already-present counts for each file.
+
+The import can run while the daemon is serving, but a fresh empty database has a
+milliseconds-scale residual race: a request may have started before the boundary
+while its `InsertPending` has not committed yet, then append a ledger line later.
+For a strictly overlap-safe fresh-database migration, run the import before the
+daemon starts serving.
 
 Legacy ledgers do not contain complete pricing or normalization evidence. Imported
 subscription rows are known zero-marginal cost; imported metered rows deliberately

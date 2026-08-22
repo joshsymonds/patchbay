@@ -114,6 +114,13 @@ func TestImportLedgerFileMapsRecordsAndBilling(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("imported rows = %d; want 4", len(got))
 	}
+	for index, imported := range got {
+		knownBasis := imported.basisText.Valid && imported.basisText.String != "unknown"
+		if (imported.costStatus == CostStatusKnown.String()) != knownBasis {
+			t.Errorf("imported row %d status/basis = %q/%#v; want known iff basis is non-unknown",
+				index+1, imported.costStatus, imported.basisText)
+		}
+	}
 	first := got[0]
 	cacheTokensAbsent := !first.creation.Valid && !first.read.Valid &&
 		!first.creation5.Valid && !first.creation1.Valid
@@ -210,6 +217,49 @@ func TestImportLedgerFileBoundaryAndIdempotence(t *testing.T) {
 	after := importedRowSnapshot(t, store.db)
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("full imported rows changed on idempotent import:\n before=%#v\n after=%#v", before, after)
+	}
+}
+
+func TestImportBoundaryOnEmptyStoreUsesReadTimeAndSkipsOverlap(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+	before := time.Now().UnixNano()
+	boundary, err := store.ImportBoundary(context.Background())
+	after := time.Now().UnixNano()
+	if err != nil {
+		t.Fatalf("ImportBoundary() returned error: %v", err)
+	}
+	if boundary == 0 || boundary < before || boundary > after {
+		t.Errorf("ImportBoundary() = %d; want non-zero read time in [%d, %d]", boundary, before, after)
+	}
+
+	pivot := boundary
+	if pivot == 0 {
+		pivot = before
+	}
+	older := time.Unix(0, pivot-1).UTC()
+	newer := time.Unix(0, pivot+1).UTC()
+	path := writeLedger(t, t.TempDir(), "patchbay-2026-08-20.jsonl", fmt.Sprintf(
+		`{"timestamp":%q,"host":"host","upstream":"upstream","model":"model","request_model":"model","auth_mode":"inject","status":200,"input_tokens":0,"output_tokens":1,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`+"\n"+
+			`{"timestamp":%q,"host":"host","upstream":"upstream","model":"model","request_model":"model","auth_mode":"inject","status":200,"input_tokens":0,"output_tokens":1,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`+"\n",
+		older.Format(time.RFC3339Nano),
+		newer.Format(time.RFC3339Nano),
+	))
+	result, err := store.ImportLedgerFile(context.Background(), path, filepath.Base(path), boundary)
+	if err != nil {
+		t.Fatalf("ImportLedgerFile() returned error: %v", err)
+	}
+	if result != (ImportResult{Imported: 1, SkippedBoundary: 1}) {
+		t.Fatalf("ImportLedgerFile() = %#v; want one historical import and one boundary skip", result)
+	}
+	var storedStartedAt int64
+	if err := store.db.QueryRow(`SELECT started_at FROM accounting_requests WHERE import_source IS NOT NULL`).
+		Scan(&storedStartedAt); err != nil {
+		t.Fatalf("read imported historical row: %v", err)
+	}
+	if storedStartedAt != older.UnixNano() {
+		t.Fatalf("imported started_at = %d; want older line %d", storedStartedAt, older.UnixNano())
 	}
 }
 

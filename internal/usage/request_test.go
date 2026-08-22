@@ -900,9 +900,9 @@ func TestFinalizePersistsCompleteSnapshot(t *testing.T) {
 			got.lifecycleState, got.completedAt, finalized.CompletedAt.UnixNano())
 	}
 	if got.outcome != (sql.NullString{String: string(finalized.Outcome), Valid: true}) ||
-		got.costStatus != string(finalized.CostStatus) {
+		got.costStatus != CostStatusKnown.String() {
 		t.Fatalf("final outcome/cost = %#v/%q; want %q/%q",
-			got.outcome, got.costStatus, finalized.Outcome, finalized.CostStatus)
+			got.outcome, got.costStatus, finalized.Outcome, CostStatusKnown)
 	}
 	if got.responseID != (sql.NullString{String: finalized.ResponseID, Valid: true}) ||
 		got.httpStatus != (sql.NullInt64{Int64: int64(finalized.HTTPStatus), Valid: true}) ||
@@ -937,6 +937,216 @@ func TestFinalizePersistsCompleteSnapshot(t *testing.T) {
 		got.upstreamMS != (sql.NullInt64{Int64: finalized.UpstreamMS, Valid: true}) {
 		t.Fatalf("final details = stop %#v shape %#v duration %#v upstream %#v",
 			got.stopReason, got.blockShape, got.durationMS, got.upstreamMS)
+	}
+}
+
+func TestFinalizeDerivesCostStatusFromFinalCost(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		cards      []RateCard
+		wantStatus string
+		wantBasis  string
+		wantAmount sql.NullInt64
+		wantCard   bool
+	}{
+		{
+			name:       "matching rate card",
+			cards:      []RateCard{rateCardWithRates("claude-opus-5", validPendingRequest().StartedAt, 7, 11, 0, 0, 0, 0)},
+			wantStatus: CostStatusKnown.String(),
+			wantBasis:  "rate_card",
+			wantAmount: sql.NullInt64{Int64: 18, Valid: true},
+			wantCard:   true,
+		},
+		{
+			name:       "no matching rate card",
+			wantStatus: CostStatusUnknown.String(),
+			wantBasis:  "unknown",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+			if err := store.LoadRateCards(context.Background(), test.cards); err != nil {
+				t.Fatalf("LoadRateCards() returned error: %v", err)
+			}
+			id, err := store.InsertPending(context.Background(), meteredPendingRequest())
+			if err != nil {
+				t.Fatalf("InsertPending() returned error: %v", err)
+			}
+			if err := store.Finalize(context.Background(), id, rateCardFinalizedRequest()); err != nil {
+				t.Fatalf("Finalize() returned error: %v", err)
+			}
+
+			got := readStoredRequest(t, store.db, id)
+			if got.costStatus != test.wantStatus ||
+				got.costBasis != (sql.NullString{String: test.wantBasis, Valid: true}) ||
+				got.finalCostNanoUSD != test.wantAmount || got.rateCardID.Valid != test.wantCard {
+				t.Fatalf(
+					"derived pricing = status %q basis %#v amount %#v card %#v; want %q/%q/%#v/card=%t",
+					got.costStatus,
+					got.costBasis,
+					got.finalCostNanoUSD,
+					got.rateCardID,
+					test.wantStatus,
+					test.wantBasis,
+					test.wantAmount,
+					test.wantCard,
+				)
+			}
+		})
+	}
+}
+
+func TestFinalizeReplayPreservesDerivedPricingAcrossRateCardChanges(t *testing.T) {
+	t.Parallel()
+
+	matchingCard := func() RateCard {
+		return rateCardWithRates("claude-opus-5", validPendingRequest().StartedAt, 7, 11, 0, 0, 0, 0)
+	}
+
+	t.Run("matching card added after unknown finalization", func(t *testing.T) {
+		t.Parallel()
+
+		store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+		id, err := store.InsertPending(context.Background(), meteredPendingRequest())
+		if err != nil {
+			t.Fatalf("InsertPending() returned error: %v", err)
+		}
+		finalized := rateCardFinalizedRequest()
+		if err := store.Finalize(context.Background(), id, finalized); err != nil {
+			t.Fatalf("first Finalize() returned error: %v", err)
+		}
+		before := readStoredRequest(t, store.db, id)
+		if before.costStatus != CostStatusUnknown.String() ||
+			before.costBasis != (sql.NullString{String: "unknown", Valid: true}) ||
+			before.finalCostNanoUSD.Valid {
+			t.Fatalf("first derived pricing = %q/%#v/%#v; want unknown/unknown/NULL",
+				before.costStatus, before.costBasis, before.finalCostNanoUSD)
+		}
+		if err := store.LoadRateCards(context.Background(), []RateCard{matchingCard()}); err != nil {
+			t.Fatalf("LoadRateCards() returned error: %v", err)
+		}
+		if err := store.Finalize(context.Background(), id, finalized); err != nil {
+			t.Fatalf("exact replay after card addition returned error: %v", err)
+		}
+		if got := readStoredRequest(t, store.db, id); got != before {
+			t.Fatalf("row changed after card addition and exact replay:\n got %#v\nwant %#v", got, before)
+		}
+	})
+
+	t.Run("matching card removed after known finalization", func(t *testing.T) {
+		t.Parallel()
+
+		store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+		if err := store.LoadRateCards(context.Background(), []RateCard{matchingCard()}); err != nil {
+			t.Fatalf("LoadRateCards() returned error: %v", err)
+		}
+		id, err := store.InsertPending(context.Background(), meteredPendingRequest())
+		if err != nil {
+			t.Fatalf("InsertPending() returned error: %v", err)
+		}
+		finalized := rateCardFinalizedRequest()
+		if err := store.Finalize(context.Background(), id, finalized); err != nil {
+			t.Fatalf("first Finalize() returned error: %v", err)
+		}
+		before := readStoredRequest(t, store.db, id)
+		if before.costStatus != CostStatusKnown.String() ||
+			before.costBasis != (sql.NullString{String: "rate_card", Valid: true}) ||
+			before.finalCostNanoUSD != (sql.NullInt64{Int64: 18, Valid: true}) || !before.rateCardID.Valid {
+			t.Fatalf("first derived pricing = %q/%#v/%#v/%#v; want known/rate_card/18/card",
+				before.costStatus, before.costBasis, before.finalCostNanoUSD, before.rateCardID)
+		}
+		if _, err := store.db.Exec(`DROP TRIGGER rate_cards_forbid_update`); err != nil {
+			t.Fatalf("drop test-only rate-card update guard: %v", err)
+		}
+		result, err := store.db.Exec(
+			`UPDATE rate_cards SET model = 'other/model' WHERE id = ?`,
+			before.rateCardID.Int64,
+		)
+		if err != nil {
+			t.Fatalf("remove matching card in test database: %v", err)
+		}
+		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+			t.Fatalf("removed matching rate cards = %d, %v; want 1, nil", rows, err)
+		}
+		if err := store.Finalize(context.Background(), id, finalized); err != nil {
+			t.Fatalf("exact replay after card removal returned error: %v", err)
+		}
+		if got := readStoredRequest(t, store.db, id); got != before {
+			t.Fatalf("row changed after card removal and exact replay:\n got %#v\nwant %#v", got, before)
+		}
+	})
+}
+
+func TestFinalizeStalePendingReadPreservesFirstDerivationAcrossRateCardChange(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	winner := openStore(t, path)
+	staleReader := openStore(t, path)
+	id, err := winner.InsertPending(context.Background(), meteredPendingRequest())
+	if err != nil {
+		t.Fatalf("InsertPending() returned error: %v", err)
+	}
+	finalized := rateCardFinalizedRequest()
+	snapshot, err := deriveFinalizedSnapshot(context.Background(), id, finalized)
+	if err != nil {
+		t.Fatalf("deriveFinalizedSnapshot() returned error: %v", err)
+	}
+	if err := staleReader.acquireWritePermit(context.Background()); err != nil {
+		t.Fatalf("acquire stale-reader write permit: %v", err)
+	}
+	t.Cleanup(staleReader.releaseWritePermit)
+	staleState, err := staleReader.readFinalizationState(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read pending finalization state: %v", err)
+	}
+	if staleState.lifecycleState != "pending" {
+		t.Fatalf("stale-reader lifecycle = %q; want pending", staleState.lifecycleState)
+	}
+	if err := validateFinalizationState(id, staleState, snapshot); err != nil {
+		t.Fatalf("validate pending finalization state: %v", err)
+	}
+
+	if err := winner.Finalize(context.Background(), id, finalized); err != nil {
+		t.Fatalf("winning Finalize() returned error: %v", err)
+	}
+	first := readStoredRequest(t, winner.db, id)
+	if first.costStatus != CostStatusUnknown.String() ||
+		first.costBasis != (sql.NullString{String: CostStatusUnknown.String(), Valid: true}) ||
+		first.finalCostNanoUSD.Valid || first.rateCardID.Valid {
+		t.Fatalf("winning derived pricing = %q/%#v/%#v/%#v; want unknown/unknown/NULL/NULL",
+			first.costStatus, first.costBasis, first.finalCostNanoUSD, first.rateCardID)
+	}
+	if err := winner.LoadRateCards(context.Background(), []RateCard{
+		rateCardWithRates("claude-opus-5", validPendingRequest().StartedAt, 7, 11, 0, 0, 0, 0),
+	}); err != nil {
+		t.Fatalf("LoadRateCards() returned error: %v", err)
+	}
+	staleCost, err := staleReader.deriveFinalCost(context.Background(), staleState, snapshot)
+	if err != nil {
+		t.Fatalf("derive stale-reader final cost: %v", err)
+	}
+	if staleCost.status() != CostStatusKnown.String() ||
+		staleCost.basis != (sql.NullString{String: "rate_card", Valid: true}) ||
+		staleCost.amount != (sql.NullInt64{Int64: 18, Valid: true}) || !staleCost.rateCardID.Valid {
+		t.Fatalf("stale-reader derived pricing = %q/%#v/%#v/%#v; want known/rate_card/18/card",
+			staleCost.status(), staleCost.basis, staleCost.amount, staleCost.rateCardID)
+	}
+
+	if err := staleReader.finalizeAfterPendingRead(
+		context.Background(),
+		id,
+		staleState,
+		snapshot,
+	); err != nil {
+		t.Fatalf("stale-reader exact replay returned error: %v", err)
+	}
+	if got := readStoredRequest(t, staleReader.db, id); got != first {
+		t.Fatalf("stale-reader replay changed first derivation:\n got %#v\nwant %#v", got, first)
 	}
 }
 
@@ -984,7 +1194,7 @@ func TestFinalizationVocabularies(t *testing.T) {
 	}
 }
 
-func TestFinalizeAcceptsEveryOutcomeAndFinalCostStatus(t *testing.T) {
+func TestFinalizeAcceptsEveryOutcome(t *testing.T) {
 	t.Parallel()
 
 	for _, outcome := range []Outcome{
@@ -995,26 +1205,23 @@ func TestFinalizeAcceptsEveryOutcomeAndFinalCostStatus(t *testing.T) {
 		OutcomeResponseInterrupted,
 		OutcomeNormalizationFailure,
 	} {
-		for _, status := range []CostStatus{CostStatusKnown, CostStatusUnknown} {
-			t.Run(outcome.String()+"/"+status.String(), func(t *testing.T) {
-				t.Parallel()
+		t.Run(outcome.String(), func(t *testing.T) {
+			t.Parallel()
 
-				path := filepath.Join(t.TempDir(), "usage.sqlite")
-				store := openStore(t, path)
-				id := insertPendingRequest(t, store)
-				finalized := validFinalizedRequest()
-				finalized.Outcome = outcome
-				finalized.CostStatus = status
-				if err := store.Finalize(context.Background(), id, finalized); err != nil {
-					t.Fatalf("Finalize() returned error: %v", err)
-				}
-				got := readStoredRequest(t, store.db, id)
-				if got.outcome.String != outcome.String() || got.costStatus != status.String() {
-					t.Fatalf("stored outcome/status = %q/%q; want %q/%q",
-						got.outcome.String, got.costStatus, outcome, status)
-				}
-			})
-		}
+			path := filepath.Join(t.TempDir(), "usage.sqlite")
+			store := openStore(t, path)
+			id := insertPendingRequest(t, store)
+			finalized := validFinalizedRequest()
+			finalized.Outcome = outcome
+			if err := store.Finalize(context.Background(), id, finalized); err != nil {
+				t.Fatalf("Finalize() returned error: %v", err)
+			}
+			got := readStoredRequest(t, store.db, id)
+			if got.outcome.String != outcome.String() || got.costStatus != CostStatusKnown.String() {
+				t.Fatalf("stored outcome/status = %q/%q; want %q/%q",
+					got.outcome.String, got.costStatus, outcome, CostStatusKnown)
+			}
+		})
 	}
 }
 
@@ -1234,9 +1441,6 @@ func TestFinalizeRejectsInvalidValuesBeforeMutation(t *testing.T) {
 	}{
 		{"blank outcome", func(value *FinalizedRequest) { value.Outcome = "" }},
 		{"invalid outcome", func(value *FinalizedRequest) { value.Outcome = "unknown" }},
-		{"pending cost status", func(value *FinalizedRequest) { value.CostStatus = CostStatusPending }},
-		{"blank cost status", func(value *FinalizedRequest) { value.CostStatus = "" }},
-		{"invalid cost status", func(value *FinalizedRequest) { value.CostStatus = "Known" }},
 		{"HTTP below range", func(value *FinalizedRequest) { value.HTTPStatus = 99 }},
 		{"HTTP above range", func(value *FinalizedRequest) { value.HTTPStatus = 600 }},
 		{"negative input", func(value *FinalizedRequest) { value.InputTokens = -1 }},
@@ -1523,7 +1727,6 @@ func TestFinalizeRejectsEveryDifferingReplayField(t *testing.T) {
 		{"block shape", func(value *FinalizedRequest) { value.BlockShape = []string{"text", "thinking"} }},
 		{"duration", func(value *FinalizedRequest) { value.DurationMS++ }},
 		{"upstream duration", func(value *FinalizedRequest) { value.UpstreamMS++ }},
-		{"cost status", func(value *FinalizedRequest) { value.CostStatus = CostStatusUnknown }},
 	}
 	for _, test := range mutations {
 		t.Run(test.name, func(t *testing.T) {
@@ -2428,8 +2631,25 @@ func validFinalizedRequest() FinalizedRequest {
 		BlockShape:                        []string{"thinking", "text"},
 		DurationMS:                        1_000,
 		UpstreamMS:                        800,
-		CostStatus:                        CostStatusKnown,
 	}
+}
+
+func rateCardFinalizedRequest() FinalizedRequest {
+	finalized := validFinalizedRequest()
+	finalized.ProviderCostPresent = false
+	finalized.ProviderCostValid = false
+	finalized.ProviderCost = 0
+	finalized.InputTokens = 1_000_000
+	finalized.OutputTokens = 1_000_000
+	finalized.CacheCreationInputTokens = 0
+	finalized.CacheCreationInputTokensPresent = false
+	finalized.CacheReadInputTokens = 0
+	finalized.CacheReadInputTokensPresent = false
+	finalized.CacheCreation5mInputTokens = 0
+	finalized.CacheCreation5mInputTokensPresent = false
+	finalized.CacheCreation1hInputTokens = 0
+	finalized.CacheCreation1hInputTokensPresent = false
+	return finalized
 }
 
 func validPendingRequest() PendingRequest {

@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/joshsymonds/patchbay/internal/billing"
 	usagepkg "github.com/joshsymonds/patchbay/internal/usage"
 )
 
@@ -84,13 +83,6 @@ func (e *exchange) accountingOutcome(capt *capture, sum summary) usagepkg.Outcom
 
 func (e *exchange) finalizedRequest(capt *capture) usagepkg.FinalizedRequest {
 	sum := e.accountingSummary(capt)
-	costStatus := usagepkg.CostStatusUnknown
-	seat := e.seat()
-	class, err := billing.RealizeClass(seat.BillingPolicy(), seat.BillingClass, e.credentialClass)
-	if err == nil && (sum.providerCostPresent && sum.providerCostValid ||
-		class == billing.ClassSubscription || class == billing.ClassSelfHosted) {
-		costStatus = usagepkg.CostStatusKnown
-	}
 
 	return usagepkg.FinalizedRequest{
 		CompletedAt:                       time.Now(),
@@ -117,7 +109,6 @@ func (e *exchange) finalizedRequest(capt *capture) usagepkg.FinalizedRequest {
 		BlockShape:                        sum.blockTypes,
 		DurationMS:                        e.durationMS,
 		UpstreamMS:                        e.upstreamMS,
-		CostStatus:                        costStatus,
 	}
 }
 

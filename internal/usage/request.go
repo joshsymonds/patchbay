@@ -133,7 +133,6 @@ type FinalizedRequest struct {
 	BlockShape                        []string
 	DurationMS                        int64
 	UpstreamMS                        int64
-	CostStatus                        CostStatus
 }
 
 // PendingRequest is the immutable request identity captured before upstream contact.
@@ -233,7 +232,7 @@ func (store *Store) InsertPending(ctx context.Context, request PendingRequest) (
 }
 
 const (
-	finalizeUpdateArgumentCount = 44
+	finalizeUpdateArgumentCount = 43
 	finalizedLifecycleState     = "finalized"
 )
 
@@ -256,13 +255,26 @@ type finalizedSnapshot struct {
 	blockShape                 string
 	durationMS                 int64
 	upstreamMS                 int64
-	costStatus                 string
 }
 
 type finalCost struct {
 	basis      sql.NullString
 	amount     sql.NullInt64
 	rateCardID sql.NullInt64
+}
+
+func (cost finalCost) status() string {
+	if !cost.basis.Valid {
+		return CostStatusUnknown.String()
+	}
+	return costStatusForBasis(cost.basis.String)
+}
+
+func costStatusForBasis(basis string) string {
+	if basis == CostStatusUnknown.String() {
+		return CostStatusUnknown.String()
+	}
+	return CostStatusKnown.String()
 }
 
 type finalizationState struct {
@@ -296,6 +308,19 @@ func (store *Store) Finalize(ctx context.Context, id int64, finalized FinalizedR
 	if state.lifecycleState == finalizedLifecycleState {
 		return nil
 	}
+	return store.finalizeAfterPendingRead(ctx, id, state, snapshot)
+}
+
+// finalizeAfterPendingRead completes a finalization whose caller already read and
+// validated a pending row while holding this Store's write permit. Another Store
+// can finalize the row before this UPDATE; the exact-replay branch then preserves
+// that winner's derived pricing while accepting the identical caller snapshot.
+func (store *Store) finalizeAfterPendingRead(
+	ctx context.Context,
+	id int64,
+	state finalizationState,
+	snapshot finalizedSnapshot,
+) error {
 	cost, err := store.deriveFinalCost(ctx, state, snapshot)
 	if err != nil {
 		return fmt.Errorf("finalize request %d: derive final cost: %w", id, err)
@@ -305,7 +330,7 @@ func (store *Store) Finalize(ctx context.Context, id int64, finalized FinalizedR
 		completed_at = ?,
 		lifecycle_state = 'finalized',
 		outcome = ?,
-		cost_status = ?,
+		cost_status = CASE WHEN lifecycle_state = 'pending' THEN ? ELSE cost_status END,
 		cost_basis = CASE WHEN lifecycle_state = 'pending' THEN ? ELSE cost_basis END,
 		final_cost_nano_usd = CASE WHEN lifecycle_state = 'pending' THEN ? ELSE final_cost_nano_usd END,
 		rate_card_id = CASE WHEN lifecycle_state = 'pending' THEN ? ELSE rate_card_id END,
@@ -334,7 +359,6 @@ func (store *Store) Finalize(ctx context.Context, id int64, finalized FinalizedR
 		OR (lifecycle_state = 'finalized'
 			AND completed_at IS ?
 			AND outcome IS ?
-			AND cost_status IS ?
 			AND response_id IS ?
 			AND http_status IS ?
 			AND normalization_complete IS ?
@@ -418,7 +442,6 @@ func deriveFinalizedSnapshot(
 		blockShape:          string(encodedShape),
 		durationMS:          finalized.DurationMS,
 		upstreamMS:          finalized.UpstreamMS,
-		costStatus:          finalized.CostStatus.String(),
 	}, nil
 }
 
@@ -448,9 +471,6 @@ func validateFinalizedRequest(
 	}
 	if finalized.HTTPStatus != 0 && (finalized.HTTPStatus < 100 || finalized.HTTPStatus > 599) {
 		return 0, fmt.Errorf("finalize request HTTP status %d is outside 100-599", finalized.HTTPStatus)
-	}
-	if finalized.CostStatus != CostStatusKnown && finalized.CostStatus != CostStatusUnknown {
-		return 0, fmt.Errorf("finalize request cost status %q is invalid", finalized.CostStatus)
 	}
 	if metricErr := validateFinalizedMetrics(finalized); metricErr != nil {
 		return 0, metricErr
@@ -562,7 +582,7 @@ func (snapshot finalizedSnapshot) updateArguments(id int64, cost finalCost) []an
 	values = append(values,
 		snapshot.completedAt,
 		snapshot.outcome,
-		snapshot.costStatus,
+		cost.status(),
 		nullableValue(cost.basis),
 		nullableValue(cost.amount),
 		nullableValue(cost.rateCardID),
@@ -589,7 +609,6 @@ func (snapshot finalizedSnapshot) updateArguments(id int64, cost finalCost) []an
 	return append(values,
 		snapshot.completedAt,
 		snapshot.outcome,
-		snapshot.costStatus,
 		nullableValue(snapshot.responseID),
 		nullableValue(snapshot.httpStatus),
 		snapshot.normalizationComplete,
@@ -653,8 +672,7 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 		stop_reason,
 		block_shape,
 		duration_ms,
-		upstream_ms,
-		cost_status
+		upstream_ms
 	FROM accounting_requests WHERE id = ?`, id).Scan(
 		&state.startedAt,
 		&state.resolvedModel,
@@ -680,7 +698,6 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 		&blockShape,
 		&durationMS,
 		&upstreamMS,
-		&state.snapshot.costStatus,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return finalizationState{}, fmt.Errorf("finalize request %d: request does not exist", id)
@@ -751,7 +768,7 @@ func (store *Store) deriveFinalCost(
 }
 
 func unknownFinalCost() finalCost {
-	return finalCost{basis: sql.NullString{String: "unknown", Valid: true}}
+	return finalCost{basis: sql.NullString{String: CostStatusUnknown.String(), Valid: true}}
 }
 
 type pricedTokens struct {
