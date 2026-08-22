@@ -4,7 +4,7 @@
 # particular, publish the port to host loopback ONLY: anything that can reach
 # this socket can spend the caller's credentials.
 #
-# Note the one thing this image cannot do: `sigv4` routes exec the aws CLI,
+# Note the one thing this image cannot do: `sigv4` Seats exec the aws CLI,
 # which is not here. Registries using them need a native install (or the Nix
 # module) — see docs/docker.md.
 
@@ -33,7 +33,8 @@ COPY --from=build --chown=65532:65532 /var/lib/patchbay /var/lib/patchbay
 # to 127.0.0.1 on the host (see examples/docker/compose.yaml).
 ENV PATCHBAY_LISTEN=0.0.0.0:4100 \
     PATCHBAY_REGISTRY=/etc/patchbay/routes.json \
-    PATCHBAY_LEDGER_DIR=/var/lib/patchbay/ledger
+    PATCHBAY_LEDGER_DIR=/var/lib/patchbay/ledger \
+    PATCHBAY_USAGE_DB=/var/lib/patchbay/usage.sqlite
 
 EXPOSE 4100
 

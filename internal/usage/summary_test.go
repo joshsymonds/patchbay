@@ -404,19 +404,36 @@ func nullableSummaryToken(value int64) any {
 	return value
 }
 
+// TestSummaryFilterInvalidContextDoesNotReachSQLite pins that a filter names a
+// Context the current registry could produce, or is refused before any query
+// runs. The rule is the registry's own ID grammar, called rather than restated,
+// so the leading-dash name the older grammar admitted is refused here too — it
+// can only match rows imported from v1 history, and the filter is asking about
+// the world the registry describes now.
 func TestSummaryFilterInvalidContextDoesNotReachSQLite(t *testing.T) {
 	t.Parallel()
 
-	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
-	if err := store.db.Close(); err != nil {
-		t.Fatalf("close database: %v", err)
-	}
-	_, err := store.SummarizeUsage(context.Background(), SummaryFilter{
-		Since:   time.Now().UTC(),
-		Until:   time.Now().UTC().Add(time.Hour),
-		Context: "invalid/context",
-	})
-	if err == nil || !strings.Contains(err.Error(), "context") {
-		t.Fatalf("SummarizeUsage() error = %v; want context validation error", err)
+	for _, contextName := range []string{
+		"invalid/context",
+		"Work",
+		"-legacy",
+		"work_2",
+	} {
+		t.Run(contextName, func(t *testing.T) {
+			t.Parallel()
+
+			store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+			if err := store.db.Close(); err != nil {
+				t.Fatalf("close database: %v", err)
+			}
+			_, err := store.SummarizeUsage(context.Background(), SummaryFilter{
+				Since:   time.Now().UTC(),
+				Until:   time.Now().UTC().Add(time.Hour),
+				Context: contextName,
+			})
+			if err == nil || !strings.Contains(err.Error(), "context") {
+				t.Fatalf("SummarizeUsage() error = %v; want context validation error", err)
+			}
+		})
 	}
 }

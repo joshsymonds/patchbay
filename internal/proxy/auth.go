@@ -15,7 +15,7 @@ import (
 )
 
 // CallerKeyHeader is patchbay's own authentication header: the shared secret a
-// caller must present before an inject route will spend the household key.
+// caller must present before an inject seat will spend the household key.
 // Because it is patchbay's and never the upstream's, it is stripped from every
 // upstream request (see upstreamRequest's copyHeader call).
 //
@@ -29,22 +29,22 @@ const CallerKeyHeader = "X-Patchbay-Key"
 // upstream key uses, so the secret is never baked into the config.
 const CallerKeyEnvFile = "PATCHBAY_CALLER_KEY_FILE"
 
-// applyAuth sets the credentials the route pays with.
+// applyAuth sets the credentials the seat pays with.
 //
-// A forward route leaves the caller's own Authorization and x-api-key headers
-// exactly as they arrived — that is the whole point of the default route, where
-// the caller's subscription pays. An inject route deletes both first: the
+// A forward seat leaves the caller's own Authorization and x-api-key headers
+// exactly as they arrived — that is the whole point of the default seat, where
+// the caller's subscription pays. An inject seat deletes both first: the
 // caller's OAuth token must never reach a foreign upstream, not even alongside
 // the injected key.
-func applyAuth(req *http.Request, route registry.Route) *gatewayError {
-	if route.Auth != registry.AuthInject {
+func applyAuth(req *http.Request, seat registry.Seat) *gatewayError {
+	if seat.AuthMode != registry.AuthInject {
 		return nil
 	}
 
 	req.Header.Del(anthropic.HeaderAuthorization)
 	req.Header.Del(anthropic.HeaderClientKey)
 
-	key, err := readAPIKey(route.APIKeyEnvFile)
+	key, err := readAPIKey(seat.APIKeyEnvFile)
 	if err != nil {
 		return &gatewayError{status: http.StatusInternalServerError, err: err}
 	}
@@ -56,7 +56,7 @@ func applyAuth(req *http.Request, route registry.Route) *gatewayError {
 
 // checkCallerKey refuses an inject request that does not present the shared
 // caller secret, so a local process that lacks it cannot spend the household
-// key an inject route injects. It reads the inbound request — before the header
+// key an inject seat injects. It reads the inbound request — before the header
 // is stripped from the upstream copy — and fails closed: any problem reading
 // the expected key refuses the request rather than injecting the key for a
 // caller that proved nothing.
@@ -104,7 +104,7 @@ func CallerKeyMatches(presented, expected string) bool {
 	return subtle.ConstantTimeCompare(presentedSum[:], expectedSum[:]) == 1
 }
 
-// readAPIKey resolves the double indirection an inject route uses: envName is
+// readAPIKey resolves the double indirection an inject seat uses: envName is
 // the name of an environment variable whose value is the path of a file holding
 // the key. The file is read per request, so rotating the key on disk takes
 // effect immediately, and nothing keeps the key in memory afterwards.

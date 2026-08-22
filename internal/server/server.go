@@ -4,24 +4,34 @@
 //
 // Almost everything rides the pipeline. It is the catch-all rather than a
 // fallback for paths worth enumerating, because a request naming no model
-// resolves to the built-in default route and reaches Anthropic with the
-// caller's own credentials — so /v1/messages, /v1/messages/count_tokens and
-// every endpoint nobody here has heard of are all served by forwarding them.
+// resolves to its Context's own default Seat — so /v1/messages,
+// /v1/messages/count_tokens and every endpoint nobody here has heard of are all
+// served by forwarding them.
 //
 // The two model-listing endpoints are the exceptions, and only because their
-// honest answer is a merge. The aliases patchbay serves are gateway-local
+// honest answer is a merge. The public bindings patchbay serves are gateway-local
 // knowledge no upstream can report; the models an account may use are
-// knowledge patchbay does not have. Neither half is invented and neither half
-// can take down the other: a broken registry costs the aliases, an unreachable
-// upstream costs the upstream models, and the caller still gets a listing.
+// knowledge patchbay does not have. Neither half is invented — but the two
+// halves fail differently, and only one of them degrades.
+//
+// A stable registry is a requirement of every request, listings included. A
+// registry that will not validate is refused with 503 and a Context nothing
+// defines with 404, here exactly as on the proxy path: there is no Seat outside
+// the registry to answer from, so falling back would answer a question nobody
+// asked. Only the upstream half is optional. An Anthropic that is unreachable,
+// refuses the caller's credentials or answers with something that is not a
+// listing costs those entries and is logged, and the caller still gets the
+// Context's own bindings, with 200.
 package server
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joshsymonds/patchbay/internal/anthropic"
@@ -40,9 +50,9 @@ const (
 
 // contextPrefix is how a request names the context it wants:
 // "/ctx/work/v1/messages" asks the work context for /v1/messages. The prefix is
-// stripped before anything else looks at the path, so every gate and every
-// upstream URL downstream sees the request exactly as it would have arrived
-// without one.
+// stripped as the context is selected, so every gate and every upstream URL
+// below the selection sees the request exactly as it would have arrived without
+// one.
 const contextPrefix = "/ctx"
 
 // fetchTimeout bounds one upstream models call. Nothing on this surface
@@ -66,7 +76,7 @@ type Config struct {
 	// nearly all of them. Required.
 	Proxy http.Handler
 
-	// Registry supplies the aliases the model endpoints advertise. Required.
+	// Registry supplies the public bindings the model endpoints advertise. Required.
 	Registry *registry.Registry
 
 	// Usage supplies durable request-accounting summaries. A nil Usage leaves the
@@ -78,9 +88,11 @@ type Config struct {
 	// already bounded by a context.
 	Client *http.Client
 
-	// Logger receives the warnings a degraded listing produces. A nil Logger
-	// gets slog.Default(), which is what the host process configured for
-	// everything else.
+	// Logger receives the warnings a degraded listing produces, and the
+	// diagnostics the gateway keeps off every surface a caller can read — the
+	// detail behind a registry that stopped validating under a running gateway
+	// above all. A nil Logger gets slog.Default(), which is what the host process
+	// configured for everything else.
 	Logger *slog.Logger
 
 	// Listen is the address the host process bound, reported by the
@@ -91,25 +103,111 @@ type Config struct {
 
 // gateway answers the endpoints patchbay serves from its own knowledge. It is
 // safe for concurrent use: the registry and the client are themselves
-// concurrent, and every request carries its own state.
+// concurrent, every request carries its own state, and the one thing requests do
+// share — the hot-reload failure already reported to the operator — carries its
+// own lock.
 type gateway struct {
 	registry *registry.Registry
 	usage    UsageSummaryStore
 	client   *http.Client
 	logger   *slog.Logger
 	listen   string
+	invalid  invalidRegistry
+}
+
+type registryDocumentState struct {
+	state registry.State
+}
+
+type registryDocumentStateKey struct{}
+
+// invalidRegistryMessage is the stable line an operator greps a gateway's logs
+// for. Nothing a caller can read ever carries it.
+const invalidRegistryMessage = "registry invalid; requests fail closed"
+
+// invalidRegistry remembers the hot-reload failure the operator has already been
+// told about, by the detail that describes it.
+//
+// A registry that will not validate refuses every request that arrives while it
+// stays that way, and the detail behind each of those refusals is the same
+// detail. Logging it per request would bury the one line an operator needs under
+// the traffic it stopped, so it is logged once per distinct failure. A different
+// failure is a different line; the same failure after the file was repaired is
+// news a second time, which is what an observation finding nothing wrong is for.
+type invalidRegistry struct {
+	mu       sync.Mutex
+	sequence uint64
+	reported string
+}
+
+// report orders an already-acquired registry diagnostic, updates the dedup
+// marker, and decides whether the failure is news. The registry's monotonic
+// snapshot generation prevents an older valid observation from clearing a newer
+// failure.
+// Only that compare/update runs under the mutex; logging happens afterwards so
+// a blocked sink cannot serialize healthy requests. A nil detail is recovery:
+// it clears the marker and re-arms the same failure for a future observation.
+func (i *invalidRegistry) report(observed registry.Observation, emit func(error)) {
+	i.mu.Lock()
+	if observed.Sequence <= i.sequence {
+		i.mu.Unlock()
+		return
+	}
+	i.sequence = observed.Sequence
+
+	detail := observed.Err
+	if detail == nil {
+		i.reported = ""
+		i.mu.Unlock()
+		return
+	}
+
+	text := detail.Error()
+	if i.reported == text {
+		i.mu.Unlock()
+		return
+	}
+	i.reported = text
+	i.mu.Unlock()
+
+	emit(detail)
+}
+
+// observeRegistry tells the operator what is wrong with the registry right now:
+// the file it was read from, the field that was rejected, and the value that
+// file named — or nothing at all, when nothing is wrong with it.
+//
+// This is the only place that detail is spoken aloud. Resolve, the introspected
+// State, every response built from either and every ledger record kept of one
+// carry the bare sentinel instead, because a validation error quotes what the
+// rejected file contains and a request is entitled to none of it. An operator
+// reading the gateway's own logs is entitled to it, and is the only audience
+// that can act on it.
+//
+// The caller passes the diagnostic acquired with its resolution or inspection,
+// so this path performs no second filesystem observation. Generation ordering
+// in the tracker keeps a delayed older request from speaking over newer state.
+func (gw *gateway) observeRegistry(ctx context.Context, observed registry.Observation) {
+	gw.invalid.report(observed, func(detail error) {
+		gw.logger.ErrorContext(ctx, invalidRegistryMessage, slog.Any("error", detail))
+	})
 }
 
 // Handler returns the gateway's HTTP surface: the introspection endpoint, the
 // two model endpoints answered locally, and cfg.Proxy for every other path and
 // every other method.
 //
-// Context selection runs first and introspection immediately after it, on the
-// path the selection left behind. The introspection prefix is patchbay's own —
-// no Anthropic endpoint lives under it and no context can put one there — so a
-// path under it that nothing serves is answered here rather than becoming a
-// request to Anthropic that the caller never made, and that holds for
-// "/ctx/work/_patchbay/anything" exactly as it does for the bare form.
+// Introspection wraps context selection on both sides, because the two forms of
+// a patchbay-private path arrive at different points. The outer wrapper reads
+// the path as it arrived and answers the bare "/_patchbay/..." form before any
+// context is selected at all. The inner wrapper reads the path selection left
+// behind and answers "/ctx/work/_patchbay/...", which only looks like an
+// introspection path once the prefix naming the context has come off it.
+//
+// The introspection prefix is patchbay's own — no Anthropic endpoint lives
+// under it and no context can put one there — so between the two wrappers,
+// neither form can reach the proxy and become a request to Anthropic that the
+// caller never made, including a path under the prefix that nothing serves.
 func Handler(cfg Config) http.Handler {
 	gw := &gateway{
 		registry: cfg.Registry,
@@ -132,7 +230,7 @@ func Handler(cfg Config) http.Handler {
 	mux.HandleFunc(modelPattern, gw.showModel)
 	mux.Handle(rootPattern, cfg.Proxy)
 
-	return gw.selectContext(gw.selectIntrospection(mux))
+	return gw.selectIntrospection(gw.selectContext(gw.selectIntrospection(mux)))
 }
 
 // selectIntrospection answers everything under patchbay's own path prefix and
@@ -168,24 +266,50 @@ func (gw *gateway) selectIntrospection(next http.Handler) http.Handler {
 // mid-request cannot serve the first half of a request from one document and
 // the second half from the next.
 //
-// A request that named no context still resolves, implicitly, to the personal
-// context, and keeps working with no registry at all. A request that DID name
-// one is refused unless the current registry can produce it — an unknown name, a
-// broken file, a missing file. Falling through to another context, or to the
-// built-in default route, would answer a question nobody asked, and the whole
-// point of a context is that it is a boundary.
+// A request that named no context still resolves, implicitly, to the registry's
+// configured default_context. A request that DID name one is refused unless the
+// current registry can produce it — an unknown name, a broken file, a missing
+// file. So is the implicit one: there is no Seat outside the registry to fall
+// back to, and falling through to another context would answer a question
+// nobody asked, when the whole point of a context is that it is a boundary.
+//
+// It is also where the operator hears about a registry that stopped validating,
+// because this is where a running gateway first finds out. The two refusals are
+// not the same news: a file that will not validate is a broken machine and gets
+// the detail behind it logged, while a context nothing defines is a request
+// asking for something that was never there.
+//
+// Resolution and its operator diagnostic come from the same registry freshness
+// acquisition. The diagnostic's snapshot generation orders delayed requests
+// without a second read.
 func (gw *gateway) selectContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sel, stripped := splitContext(r.URL)
 
-		res, err := gw.registry.Resolve(sel, "")
-		if err != nil {
-			gw.writeUnknownContext(r.Context(), w, err)
-
-			return
+		ctx := registry.WithSelection(r.Context(), sel)
+		var (
+			res      registry.Resolution
+			observed registry.Observation
+			err      error
+		)
+		if stripped.Path == introspectRoot || strings.HasPrefix(stripped.Path, introspectPrefix) {
+			state, documentObserved := gw.registry.InspectObserved()
+			res, err = registry.ResolveState(state, sel, "", nil)
+			observed = documentObserved
+			ctx = context.WithValue(ctx, registryDocumentStateKey{}, registryDocumentState{
+				state: state,
+			})
+		} else {
+			res, observed, err = gw.registry.ResolveObserved(sel, "", nil)
 		}
 
-		ctx := registry.WithResolution(registry.WithSelection(r.Context(), sel), res)
+		gw.observeRegistry(ctx, observed)
+
+		if err != nil {
+			ctx = registry.WithResolutionError(ctx, err)
+		} else {
+			ctx = registry.WithResolution(ctx, res)
+		}
 		routed := r.WithContext(ctx)
 
 		if sel.Explicit {
@@ -196,29 +320,38 @@ func (gw *gateway) selectContext(next http.Handler) http.Handler {
 	})
 }
 
-// ContextFromPath reports the context a request for path selects, by exactly
+// ContextFromURL reports the context a request for target selects, by exactly
 // the split the gateway routes with. It is exported because patchbay's own CLI
 // has to say which context a configured base URL lands a project in, and a
 // second implementation of the rule is how the tool and the gateway come to
 // disagree about what a path means.
 //
-// A path naming no context selects the personal one. A path whose prefix names
-// nothing selects the empty name, which no registry can produce and which the
-// gateway refuses.
-func ContextFromPath(path string) string {
-	sel, _ := splitContext(&url.URL{Path: path})
-
+// It takes the whole URL rather than a path string because the decoded Path and
+// the raw RawPath are two different answers to the question: "/ctx/work%2Feu"
+// decodes to a context named "work" under a sub-path and escapes to one segment
+// naming neither. The gateway routes on the escaped form, so a caller handing
+// over only the decoded half would report a context this URL never reaches.
+//
+// A URL naming no context selects the registry's configured default_context. One
+// whose prefix names nothing — or whose name will not come cleanly off both
+// halves of the path — selects the empty name, which no registry can produce and
+// which the gateway refuses.
+func ContextFromURL(target *url.URL, defaultContext string) string {
+	sel, _ := splitContext(target)
+	if !sel.Explicit {
+		return defaultContext
+	}
 	return sel.Name
 }
 
 // splitContext separates the context a request named from the path it actually
-// asked for. A path with no prefix selects the personal context implicitly and
-// is returned unchanged. A prefix naming nothing — "/ctx", "/ctx/", "/ctx//x",
+// asked for. A path with no prefix selects the configured default_context
+// implicitly and is returned unchanged. A prefix naming nothing — "/ctx", "/ctx/", "/ctx//x",
 // or a name that will not come cleanly off the escaped path — is an explicit
 // selection of no context at all, which fails closed like any other name the
 // registry cannot produce.
 func splitContext(target *url.URL) (registry.Selection, *url.URL) {
-	implicit := registry.Selection{Name: registry.PersonalContext, Explicit: false}
+	implicit := registry.Selection{}
 
 	after, found := strings.CutPrefix(target.EscapedPath(), contextPrefix)
 	if !found || (after != "" && !strings.HasPrefix(after, "/")) {
@@ -266,6 +399,19 @@ func stripPrefix(target *url.URL, prefix string) (*url.URL, bool) {
 	return &stripped, true
 }
 
+// writeResolutionError refuses a request whose context did not resolve, in the
+// two ways it can fail to. A registry that will not validate is the gateway's
+// own condition and answers 503, so a caller knows to try again; a context the
+// current registry simply does not define answers 404, because trying again
+// will not produce it.
+func (gw *gateway) writeResolutionError(ctx context.Context, w http.ResponseWriter, err error) {
+	if errors.Is(err, registry.ErrInvalid) {
+		gw.writeError(ctx, w, http.StatusServiceUnavailable, err)
+		return
+	}
+	gw.writeUnknownContext(ctx, w, err)
+}
+
 // writeUnknownContext refuses a request naming a context patchbay cannot
 // resolve. It answers 404 in Anthropic's own not-found taxonomy rather than a
 // type of patchbay's invention, so a client that has never heard of contexts
@@ -273,7 +419,11 @@ func stripPrefix(target *url.URL, prefix string) (*url.URL, bool) {
 // so an operator can see which one. It never names anything else about the
 // request.
 func (gw *gateway) writeUnknownContext(ctx context.Context, w http.ResponseWriter, err error) {
-	gw.logger.WarnContext(ctx, "request named a context that cannot be resolved", slog.Any("error", err))
+	gw.logger.WarnContext(
+		ctx,
+		"request named a context that cannot be resolved",
+		slog.Any("error", err),
+	)
 	gw.writeTyped(ctx, w, http.StatusNotFound, anthropic.ErrorTypeNotFound, err)
 }
 

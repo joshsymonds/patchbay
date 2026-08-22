@@ -95,7 +95,7 @@ func parseUsageSummaryFilter(r *http.Request) (usage.SummaryFilter, error) {
 	}
 	contextName := query.Get("context")
 	if contextName != "" {
-		if contextErr := registry.ValidContextName(contextName); contextErr != nil {
+		if contextErr := registry.ValidID(contextName); contextErr != nil {
 			return usage.SummaryFilter{}, errors.New("usage summary context is invalid")
 		}
 	}

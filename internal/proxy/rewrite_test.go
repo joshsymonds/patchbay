@@ -11,10 +11,10 @@ import (
 	"github.com/joshsymonds/patchbay/internal/proxy"
 )
 
-const rewriteAlias = "local/rewrite"
+const rewriteSelector = "local/rewrite"
 
-// rewriteBody is a request carrying everything a rewrite route has to touch: a
-// model to replace, a max_tokens above the route's ceiling, a value extra_body
+// rewriteBody is a request carrying everything a rewrite Seat has to touch: a
+// model to replace, a max_tokens above the Seat's ceiling, a value extra_body
 // overrides, cache_control markers nested two levels deep, and a float whose
 // exact decimal expansion must survive re-encoding.
 const rewriteBody = `{"model":"local/rewrite","max_tokens":9000,"temperature":0.5,` +
@@ -23,25 +23,26 @@ const rewriteBody = `{"model":"local/rewrite","max_tokens":9000,"temperature":0.
 	`"messages":[{"role":"user","content":[{"type":"text","text":"hi",` +
 	`"cache_control":{"type":"ephemeral"}}]}]}`
 
-// rewriteRoute returns a route that rewrites the model, merges an extra body,
+// rewriteSeat returns a Seat that rewrites the model, merges an extra body,
 // strips cache_control and caps output tokens.
-func rewriteRoute(baseURL string) string {
-	return fmt.Sprintf(`%q:{"base_url":%q,"model":"vendor/model-1","auth":"inject",`+
-		`"api_key_env_file":%q,"extra_body":{"reasoning_effort":"low","temperature":1},`+
+func rewriteSeat(baseURL string) string {
+	return fmt.Sprintf(`%q:{"upstream":%q,"model":"vendor/model-1","auth_mode":"inject",`+
+		`"api_key_env_file":%q,"billing":"metered",`+
+		`"extra_body":{"reasoning_effort":"low","temperature":1},`+
 		`"strip_cache_control":true,"max_output_tokens":4096}`,
-		rewriteAlias, baseURL, keyEnvName)
+		rewriteSelector, baseURL, keyEnvName)
 }
 
-// TestRewriteRouteTransformsRequest checks the whole rewrite: model replaced,
+// TestRewriteSeatTransformsRequest checks the whole rewrite: model replaced,
 // extra_body merged over the caller's values, cache_control removed everywhere,
 // max_tokens clamped, and every untouched value preserved exactly.
-func TestRewriteRouteTransformsRequest(t *testing.T) {
+func TestRewriteSeatTransformsRequest(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, rewriteRoute(stub.url())),
+		Registry: newRegistry(t, rewriteSeat(stub.url())),
 		Host:     testHost,
 	}, messagesRequest(rewriteBody))
 
@@ -70,14 +71,14 @@ func TestRewriteRouteTransformsRequest(t *testing.T) {
 }
 
 // TestRewriteClampsOnlyAboveTheCeiling leaves a request already under the
-// route's output cap alone.
+// Seat's output cap alone.
 func TestRewriteClampsOnlyAboveTheCeiling(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, rewriteRoute(stub.url())),
+		Registry: newRegistry(t, rewriteSeat(stub.url())),
 		Host:     testHost,
 	}, messagesRequest(`{"model":"local/rewrite","max_tokens":100}`))
 
@@ -102,11 +103,12 @@ func TestRewriteClampsNonIntegerMaxTokens(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
-	route := fmt.Sprintf(`%q:{"base_url":%q,"model":"vendor/model-1","auth":"inject",`+
-		`"api_key_env_file":%q,"max_output_tokens":100}`, rewriteAlias, stub.url(), keyEnvName)
+	seat := fmt.Sprintf(`%q:{"upstream":%q,"model":"vendor/model-1","auth_mode":"inject",`+
+		`"api_key_env_file":%q,"billing":"metered","max_output_tokens":100}`,
+		rewriteSelector, stub.url(), keyEnvName)
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, route),
+		Registry: newRegistry(t, seat),
 		Host:     testHost,
 	}, messagesRequest(`{"model":"local/rewrite","max_tokens":1e5}`))
 
@@ -127,50 +129,47 @@ func TestRewriteClampsNonIntegerMaxTokens(t *testing.T) {
 	}
 }
 
-// TestRewriteLeavesSharedExtraBodyIntact protects the registry's shared bytes:
-// every Resolve of an alias hands out the same backing array, so a merge that
-// wrote into it would corrupt every later request.
-func TestRewriteLeavesSharedExtraBodyIntact(t *testing.T) {
+// TestRewriteLeavesTheConfiguredExtraBodyIntact holds a merge to the request it
+// belongs to. Every resolution is an isolated snapshot, so the extra_body the
+// pipeline merges the caller's body over is that request's own copy — and the
+// registry still has to answer the next request with the extra_body its file
+// configured, whatever the last one did to the copy it was handed.
+func TestRewriteLeavesTheConfiguredExtraBodyIntact(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
-	reg := newRegistry(t, rewriteRoute(stub.url()))
+	reg := newRegistry(t, rewriteSeat(stub.url()))
 
-	before := resolveRoute(t, reg, rewriteAlias)
-	snapshot := bytes.Clone(before.ExtraBody)
+	configured := resolveSeat(t, reg, rewriteSelector)
+	if len(configured.ExtraBody) == 0 {
+		t.Fatal("Seat has no extra_body to protect")
+	}
 
 	rec := serve(t, proxy.Config{Registry: reg, Host: testHost}, messagesRequest(rewriteBody))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 
-	after := resolveRoute(t, reg, rewriteAlias)
+	after := resolveSeat(t, reg, rewriteSelector)
 
-	if len(after.ExtraBody) == 0 || len(before.ExtraBody) == 0 {
-		t.Fatal("route has no extra_body to protect")
-	}
-
-	if &after.ExtraBody[0] != &before.ExtraBody[0] {
-		t.Fatal("registry handed out fresh bytes; the test cannot observe the shared array")
-	}
-
-	if !bytes.Equal(after.ExtraBody, snapshot) {
-		t.Errorf("extra_body backing array changed:\n got %s\nwant %s", after.ExtraBody, snapshot)
+	if !bytes.Equal(after.ExtraBody, configured.ExtraBody) {
+		t.Errorf("extra_body changed across a merging request:\n got %s\nwant %s",
+			after.ExtraBody, configured.ExtraBody)
 	}
 }
 
-// TestStripOnlyRouteKeepsEverythingElse covers the narrowest rewrite there is:
-// a route that only strips cache_control still forwards the caller's model and
+// TestStripOnlySeatKeepsEverythingElse covers the narrowest rewrite there is:
+// a Seat that only strips cache_control still forwards the caller's model and
 // every other value untouched.
-func TestStripOnlyRouteKeepsEverythingElse(t *testing.T) {
+func TestStripOnlySeatKeepsEverythingElse(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 
 	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
-	route := fmt.Sprintf(`%q:{"base_url":%q,"auth":"inject","api_key_env_file":%q,`+
-		`"strip_cache_control":true}`, echoAlias, stub.url(), keyEnvName)
+	seat := fmt.Sprintf(`%q:{"upstream":%q,"auth_mode":"inject","api_key_env_file":%q,`+
+		`"billing":"metered","strip_cache_control":true}`, echoSelector, stub.url(), keyEnvName)
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, route),
+		Registry: newRegistry(t, seat),
 		Host:     testHost,
 	}, messagesRequest(fidelityBody))
 

@@ -71,7 +71,7 @@ type profileCache struct {
 }
 
 // NewCredentialSource returns an empty source. Nothing is exported until a
-// route actually needs credentials.
+// Seat actually needs credentials.
 func NewCredentialSource() *CredentialSource {
 	return &CredentialSource{profiles: map[string]*profileCache{}}
 }

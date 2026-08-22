@@ -1,152 +1,273 @@
-# Ledger
+# Ledger v2
 
-Every proxied request appends one JSON object, on one line, to a file named for
-the UTC day it happened:
+Every request that enters the proxy pipeline is ledger-eligible, including
+registry, Context, body, rewrite-target, caller-key, and selected-Seat failures.
+Model and introspection endpoints remain unledgered.
 
+Records are one JSON object per line:
+
+```text
+$PATCHBAY_LEDGER_DIR/patchbay-v2-YYYY-MM-DD.jsonl
 ```
-$PATCHBAY_LEDGER_DIR/patchbay-2026-08-19.jsonl
-```
 
-The directory is created 0700 and files are 0600 — the records name every model
-a machine used and when, which is nobody else's business. Rotation is nothing
-but the choice of filename at append time; no timer runs. The directory is held
-as an `os.Root` handle, so every file operation is resolved inside it and cannot
-escape.
+The filename uses the record timestamp's UTC date. Files rotate on append when
+the date changes. Patchbay does not enforce size or retention limits and does not
+delete old files.
 
-Writes happen off the request path: the caller is answered first, then the
-record is built and appended by a separate goroutine. Each append is written,
-`fsync`ed and closed before it is reported as written. A ledger that fails —
-unwritable directory, full disk, a record that fails validation — costs the
-record and logs a warning; it never costs the request. At shutdown, in-flight
-records get a bounded 5 s to finish before the ledger is closed.
+The ledger directory is created with mode 0700 and new files with mode 0600.
+Existing permissions are not changed. Each complete append is followed by
+`fsync`.
 
-## Record schema
+Writes happen in a goroutine after the client response. A validation, open, write,
+sync, or close failure drops the record and logs `ledger record dropped`; it does
+not change the HTTP response. At shutdown, pending writes get up to five seconds
+after HTTP shutdown.
 
-Real records, from a live gateway:
+Only `patchbay-v2-*.jsonl` files are scanned. There is no v1 decoder and no legacy
+optional-field compatibility. A legacy-shaped line placed in a v2 file is
+corruption.
+
+## Selected record
 
 ```json
-{"timestamp":"2026-08-19T00:22:56.18060013-07:00","host":"workstation","context":"personal","credential_class":"none","alias":"stub/kimi","upstream":"http://127.0.0.1:4300","model":"moonshotai/kimi-k2","request_model":"stub/kimi","auth_mode":"inject","status":200,"input_tokens":12,"output_tokens":5,"duration_ms":0,"upstream_ms":0,"block_shape":["text"],"drop_signature":false,"stop_reason":"end_turn"}
-{"timestamp":"2026-08-19T00:22:56.186040329-07:00","host":"workstation","context":"personal","credential_class":"none","alias":"stub/kimi","upstream":"http://127.0.0.1:4300","model":"moonshotai/kimi-k2","request_model":"stub/kimi","auth_mode":"inject","status":403,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":null,"drop_signature":false,"error_body":"{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"patchbay: caller key missing or mismatched\"}}"}
+{
+  "timestamp": "2026-08-20T18:00:00-07:00",
+  "host": "workstation",
+  "context": "personal",
+  "selection": {
+    "kind": "model",
+    "model": "openrouter/kimi-k2"
+  },
+  "seat": "openrouter-kimi-k2",
+  "upstream": "https://openrouter.ai/api",
+  "model": "moonshotai/kimi-k2",
+  "request_model": "openrouter/kimi-k2",
+  "auth_mode": "inject",
+  "credential_class": "none",
+  "config_source": "PATCHBAY_OPENROUTER_KEY_FILE",
+  "status": 200,
+  "input_tokens": 12,
+  "output_tokens": 5,
+  "duration_ms": 320,
+  "upstream_ms": 40,
+  "block_shape": ["text"],
+  "drop_signature": false,
+  "stop_reason": "end_turn"
+}
 ```
 
-| Field | Type | Meaning |
-|---|---|---|
-| `timestamp` | RFC 3339 | When the request arrived, in local time with offset. The UTC date of this value chooses the file. |
-| `host` | string | The machine's hostname. Required, non-blank. |
-| `context` | string | The context that served the request — `personal` for every request that named none. |
-| `credential_class` | string | What kind of credential the **client** presented: `oauth` (an `Authorization: Bearer …`, which is what a Claude Code subscription session sends), `api_key` (an `x-api-key` header), or `none`. Never which credential. |
-| `alias` | string | The registry key the route was found under. Empty for a default route, built-in or declared. |
-| `upstream` | string | Where the request went: the route's `base_url`, or for a `sigv4` route the `bedrock-runtime` endpoint its region derives. Required, non-blank. |
-| `model` | string | The model actually asked of the upstream: the route's rewrite target, or the model the caller named when the route rewrites nothing. `(none)` when the request named none. |
-| `request_model` | string | The model the caller asked for, before any rewrite. `(none)` when the request named none. |
-| `auth_mode` | string | `forward`, `inject` or `sigv4`. Anything else is refused. |
-| `status` | int | The status the client received. For a request patchbay refused itself, that refusal's status. |
-| `input_tokens` | int | From the response. Zero when there was no summary to take it from. |
-| `output_tokens` | int | From the response — for a stream, the last figure reported, since a stream revises the count as it goes. |
-| `duration_ms` | int | Whole milliseconds from arrival to the end of the response stream. |
-| `upstream_ms` | int | Whole milliseconds from sending the upstream request to receiving its headers. |
-| `block_shape` | array of string \| null | The ordered content-block types of the response: `["text"]`, `["thinking","text","tool_use"]`, and so on. `null` when there was nothing to summarize. |
-| `drop_signature` | bool | True when `block_shape` contains two adjacent reasoning blocks (`thinking` or `redacted_thinking`, in any combination) — a block boundary with nothing user-visible between them, which is the mid-turn text drop signature. |
-| `stop_reason` | string, omitted when empty | The response's stop reason. |
-| `error_body` | string, omitted when empty | For a failure patchbay originated, the Anthropic-shaped error body it sent. For a non-2xx from upstream, the upstream's own captured body. |
-| `request_body` | string, omitted when empty | The exact bytes forwarded upstream. Only for routes with `capture_bodies: true`. |
-| `response_body` | string, omitted when empty | The captured response, whatever the status. Only for routes with `capture_bodies: true` — and on a non-2xx the same bytes also appear, truncated, in `error_body`. |
+A selected record requires all routing fields:
 
-The summary fields — `input_tokens`, `output_tokens`, `block_shape`,
-`stop_reason` — are filled in only for a 2xx with a usable capture. On any other
-status the captured body is recorded as `error_body` instead and the summary
-fields stay at their zero values, because a body that is not a completed turn
-has no token accounting worth reporting.
+| Field | Meaning |
+|---|---|
+| `timestamp` | Request start time. Its UTC date selects the file. |
+| `host` | Gateway hostname. |
+| `context` | Context that resolved the request. |
+| `selection` | Why the Seat was selected. |
+| `seat` | Private global Seat ID. |
+| `subagent` | Optional positively validated direct agent observation. |
+| `upstream` | Effective Seat upstream. It does not prove the request reached it. |
+| `model` | Seat rewrite target, or the requested model when the Seat rewrites none; JSON `null` when both are exactly absent. Always present on a selected record. SigV4 stores the map key, never the mapped Bedrock identifier. |
+| `request_model` | Requested model before rewriting; JSON `null` when the request named none at all. Always present on a selected record. |
+| `auth_mode` | `forward`, `inject`, or `sigv4`. |
+| `credential_class` | Inbound credential shape: `oauth`, `api_key`, or `none`. |
+| `config_source` | Non-secret configured credential source. |
+| `status` | Status returned to the client. |
+| `input_tokens`, `output_tokens` | Counts parsed from a successful response, otherwise zero. |
+| `duration_ms` | Whole milliseconds from request arrival through response copy or gateway error. |
+| `upstream_ms` | Whole milliseconds until upstream response headers, or zero. |
+| `block_shape` | Ordered content-block types; `null` when no retained response was summarized. |
+| `drop_signature` | True when adjacent reasoning blocks appear in `block_shape`. |
+| `stop_reason` | Parsed stop reason, omitted when empty. |
+| `error_body` | Gateway error or non-2xx upstream response, omitted when empty. |
+| `request_body`, `response_body` | Bodies stored only when `capture_bodies` is enabled and capture succeeds. |
 
-### No auth material, by construction
+`model` and `request_model` hold opaque exact strings or JSON `null`. A model
+selector is matched byte for byte and never trimmed, folded or otherwise
+normalized, so one made of nothing but whitespace, or one an operator named
+`(none)`, is a selector like any other and is stored verbatim.
 
-The schema has no field for headers of any kind. Request and response headers
-carry `Authorization` and `x-api-key`, so there is nowhere in a record to put
-them — this is a missing field, not a rule someone has to remember.
+No string is reserved to mean absence. Absence is `null`, which is not a string,
+so it collides with no selector:
 
-`credential_class` is the one attribution field that touches credentials, and it
-is a closed vocabulary of three constants written by a classifier that reads
-only whether a header is present and whether it starts with `bearer`. No header
-value can become one of those three, so no value can leak through it. Validation
-refuses any other value outright.
+```json
+{"model": null, "request_model": null}
+{"model": "(none)", "request_model": "(none)"}
+```
 
-Error bodies that patchbay writes never echo a presented or expected key: the
-caller-key refusal above says "missing or mismatched" and nothing more, and an
-AWS credential-export failure names only the profile.
+The first is a request that named no model on a Seat that rewrites none. The
+second is a Seat bound to a selector spelled `(none)`. They are different records
+and different lines.
+
+On a selected record both keys are required and always emitted, so a line
+missing either one is corruption rather than a model nobody named. A
+pre-selection record carries no `model` key at all, and spells an absent
+`request_model` by omitting it — an explicit `null` there is corruption too, so
+each state has exactly one spelling and every record round-trips as itself.
+
+`config_source` is exactly one of these non-secret descriptor forms:
+
+```text
+caller
+<API-key environment-variable name>
+aws_profile:<name>
+```
+
+It never contains a credential or resolved file path.
+
+## Selection
+
+`selection.kind` is closed to:
+
+| Kind | `selection.model` |
+|---|---|
+| `model` | Exact matched public selector. |
+| `subagent` | Exact matched requested model from `context.subagents.models`, or JSON `null` when marked traffic fell to `context.subagents.default_seat` naming no model. |
+| `default` | JSON `null`, for the ordinary Context default. |
+
+`selection.model` is the only thing separating an exact marked hit from the
+unnamed marked fallback, so validation requires a non-empty model for `model`,
+allows either a non-empty model or `null` for `subagent`, and requires `null`
+for `default`.
+
+A marked-subagent exact record may include:
+
+```json
+{
+  "selection": {
+    "kind": "subagent",
+    "model": "claude-opus-5"
+  },
+  "subagent": {
+    "agent_id": "agent-aefe5b1a70030c259",
+    "parent_agent_id": "agent-parent-id"
+  }
+}
+```
+
+Only positively validated values enter the ledger. Agent ID is required for the
+nested object; parent ID is optional. Each must be 1–256 bytes and contain only
+printable ASCII bytes `0x21`–`0x7e`. Parent-only or invalid observations are
+omitted.
+
+These IDs are correlation observations. They are not authenticated identity,
+authorization, permission, or a boundary signal.
+
+## Pre-selection failures
+
+A request refused before Seat selection writes a reduced record:
+
+```json
+{
+  "timestamp": "2026-08-20T18:01:00-07:00",
+  "host": "workstation",
+  "context": "missing",
+  "credential_class": "oauth",
+  "status": 404,
+  "input_tokens": 0,
+  "output_tokens": 0,
+  "duration_ms": 0,
+  "upstream_ms": 0,
+  "block_shape": null,
+  "drop_signature": false,
+  "error_body": "{...}"
+}
+```
+
+Pre-selection records:
+
+- retain the requested Context when it is a bounded printable name — 1–256
+  bytes of ASCII `0x21`–`0x7e`. A requested Context is a caller-supplied path
+  segment of any length carrying any bytes, so one the field cannot represent is
+  omitted while the request itself is still recorded;
+- retain request model only when it was successfully parsed before refusal, as
+  an exact string; omit the key otherwise;
+- retain validated subagent observation;
+- retain inbound `credential_class`;
+- omit `selection`, `seat`, `upstream`, `model`, `auth_mode`, and
+  `config_source`.
+
+A body-read failure has no parsed request model. Registry-invalid and
+unknown-Context failures occur before body parsing. A protected rewrite-target
+refusal retains the parsed `request_model` but still has no selected Seat.
+
+After Seat selection, failures retain the full selected routing fields. This
+includes rewrite/body transformation errors, caller-key refusal, provider-key or
+model-map failure, AWS credential export failure, upstream connection failure,
+and non-2xx upstream responses.
+
+## Credential handling
+
+The schema has no request-header or response-header fields. Authorization,
+API-key, caller-key, SigV4, and AWS session-token headers therefore have no place
+in a record.
+
+`credential_class` records only inbound header shape:
+
+1. Bearer `Authorization` — `oauth`;
+2. otherwise a non-empty `X-Api-Key` — `api_key`;
+3. otherwise — `none`.
+
+Captured bodies may contain sensitive application data. Enable `capture_bodies`
+only when the ledger's storage and retention are suitable.
+
+For SigV4, `request_body` is captured after common Seat rewrites but before
+Bedrock removes `model` and `stream` and adds `anthropic_version`. Bedrock response
+streams are captured after translation to Anthropic SSE.
+
+On a non-2xx upstream response, retained bytes become `error_body`. With body
+capture enabled, the same bytes also remain in `response_body`.
 
 ## Validation
 
-`Validate` runs before anything is written, and again on every line that is read
-back, so a malformed record never reaches a file and one that somehow did is
-reported as corruption rather than returned as if it were sound. A record must
-have:
+Every appended or scanned v2 record is validated. Selected records require a
+valid Context, selection, Seat, upstream, auth mode, credential class, and
+configured source, and both model keys. A model is either absent or an exact
+non-empty string; an empty string is refused in either field, on either record
+shape, because absence already has a spelling. Pre-selection records must omit
+every selection-dependent field, `model` included. Timestamp and host are
+required; status, token counts, and durations must be non-negative.
 
-- non-blank `host`, `upstream`, `model` and `request_model`;
-- `auth_mode` in {`forward`, `inject`, `sigv4`};
-- `credential_class` in {`oauth`, `api_key`, `none`} — or empty, see below;
-- `context` empty, or lowercase letters, digits and dashes only;
-- a non-zero `timestamp`;
-- non-negative `status`, token counts and durations.
+`Ledger.Scan` rejects three things about the raw shape of a v2 line: unknown
+fields, at every depth; trailing data after the record; and duplicate JSON member
+names, recursively, in every object at every depth, including objects carried in
+arrays. A repeated name is refused rather than resolved last-wins, because a
+decoder keeps only the second value and leaves nothing of the first.
 
-`(none)` is the stand-in the pipeline writes for a model the request never gave,
-precisely so a request that named nothing is recorded as exactly that rather
-than dropped by the non-blank rule.
+## Capture limits
 
-### Legacy records
+`error_body` is truncated to 4096 bytes on a UTF-8 boundary.
 
-`context` and `credential_class` are accepted when **absent** on read. Records
-written before contexts existed carry neither field, and a ledger that refused
-to read its own history would be a worse failure than a missing field. The
-leniency is read-side only: the pipeline always populates both, so nothing new
-is written that shape. A `context` that *is* present is held to the shape a
-context name has, so a value that could only have come from somewhere other than
-a resolved context is refused rather than stored.
+The response summary capture is limited to 64 MiB. If a response exceeds that
+limit, the complete capture is discarded rather than stored as a prefix. The
+client still receives the response, and the record is attempted without summary
+or response body. Request bodies have their own 64 MiB proxy limit.
 
-## Truncation and capture
+A client-write failure, upstream read error, or Bedrock stream decoding error also
+discards response capture. A clean EOF is not checked for an Anthropic
+`message_stop` event; a clean prefix may still be summarized.
 
-Three different things can shorten what a record holds, and they are
-deliberately distinguishable:
-
-- **`error_body` truncation.** Capped at 4096 bytes at append time, cut back to
-  a UTF-8 rune boundary so a stored line never contains a split rune. A runaway
-  upstream must not be able to make one ledger line unbounded.
-- **Capture dropped at the ceiling.** The response tee holds at most 64 MiB. Past
-  that the whole capture is dropped rather than kept as a prefix, and a warning
-  is logged. The record is still written — with no `block_shape`, no token
-  counts and no stop reason — because half a stream reported as if it were whole
-  is worse than no summary.
-- **Stream truncated mid-flight.** If the client goes away mid-stream, or the
-  upstream's body ends with a non-EOF error before its own `message_stop`, the
-  capture is marked truncated and yields nothing, for the same reason. A warning
-  is logged.
-
-Summarization itself never fails: an unparsable, empty or partial body yields an
-empty summary, and the record is written either way. Token counts, block shapes
-and stop reasons are read from both response shapes — a complete JSON message,
-or an SSE stream walked event by event (`message_start` for input tokens,
-`content_block_start` for the shape, `message_delta` for output tokens and the
-stop reason). For a Bedrock route it is the translated SSE that is summarized,
-because that is what the caller actually received.
+Only retained 2xx responses are summarized. JSON responses provide block types,
+usage, and stop reason. SSE responses provide those values from `message_start`,
+`content_block_start`, and `message_delta` events.
 
 ## Reading records
 
-They are JSONL: `jq` works, and so does anything else that reads a line at a
-time.
+Patchbay has no ledger tail, pruning, or retention command. Use ordinary JSONL
+tools:
 
 ```console
-$ jq -r 'select(.status != 200) | [.timestamp, .context, .alias, .status] | @tsv' \
-    ~/.local/state/patchbay/ledger/patchbay-2026-08-19.jsonl
+$ jq -r 'select(.status != 200) | [.timestamp, .context, .seat, .status] | @tsv' \
+    ~/.local/state/patchbay/ledger/patchbay-v2-2026-08-20.jsonl
 
-$ jq -s 'group_by(.context) | map({context: .[0].context, requests: length,
-      input: (map(.input_tokens) | add), output: (map(.output_tokens) | add)})' \
-    ~/.local/state/patchbay/ledger/*.jsonl
+$ jq -s 'group_by(.seat) | map({seat: .[0].seat, requests: length})' \
+    ~/.local/state/patchbay/ledger/patchbay-v2-*.jsonl
 
 $ jq -r 'select(.drop_signature) | [.timestamp, .model, (.block_shape | join(","))] | @tsv' \
-    ~/.local/state/patchbay/ledger/*.jsonl
+    ~/.local/state/patchbay/ledger/patchbay-v2-*.jsonl
 ```
 
-patchbay's own reader (`ledger.Scan`, used by the tests) stops at the first line
-that will not parse or will not validate, returning the records before it
-alongside a `CorruptionError` naming the byte offset — damage is surfaced, never
-silently skipped. A final line missing its newline counts as corruption, since a
-half-written record is not a record.
+The Go API is `(*ledger.Ledger).Scan(day)`. A missing day returns an empty slice.
+Scanning stops at the first invalid line and returns the valid prefix with a
+`*ledger.CorruptionError` naming the byte offset. A final line without a newline
+is corruption.

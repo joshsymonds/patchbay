@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/joshsymonds/patchbay/internal/accounting"
+	"github.com/joshsymonds/patchbay/internal/anthropic"
 	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
@@ -32,16 +33,19 @@ func (ctx *observedDoneContext) Done() <-chan struct{} {
 }
 
 type storedRequest struct {
-	id                         int64
-	startedAt                  int64
-	completedAt                sql.NullInt64
-	upstreamDispatchedAt       sql.NullInt64
-	requestKind                string
-	lifecycleState             string
-	outcome                    sql.NullString
-	upstreamContacted          int
-	routeHost                  string
-	routeContext               string
+	id                   int64
+	startedAt            int64
+	completedAt          sql.NullInt64
+	upstreamDispatchedAt sql.NullInt64
+	requestKind          string
+	lifecycleState       string
+	outcome              sql.NullString
+	upstreamContacted    int
+	routeHost            string
+	routeContext         string
+	// routeAlias mirrors the route_alias column, which keeps its name so
+	// already-imported v1 history stays readable and now carries the Seat ID for
+	// every row this build writes.
 	routeAlias                 sql.NullString
 	routeUpstream              string
 	requestModel               string
@@ -136,7 +140,11 @@ func TestInsertPendingRejectsInvalidRequestsWithoutWriting(t *testing.T) {
 		{
 			name: "expired context deadline",
 			requestCtx: func() context.Context {
-				ctx, _ := context.WithDeadline(context.Background(), time.Unix(1, 0))
+				// The deadline is already past, so the context is born
+				// DeadlineExceeded and cancel cannot overwrite that error. Calling
+				// it anyway releases the timer instead of leaking it.
+				ctx, cancel := context.WithDeadline(context.Background(), time.Unix(1, 0))
+				cancel()
 				return ctx
 			},
 			wantContains: "context",
@@ -213,109 +221,105 @@ func TestInsertPendingRejectsInvalidRequestsWithoutWriting(t *testing.T) {
 			wantContains: "context",
 		},
 		{
-			name:         "empty request model",
+			name:         "empty seat",
 			requestCtx:   background,
-			mutate:       func(request *PendingRequest) { request.RequestModel = "" },
-			wantContains: "request model is blank",
+			mutate:       func(request *PendingRequest) { request.SeatID = "" },
+			wantContains: "seat is blank",
 		},
 		{
-			name:         "whitespace request model",
+			name:         "whitespace seat",
 			requestCtx:   background,
-			mutate:       func(request *PendingRequest) { request.RequestModel = " \t" },
-			wantContains: "request model is blank",
+			mutate:       func(request *PendingRequest) { request.SeatID = " \t" },
+			wantContains: "seat is blank",
 		},
 		{
-			name:       "empty route upstream",
-			requestCtx: background,
-			mutate: func(request *PendingRequest) {
-				request.Route.BaseURL = ""
-			},
-			wantContains: "route upstream is blank",
+			name:         "uppercase seat",
+			requestCtx:   background,
+			mutate:       func(request *PendingRequest) { request.SeatID = "Anthropic" },
+			wantContains: "seat",
 		},
 		{
-			name:       "whitespace route upstream",
-			requestCtx: background,
-			mutate: func(request *PendingRequest) {
-				request.Route.BaseURL = " \t"
-			},
-			wantContains: "route upstream is blank",
+			name:         "path seat",
+			requestCtx:   background,
+			mutate:       func(request *PendingRequest) { request.SeatID = "anthropic/forward" },
+			wantContains: "seat",
 		},
 		{
-			name:       "whitespace resolved model",
+			name:       "empty seat upstream",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route.Model = " \t"
+				request.Seat.Upstream = ""
 			},
-			wantContains: "resolved model is blank",
+			wantContains: "seat upstream is blank",
 		},
 		{
-			name:       "whitespace route alias",
+			name:       "whitespace seat upstream",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route.Alias = " \t"
+				request.Seat.Upstream = " \t"
 			},
-			wantContains: "route alias is blank",
+			wantContains: "seat upstream is blank",
 		},
 		{
 			name:       "invalid auth mode",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route.Auth = registry.AuthMode("invalid")
+				request.Seat.AuthMode = registry.AuthMode("invalid")
 			},
 			wantContains: "billing policy",
 		},
 		{
-			name:       "explicit route missing class declaration",
+			name:       "explicit seat missing class declaration",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route.Auth = registry.AuthInject
-				request.Route.BillingClass = billing.ClassSubscription
-				request.Route.BillingClassSet = false
+				request.Seat.AuthMode = registry.AuthInject
+				request.Seat.BillingClass = billing.ClassSubscription
+				request.Seat.BillingClassSet = false
 			},
 			wantContains: "BillingClassSet=true",
 		},
 		{
-			name:       "explicit route empty class",
+			name:       "explicit seat empty class",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route.Auth = registry.AuthInject
-				request.Route.BillingClass = ""
-				request.Route.BillingClassSet = true
+				request.Seat.AuthMode = registry.AuthInject
+				request.Seat.BillingClass = ""
+				request.Seat.BillingClassSet = true
 			},
 			wantContains: "valid billing class",
 		},
 		{
-			name:       "explicit route invalid class",
+			name:       "explicit seat invalid class",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route.Auth = registry.AuthInject
-				request.Route.BillingClass = "invalid"
-				request.Route.BillingClassSet = true
+				request.Seat.AuthMode = registry.AuthInject
+				request.Seat.BillingClass = "invalid"
+				request.Seat.BillingClassSet = true
 			},
 			wantContains: "valid billing class",
 		},
 		{
-			name:       "forward route class-set marker",
+			name:       "forward seat class-set marker",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route.BillingClassSet = true
+				request.Seat.BillingClassSet = true
 			},
 			wantContains: "BillingClassSet=false",
 		},
 		{
-			name:       "forward route explicit class",
+			name:       "forward seat explicit class",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route.BillingClass = billing.ClassMetered
+				request.Seat.BillingClass = billing.ClassMetered
 			},
 			wantContains: "cannot declare billing class",
 		},
 		{
-			name:       "sigv4 route class-set marker",
+			name:       "sigv4 seat class-set marker",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route = registry.Route{
-					Auth:            registry.AuthSigV4,
+				request.Seat = registry.Seat{
+					AuthMode:        registry.AuthSigV4,
 					AWSRegion:       "us-west-2",
 					BillingClassSet: true,
 				}
@@ -323,11 +327,11 @@ func TestInsertPendingRejectsInvalidRequestsWithoutWriting(t *testing.T) {
 			wantContains: "BillingClassSet=false",
 		},
 		{
-			name:       "sigv4 route explicit class",
+			name:       "sigv4 seat explicit class",
 			requestCtx: background,
 			mutate: func(request *PendingRequest) {
-				request.Route = registry.Route{
-					Auth:         registry.AuthSigV4,
+				request.Seat = registry.Seat{
+					AuthMode:     registry.AuthSigV4,
 					AWSRegion:    "us-west-2",
 					BillingClass: billing.ClassMetered,
 				}
@@ -345,12 +349,6 @@ func TestInsertPendingRejectsInvalidRequestsWithoutWriting(t *testing.T) {
 			requestCtx:   background,
 			mutate:       func(request *PendingRequest) { request.CredentialClass = "bearer" },
 			wantContains: "credential class",
-		},
-		{
-			name:         "forward route without credential",
-			requestCtx:   background,
-			mutate:       func(request *PendingRequest) { request.CredentialClass = billing.CredentialNone },
-			wantContains: "realize pending request billing class",
 		},
 	}
 
@@ -379,6 +377,28 @@ func TestInsertPendingRejectsInvalidRequestsWithoutWriting(t *testing.T) {
 				t.Fatalf("stored request count = %d; want 0", got)
 			}
 		})
+	}
+}
+
+func TestInsertPendingRecordsUnattributableForwardRefusal(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+	request := validPendingRequest()
+	request.CredentialClass = billing.CredentialNone
+	id, err := store.InsertPending(context.Background(), request)
+	if err != nil {
+		t.Fatalf("InsertPending() error: %v", err)
+	}
+	stored := readStoredRequest(t, store.db, id)
+	if stored.credentialClass != billing.CredentialNone.String() ||
+		stored.billingPolicy != billing.PolicyCallerDerived.String() || stored.billingClass.Valid {
+		t.Fatalf(
+			"stored credential/policy/class = %q, %q, %#v; want none, credential_derived, NULL",
+			stored.credentialClass,
+			stored.billingPolicy,
+			stored.billingClass,
+		)
 	}
 }
 
@@ -616,7 +636,8 @@ func TestInsertPendingPersistsForwardOAuthSnapshot(t *testing.T) {
 		Kind:            RequestMessages,
 		Host:            "gnomon",
 		Context:         "personal",
-		Route:           registry.DefaultRoute(),
+		SeatID:          defaultSeatID,
+		Seat:            defaultSeat(),
 		RequestModel:    "claude-opus-5",
 		CredentialClass: billing.CredentialOAuth,
 	})
@@ -636,7 +657,8 @@ func TestInsertPendingPersistsForwardOAuthSnapshot(t *testing.T) {
 		upstreamContacted: 0,
 		routeHost:         "gnomon",
 		routeContext:      "personal",
-		routeUpstream:     registry.DefaultRoute().Upstream(),
+		routeAlias:        sql.NullString{String: defaultSeatID, Valid: true},
+		routeUpstream:     defaultSeat().EffectiveUpstream(),
 		requestModel:      "claude-opus-5",
 		resolvedModel:     "claude-opus-5",
 		authMode:          string(registry.AuthForward),
@@ -650,35 +672,36 @@ func TestInsertPendingPersistsForwardOAuthSnapshot(t *testing.T) {
 	}
 }
 
-func TestInsertPendingPersistsResolvedRouteBillingMatrix(t *testing.T) {
+func TestInsertPendingPersistsResolvedSeatBillingMatrix(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name            string
-		route           registry.Route
+		seatID          string
+		seat            registry.Seat
 		credentialClass billing.CredentialClass
 		wantPolicy      billing.Policy
 		wantClass       billing.Class
 	}{
 		{
-			name: "forward API key is metered",
-			route: registry.Route{
-				Alias:   "forward-metered",
-				BaseURL: "opaque-forward-upstream",
-				Model:   "opaque/forward-model",
-				Auth:    registry.AuthForward,
+			name:   "forward API key is metered",
+			seatID: "forward-metered",
+			seat: registry.Seat{
+				Upstream: "opaque-forward-upstream",
+				Model:    "opaque/forward-model",
+				AuthMode: registry.AuthForward,
 			},
 			credentialClass: billing.CredentialAPIKey,
 			wantPolicy:      billing.PolicyCallerDerived,
 			wantClass:       billing.ClassMetered,
 		},
 		{
-			name: "explicit subscription",
-			route: registry.Route{
-				Alias:           "inject-subscription",
-				BaseURL:         "opaque-subscription-upstream",
+			name:   "explicit subscription",
+			seatID: "inject-subscription",
+			seat: registry.Seat{
+				Upstream:        "opaque-subscription-upstream",
 				Model:           "opaque/subscription-model",
-				Auth:            registry.AuthInject,
+				AuthMode:        registry.AuthInject,
 				BillingClass:    billing.ClassSubscription,
 				BillingClassSet: true,
 			},
@@ -687,12 +710,12 @@ func TestInsertPendingPersistsResolvedRouteBillingMatrix(t *testing.T) {
 			wantClass:       billing.ClassSubscription,
 		},
 		{
-			name: "explicit metered",
-			route: registry.Route{
-				Alias:           "inject-metered",
-				BaseURL:         "opaque-metered-upstream",
+			name:   "explicit metered",
+			seatID: "inject-metered",
+			seat: registry.Seat{
+				Upstream:        "opaque-metered-upstream",
 				Model:           "opaque/metered-model",
-				Auth:            registry.AuthInject,
+				AuthMode:        registry.AuthInject,
 				BillingClass:    billing.ClassMetered,
 				BillingClassSet: true,
 			},
@@ -701,12 +724,12 @@ func TestInsertPendingPersistsResolvedRouteBillingMatrix(t *testing.T) {
 			wantClass:       billing.ClassMetered,
 		},
 		{
-			name: "explicit self hosted",
-			route: registry.Route{
-				Alias:           "inject-self-hosted",
-				BaseURL:         "opaque-self-hosted-upstream",
+			name:   "explicit self hosted",
+			seatID: "inject-self-hosted",
+			seat: registry.Seat{
+				Upstream:        "opaque-self-hosted-upstream",
 				Model:           "opaque/self-hosted-model",
-				Auth:            registry.AuthInject,
+				AuthMode:        registry.AuthInject,
 				BillingClass:    billing.ClassSelfHosted,
 				BillingClassSet: true,
 			},
@@ -715,11 +738,11 @@ func TestInsertPendingPersistsResolvedRouteBillingMatrix(t *testing.T) {
 			wantClass:       billing.ClassSelfHosted,
 		},
 		{
-			name: "sigv4 is metered",
-			route: registry.Route{
-				Alias:     "bedrock",
+			name:   "sigv4 is metered",
+			seatID: "bedrock",
+			seat: registry.Seat{
 				Model:     "anthropic.claude-opus-5-v1:0",
-				Auth:      registry.AuthSigV4,
+				AuthMode:  registry.AuthSigV4,
 				AWSRegion: "us-west-2",
 			},
 			credentialClass: billing.CredentialNone,
@@ -740,7 +763,8 @@ func TestInsertPendingPersistsResolvedRouteBillingMatrix(t *testing.T) {
 				Kind:            RequestCountTokens,
 				Host:            "vermissian",
 				Context:         "work-2",
-				Route:           test.route,
+				SeatID:          test.seatID,
+				Seat:            test.seat,
 				RequestModel:    "caller/model-name",
 				CredentialClass: test.credentialClass,
 			}
@@ -759,11 +783,11 @@ func TestInsertPendingPersistsResolvedRouteBillingMatrix(t *testing.T) {
 				upstreamContacted: 0,
 				routeHost:         request.Host,
 				routeContext:      request.Context,
-				routeAlias:        sql.NullString{String: test.route.Alias, Valid: true},
-				routeUpstream:     test.route.Upstream(),
+				routeAlias:        sql.NullString{String: test.seatID, Valid: true},
+				routeUpstream:     test.seat.EffectiveUpstream(),
 				requestModel:      request.RequestModel,
-				resolvedModel:     test.route.Model,
-				authMode:          string(test.route.Auth),
+				resolvedModel:     test.seat.Model,
+				authMode:          string(test.seat.AuthMode),
 				credentialClass:   test.credentialClass.String(),
 				billingPolicy:     test.wantPolicy.String(),
 				billingClass:      sql.NullString{String: test.wantClass.String(), Valid: true},
@@ -771,6 +795,80 @@ func TestInsertPendingPersistsResolvedRouteBillingMatrix(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("stored request mismatch:\n got %#v\nwant %#v", got, want)
+			}
+		})
+	}
+}
+
+// TestInsertPendingPersistsModelsExactly pins that neither model is judged.
+//
+// A model is an opaque exact string: the Seat binds the bytes an operator wrote
+// and a request asks with the bytes a client sent. Absence is not a string at
+// all — a default Seat binds no rewrite, and a request may name no model — so a
+// row whose two model columns are empty is describing a request that happened
+// and named nothing. Inventing a model for it, or refusing the row, would each
+// make the accounting say something the request did not.
+func TestInsertPendingPersistsModelsExactly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		seatModel    string
+		requestModel string
+		wantResolved string
+	}{
+		{
+			name:         "default seat and a request that named no model",
+			seatModel:    "",
+			requestModel: "",
+			wantResolved: "",
+		},
+		{
+			name:         "seat rewrite stands in for a request that named no model",
+			seatModel:    "opaque/rewrite-target",
+			requestModel: "",
+			wantResolved: "opaque/rewrite-target",
+		},
+		{
+			name:         "whitespace is a model a seat can bind",
+			seatModel:    " \t",
+			requestModel: "claude-opus-5",
+			wantResolved: " \t",
+		},
+		{
+			name:         "whitespace is a model a request can ask for",
+			seatModel:    "",
+			requestModel: " \t",
+			wantResolved: " \t",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+			request := validPendingRequest()
+			request.Seat.Model = test.seatModel
+			request.RequestModel = test.requestModel
+
+			id, err := store.InsertPending(context.Background(), request)
+			if err != nil {
+				t.Fatalf("InsertPending() returned error: %v", err)
+			}
+
+			got := readStoredRequest(t, store.db, id)
+			if got.requestModel != test.requestModel || got.resolvedModel != test.wantResolved {
+				t.Fatalf(
+					"stored models = request_model %q, resolved_model %q; want %q, %q",
+					got.requestModel,
+					got.resolvedModel,
+					test.requestModel,
+					test.wantResolved,
+				)
+			}
+			if got.routeAlias != (sql.NullString{String: defaultSeatID, Valid: true}) {
+				t.Fatalf("stored route_alias = %#v; want the seat ID", got.routeAlias)
 			}
 		})
 	}
@@ -2340,9 +2438,24 @@ func validPendingRequest() PendingRequest {
 		Kind:            RequestMessages,
 		Host:            "gnomon",
 		Context:         "personal",
-		Route:           registry.DefaultRoute(),
+		SeatID:          defaultSeatID,
+		Seat:            defaultSeat(),
 		RequestModel:    "claude-opus-5",
 		CredentialClass: billing.CredentialOAuth,
+	}
+}
+
+// defaultSeatID is the registry ID of the Seat a plain request rides.
+const defaultSeatID = "anthropic-forward"
+
+// defaultSeat is that Seat: a forward to Anthropic on the caller's own
+// credentials, binding no model rewrite. Seat routing has no built-in Route
+// standing behind a bare request any more — every request names the Seat it
+// rides — so the accounting tests state their own.
+func defaultSeat() registry.Seat {
+	return registry.Seat{
+		Upstream: anthropic.BaseURL,
+		AuthMode: registry.AuthForward,
 	}
 }
 

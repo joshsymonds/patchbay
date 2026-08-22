@@ -12,7 +12,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,32 +21,8 @@ import (
 )
 
 const (
-	jsonType = "application/json"
-
-	// epochCreatedAt is the created_at every alias entry carries: the epoch
-	// sentinel Anthropic's own contract sanctions for a model whose release date
-	// is unknown.
-	epochCreatedAt = "1970-01-01T00:00:00Z"
-
-	// anthropicHost is the only destination the model endpoints may address.
-	// The base URL is a constant of the package and the caller's path is set on
-	// the parsed URL afterwards, so nothing a caller sends can move it.
-	anthropicHost = "api.anthropic.com"
-
-	// callBuffer sizes the recorded-call channel: wide enough that a stub
-	// upstream never blocks on a test that forgets to drain it.
+	jsonType   = "application/json"
 	callBuffer = 8
-
-	// lunaRoute is a fully populated alias: both token ceilings are set, so its
-	// listing entry advertises them.
-	lunaRoute = `"luna-fast":{"base_url":"https://openrouter.ai/api",` +
-		`"model":"openai/gpt-5.6-luna","auth":"inject",` +
-		`"api_key_env_file":"OPENROUTER_API_KEY_FILE",` +
-		`"max_input_tokens":262144,"max_output_tokens":65536}`
-
-	// barePinRoute sets no ceiling at all, so its entry carries neither.
-	barePinRoute = `"anthropic/pinned":{"base_url":"https://api.anthropic.com",` +
-		`"model":"claude-opus-5","auth":"forward"}`
 )
 
 // upstreamCall is one request as the stub upstream received it. host is the
@@ -76,37 +51,44 @@ func newUpstream(t *testing.T, handle http.HandlerFunc) *upstream {
 	t.Helper()
 
 	stub := &upstream{calls: make(chan upstreamCall, callBuffer)}
-	stub.server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		stub.calls <- upstreamCall{
-			method:   r.Method,
-			path:     r.URL.Path,
-			escaped:  r.URL.EscapedPath(),
-			rawQuery: r.URL.RawQuery,
-			host:     r.Host,
-			header:   r.Header.Clone(),
-		}
-		handle(w, r)
-	}))
+	stub.server = httptest.NewTLSServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			stub.calls <- upstreamCall{
+				method:   r.Method,
+				path:     r.URL.Path,
+				escaped:  r.URL.EscapedPath(),
+				rawQuery: r.URL.RawQuery,
+				host:     r.Host,
+				header:   r.Header.Clone(),
+			}
+			handle(w, r)
+		}),
+	)
 	t.Cleanup(stub.server.Close)
 
 	return stub
 }
 
-// call returns the single request the upstream received, failing if it saw a
-// different number of them.
+// call returns the single request the stub upstream received. A fetch that never
+// happened is the failure this is for: the gateway answers some listings from
+// its own knowledge alone, so a skipped upstream call still produces a response
+// a test can read, and receiving from the channel bare would wait forever for a
+// request nobody was going to make.
 func (u *upstream) call(t *testing.T) upstreamCall {
 	t.Helper()
 
-	if len(u.calls) != 1 {
-		t.Fatalf("upstream received %d requests, want 1", len(u.calls))
+	select {
+	case got := <-u.calls:
+		if extra := len(u.calls); extra != 0 {
+			t.Fatalf("stub upstream received %d requests, want 1", extra+1)
+		}
+
+		return got
+	case <-time.After(requestDeadline):
+		t.Fatal("no request reached the stub upstream")
+
+		return upstreamCall{}
 	}
-
-	return <-u.calls
-}
-
-// hits reports how many requests the upstream received.
-func (u *upstream) hits() int {
-	return len(u.calls)
 }
 
 // anthropicClient returns a client whose every connection lands on the stub, so
@@ -129,45 +111,34 @@ func anthropicClient(t *testing.T, stub *upstream) *http.Client {
 	return &http.Client{Transport: transport}
 }
 
-// deadClient returns a client whose every connection fails immediately, standing
-// in for an unreachable Anthropic without waiting on a timeout.
-func deadClient(t *testing.T) *http.Client {
+func newRegistryDocument(t *testing.T, body string) *registry.Registry {
 	t.Helper()
-
-	return &http.Client{Transport: &http.Transport{
-		DialContext: func(context.Context, string, string) (net.Conn, error) {
-			return nil, errors.New("upstream is unreachable in this test")
-		},
-	}}
-}
-
-// newRegistry writes a registry file holding the given route entries in the
-// personal context and returns a Registry reading it.
-func newRegistry(t *testing.T, routes string) *registry.Registry {
-	t.Helper()
-
-	return newContextRegistry(t, `"personal":{"routes":{`+routes+`}}`)
-}
-
-// newContextRegistry writes a registry file holding whole context entries and
-// returns a Registry reading it.
-func newContextRegistry(t *testing.T, contexts string) *registry.Registry {
-	t.Helper()
-
-	return newRawRegistry(t, `{"contexts":{`+contexts+`}}`)
-}
-
-// newRawRegistry writes body verbatim as the registry file, for the documents a
-// test needs to be broken.
-func newRawRegistry(t *testing.T, body string) *registry.Registry {
-	t.Helper()
-
 	path := filepath.Join(t.TempDir(), "registry.json")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatalf("write registry: %v", err)
+		t.Fatal(err)
+	}
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatalf("New() = %v\n%s", err, body)
+	}
+	return reg
+}
+
+// replaceRegistryFile rewrites path with body and stamps it at when, which is
+// what a hot reload looks like from a running registry's side: new contents
+// under a stamp it has not seen yet. The stamp is set explicitly rather than
+// left to the clock, so a replacement is noticed whatever resolution the
+// filesystem keeps modification times at.
+func replaceRegistryFile(t *testing.T, path, body string, when time.Time) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	return registry.New(path)
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // sentinel is a stand-in proxy handler that records every request routed to it
@@ -213,56 +184,6 @@ func (s *sentinel) call(t *testing.T) upstreamCall {
 	return <-s.calls
 }
 
-// logSink is a slog handler that hands every message to a channel, so a test
-// can wait for a warning instead of racing a shared buffer.
-type logSink struct {
-	messages chan string
-}
-
-// newLogSink returns a sink wide enough to hold a request's warnings.
-func newLogSink() *logSink {
-	return &logSink{messages: make(chan string, callBuffer)}
-}
-
-// Enabled accepts every level, so nothing the gateway logs is missed.
-func (*logSink) Enabled(context.Context, slog.Level) bool { return true }
-
-// Handle records the message, dropping it rather than blocking if full.
-func (s *logSink) Handle(_ context.Context, rec slog.Record) error {
-	select {
-	case s.messages <- rec.Message:
-	default:
-	}
-
-	return nil
-}
-
-// WithAttrs satisfies slog.Handler; the sink keeps only messages.
-func (s *logSink) WithAttrs([]slog.Attr) slog.Handler { return s }
-
-// WithGroup satisfies slog.Handler; the sink keeps only messages.
-func (s *logSink) WithGroup(string) slog.Handler { return s }
-
-// waitFor fails unless want is logged before the deadline.
-func (s *logSink) waitFor(t *testing.T, want string) {
-	t.Helper()
-
-	deadline := time.After(10 * time.Second)
-
-	for {
-		select {
-		case message := <-s.messages:
-			if message == want {
-				return
-			}
-		case <-deadline:
-			t.Fatalf("log message %q never arrived", want)
-
-			return
-		}
-	}
-}
-
 // serve runs one request through a handler built from cfg.
 func serve(t *testing.T, cfg server.Config, req *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
@@ -276,15 +197,6 @@ func serve(t *testing.T, cfg server.Config, req *http.Request) *httptest.Respons
 // modelsRequest builds an inbound GET carrying no credentials.
 func modelsRequest(target string) *http.Request {
 	return httptest.NewRequest(http.MethodGet, target, nil)
-}
-
-// keyedRequest builds an inbound GET presenting the caller key, which every
-// request naming a context in its path has to.
-func keyedRequest(target string) *http.Request {
-	req := httptest.NewRequest(http.MethodGet, target, nil)
-	req.Header.Set(proxy.CallerKeyHeader, callerKey)
-
-	return req
 }
 
 // modelMapFile writes a Bedrock model map and names it in the environment under
@@ -342,31 +254,6 @@ func ids(t *testing.T, list listResponse) []string {
 	return found
 }
 
-// entryFields decodes one listing entry into a generic map, so a test can
-// assert on exactly which keys it carries.
-func entryFields(t *testing.T, raw json.RawMessage) map[string]any {
-	t.Helper()
-
-	var fields map[string]any
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		t.Fatalf("decode model entry %q: %v", raw, err)
-	}
-
-	return fields
-}
-
-// upstreamList is a stub upstream listing carrying the given ids, each with a
-// created_at patchbay must relay untouched and never invent.
-func upstreamList(modelIDs ...string) string {
-	entries := make([]string, 0, len(modelIDs))
-	for _, id := range modelIDs {
-		entries = append(entries, `{"type":"model","id":"`+id+`","display_name":"`+id+
-			`","created_at":"2026-01-01T00:00:00Z"}`)
-	}
-
-	return `{"data":[` + strings.Join(entries, ",") + `],"has_more":false}`
-}
-
 // jsonHandler answers every request with status and body.
 func jsonHandler(status int, body string) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
@@ -375,3 +262,76 @@ func jsonHandler(status int, body string) http.HandlerFunc {
 		io.WriteString(w, body)
 	}
 }
+
+// anthropicHost is the only host any fetch this package makes may address. The
+// caller's own credentials ride those requests, so the destination is asserted
+// rather than assumed.
+const anthropicHost = "api.anthropic.com"
+
+// upstreamList is a one-entry Anthropic listing carrying a created_at the
+// gateway does not invent, so a relayed entry can be told from a synthesized one.
+func upstreamList(id string) string {
+	return `{"data":[{"type":"model","id":"` + id + `","display_name":"` + id +
+		`","created_at":"2026-01-01T00:00:00Z"}],"has_more":false,"first_id":"` + id +
+		`","last_id":"` + id + `"}`
+}
+
+// entryFields decodes one listing entry into a plain map, so a test can assert
+// the entry's fields exactly rather than a subset of them.
+func entryFields(t *testing.T, raw json.RawMessage) map[string]any {
+	t.Helper()
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("decode model entry %q: %v", raw, err)
+	}
+	return fields
+}
+
+// unreadableCallerKey points the caller-key variable at a directory: the file is
+// configured, and reading it fails, which is the server's own misconfiguration
+// rather than the caller's refusal.
+func unreadableCallerKey(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "caller-key-dir")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(proxy.CallerKeyEnvFile, path)
+}
+
+// keyedRequest builds an inbound GET presenting key in the caller-key header.
+func keyedRequest(target, key string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	if key != "" {
+		req.Header.Set(proxy.CallerKeyHeader, key)
+	}
+	return req
+}
+
+// errUnreachableUpstream is the failure deadClient's transport answers with. It
+// is named here rather than borrowed from the network so that "the upstream is
+// unreachable" is a fact of the test, not of whatever this machine happens to
+// have listening.
+var errUnreachableUpstream = errors.New("upstream unreachable")
+
+// deadClient returns a client whose every dial fails immediately, which is how
+// "the upstream is unreachable" is produced without a socket, a timeout, or an
+// assumption about the machine the suite runs on.
+func deadClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return nil, errUnreachableUpstream
+			},
+		},
+	}
+}
+
+// quietLogger discards the warnings a degraded listing produces, so a test's
+// output stays the test's own.
+func quietLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
+// operatorInvalidMessage is the stable line the gateway logs when the registry
+// it is serving from will not validate. An operator greps for it; a caller never
+// sees it.
+const operatorInvalidMessage = "registry invalid; requests fail closed"

@@ -193,7 +193,7 @@ func validateSummaryFilter(ctx context.Context, filter SummaryFilter) error {
 		return err
 	}
 	if filter.Context != "" {
-		if contextErr := registry.ValidContextName(filter.Context); contextErr != nil {
+		if contextErr := registry.ValidID(filter.Context); contextErr != nil {
 			return fmt.Errorf("summarize usage: context %q: %w", filter.Context, contextErr)
 		}
 	}

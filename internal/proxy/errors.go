@@ -21,8 +21,8 @@ type gatewayError struct {
 	err error
 }
 
-// forwardError maps a resolved forward route's credential shape to the local
-// refusal it requires. Inject and SigV4 routes never call it.
+// forwardError maps a resolved forward Seat's credential shape to the local
+// refusal it requires. Inject and SigV4 Seats never call it.
 func (c credentialShape) forwardError() *gatewayError {
 	switch c {
 	case credentialOAuth, credentialAPIKey:
@@ -31,31 +31,31 @@ func (c credentialShape) forwardError() *gatewayError {
 		return &gatewayError{
 			status:  http.StatusBadRequest,
 			errType: anthropic.ErrorTypeInvalidRequest,
-			err:     errors.New("forward route received both OAuth and API key credentials"),
+			err:     errors.New("forward Seat received both OAuth and API key credentials"),
 		}
 	case credentialUnrecognizedAuthorization:
 		return &gatewayError{
 			status:  http.StatusUnauthorized,
 			errType: anthropic.ErrorTypeAuthentication,
-			err:     errors.New("forward route received an unrecognized Authorization scheme"),
+			err:     errors.New("forward Seat received an unrecognized Authorization scheme"),
 		}
 	case credentialRepeatedOAuthAuthorization, credentialRepeatedAuthorization:
 		return &gatewayError{
 			status:  http.StatusUnauthorized,
 			errType: anthropic.ErrorTypeAuthentication,
-			err:     errors.New("forward route received repeated Authorization values"),
+			err:     errors.New("forward Seat received repeated Authorization values"),
 		}
 	case credentialRepeatedAPIKey:
 		return &gatewayError{
 			status:  http.StatusUnauthorized,
 			errType: anthropic.ErrorTypeAuthentication,
-			err:     errors.New("forward route received repeated API key values"),
+			err:     errors.New("forward Seat received repeated API key values"),
 		}
 	default:
 		return &gatewayError{
 			status:  http.StatusUnauthorized,
 			errType: anthropic.ErrorTypeAuthentication,
-			err:     errors.New("forward route requires an OAuth bearer or API key credential"),
+			err:     errors.New("forward Seat requires an OAuth bearer or API key credential for usage accounting"),
 		}
 	}
 }

@@ -1,5 +1,5 @@
 // Package billing defines the shared vocabulary for how Patchbay classifies
-// upstream charges and how a route determines that classification.
+// upstream charges and how a Seat determines that classification.
 package billing
 
 import "fmt"
@@ -87,15 +87,15 @@ func (credential CredentialClass) String() string {
 	return string(credential)
 }
 
-// Policy says how a route determines the billing class of a request.
+// Policy says how a Seat determines the billing class of a request.
 type Policy string
 
 const (
-	// PolicyExplicit means the route declares its billing class directly.
+	// PolicyExplicit means the Seat declares its billing class directly.
 	PolicyExplicit Policy = "explicit"
 
 	// PolicyCallerDerived means the caller's forwarded credential determines
-	// the realized billing class outside the route registry.
+	// the realized billing class outside the Seat registry.
 	PolicyCallerDerived Policy = "credential_derived"
 
 	// PolicySigV4Metered means AWS SigV4 requests are metered by the signed AWS
@@ -130,7 +130,7 @@ func (policy Policy) String() string {
 	return string(policy)
 }
 
-// RealizeClass maps a route's billing policy and a validated caller credential
+// RealizeClass maps a Seat's billing policy and a validated caller credential
 // class to the billing class attributed to the request.
 func RealizeClass(policy Policy, explicit Class, credential CredentialClass) (Class, error) {
 	if !policy.Valid() {

@@ -10,21 +10,30 @@ import (
 	usagepkg "github.com/joshsymonds/patchbay/internal/usage"
 )
 
-// Accountant durably tracks each routed request before it reaches an upstream.
-// *usagepkg.Store satisfies it.
+// Accountant durably tracks each request that selected a Seat, before it
+// reaches an upstream. *usagepkg.Store satisfies it.
 type Accountant interface {
 	InsertPending(context.Context, usagepkg.PendingRequest) (int64, error)
 	MarkUpstreamDispatched(context.Context, int64, time.Time, string) error
 	Finalize(context.Context, int64, usagepkg.FinalizedRequest) error
 }
 
+// pendingRequest is the immutable identity of one selected request, as the
+// durable store will hold it before any upstream is contacted.
+//
+// It is only ever built for an exchange that selected a Seat, so SeatID and
+// Seat are the ones the request actually rides, taken from the same immutable
+// Resolution the ledger record and the forward path read. RequestModel is the
+// exact string the caller asked with and may be empty, which is a request that
+// named no model — not a model named "".
 func pendingRequest(exch *exchange, host string, kind usagepkg.RequestKind) usagepkg.PendingRequest {
 	return usagepkg.PendingRequest{
 		StartedAt:       exch.start,
 		Kind:            kind,
 		Host:            host,
 		Context:         exch.context,
-		Route:           exch.route,
+		SeatID:          exch.seatID(),
+		Seat:            exch.seat(),
 		RequestModel:    exch.requestModel,
 		CredentialClass: exch.credentialClass,
 	}
@@ -76,7 +85,8 @@ func (e *exchange) accountingOutcome(capt *capture, sum summary) usagepkg.Outcom
 func (e *exchange) finalizedRequest(capt *capture) usagepkg.FinalizedRequest {
 	sum := e.accountingSummary(capt)
 	costStatus := usagepkg.CostStatusUnknown
-	class, err := billing.RealizeClass(e.route.BillingPolicy(), e.route.BillingClass, e.credentialClass)
+	seat := e.seat()
+	class, err := billing.RealizeClass(seat.BillingPolicy(), seat.BillingClass, e.credentialClass)
 	if err == nil && (sum.providerCostPresent && sum.providerCostValid ||
 		class == billing.ClassSubscription || class == billing.ClassSelfHosted) {
 		costStatus = usagepkg.CostStatusKnown

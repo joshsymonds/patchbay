@@ -443,11 +443,11 @@ func meteredPendingRequest() PendingRequest {
 
 func selfHostedPendingRequest() PendingRequest {
 	request := validPendingRequest()
-	request.Route = registry.Route{
-		Alias:           "self-hosted",
-		BaseURL:         "http://localhost:9000",
+	request.SeatID = "self-hosted"
+	request.Seat = registry.Seat{
+		Upstream:        "http://localhost:9000",
 		Model:           "local/model",
-		Auth:            registry.AuthInject,
+		AuthMode:        registry.AuthInject,
 		BillingClass:    billing.ClassSelfHosted,
 		BillingClassSet: true,
 	}

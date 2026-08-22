@@ -20,7 +20,7 @@ import (
 const (
 	ledgerDirMode  = 0o700
 	ledgerFileMode = 0o600
-	filePrefix     = "patchbay-"
+	filePrefix     = "patchbay-v2-"
 	fileSuffix     = ".jsonl"
 	dayLayout      = "2006-01-02"
 )
@@ -155,12 +155,16 @@ func scanLines(reader io.Reader) ([]Record, error) {
 			if line[len(line)-1] != '\n' {
 				return records, &CorruptionError{Offset: offset, Err: io.ErrUnexpectedEOF}
 			}
-			var rec Record
-			if err := json.Unmarshal(line[:len(line)-1], &rec); err != nil {
-				return records, &CorruptionError{Offset: offset, Err: err}
+			// decodeRecord owns the whole reading of a line: unknown fields at
+			// every depth, trailing data, and the model keys each record shape must
+			// and must not carry — none of which survive as questions once a
+			// decoded struct is all that is left.
+			rec, decodeErr := decodeRecord(line[:len(line)-1])
+			if decodeErr != nil {
+				return records, &CorruptionError{Offset: offset, Err: decodeErr}
 			}
-			if err := rec.Validate(); err != nil {
-				return records, &CorruptionError{Offset: offset, Err: err}
+			if validateErr := rec.Validate(); validateErr != nil {
+				return records, &CorruptionError{Offset: offset, Err: validateErr}
 			}
 			records = append(records, rec)
 			offset += int64(len(line))

@@ -1,34 +1,56 @@
 # Nix
 
-The flake is the supported deployment. It exports:
+The flake exports:
 
-| Output | What it is |
+| Output | Description |
 |---|---|
-| `packages.<system>.patchbay` | The gateway binary (also `default`). |
-| `packages.<system>.cliproxyapi` | [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), packaged from upstream release binaries — the optional Codex-subscription upstream. |
-| `homeModules.patchbay` | The home-manager module below (also `default`, and mirrored as `homeManagerModules`). |
+| `packages.<system>.patchbay` | Gateway binary and default package. |
+| `packages.<system>.cliproxyapi` | Optional CLIProxyAPI release binary. |
+| `homeModules.patchbay` | Home Manager module, also exported as `homeModules.default` and under `homeManagerModules`. |
 
-The module runs everything as systemd user services, so it is Linux-only; on
-other platforms use the packages directly and arrange the processes yourself.
+Packages are available for `x86_64-linux`, `aarch64-linux`, and
+`aarch64-darwin`. The module manages systemd user services and supports Linux
+only.
 
-## The module
+## Home Manager
+
+Add the input and import the module:
 
 ```nix
 {
   inputs.patchbay.url = "github:joshsymonds/patchbay";
+}
+```
 
-  # …in your home-manager configuration:
+```nix
+{
+  inputs,
+  ...
+}: {
   imports = [ inputs.patchbay.homeModules.patchbay ];
 
   services.patchbay = {
     enable = true;
 
-    registry.contexts.personal.routes."openrouter/kimi-k2" = {
-      auth = "inject";
-      base_url = "https://openrouter.ai/api";
-      model = "moonshotai/kimi-k2";
-      api_key_env_file = "PATCHBAY_OPENROUTER_KEY_FILE";
-      strip_cache_control = true;
+    registry = {
+      default_context = "personal";
+      seats = {
+        anthropic = {
+          upstream = "https://api.anthropic.com";
+          auth_mode = "forward";
+        };
+        openrouter-kimi-k2 = {
+          upstream = "https://openrouter.ai/api";
+          model = "moonshotai/kimi-k2";
+          auth_mode = "inject";
+          billing = "metered";
+          api_key_env_file = "PATCHBAY_OPENROUTER_KEY_FILE";
+        };
+      };
+      contexts.personal = {
+        default_seat = "anthropic";
+        models."openrouter/kimi-k2" = "openrouter-kimi-k2";
+      };
     };
 
     environment.PATCHBAY_OPENROUTER_KEY_FILE = "/run/agenix/openrouter-key";
@@ -36,86 +58,167 @@ other platforms use the packages directly and arrange the processes yourself.
 }
 ```
 
-That is a complete deployment. `home-manager switch` starts the gateway on
-`127.0.0.1:4100`, generates the registry into the store and links it at
-`~/.config/patchbay/routes.json` (patchbay hot-reloads when the store path
-moves, so a rebuild takes effect on the next request with nothing to restart),
-and generates a caller key at `~/.config/patchbay/caller.key` if none exists.
-Point `ANTHROPIC_BASE_URL` at the gateway as the README describes and you are
-done.
+`api_key_env_file` names an environment variable, and that variable contains the
+path to a key file outside the Nix store. Use agenix, sops-nix, or another secret
+manager for provider keys.
 
-The division of labor is the same one the rest of the documentation assumes:
-the registry is world-readable and holds only the *names* of environment
-variables; `services.patchbay.environment` gives those variables values, each
-the path of a key file that lives outside the store — placed by agenix,
-sops-nix, or your own hands.
+The generated strict registry is stored in the Nix store and linked at
+`~/.config/patchbay/routes.json`. It contains global Seats, Context bindings, and
+secret references, never secret contents. Patchbay reloads it when the Home
+Manager symlink target changes.
 
-### Options
+The module's default registry is valid by itself:
 
-| Option | Default | Meaning |
+```nix
+{
+  default_context = "personal";
+  seats.anthropic = {
+    upstream = "https://api.anthropic.com";
+    auth_mode = "forward";
+  };
+  contexts.personal = {
+    default_seat = "anthropic";
+    models = { };
+  };
+}
+```
+
+Apply and inspect:
+
+```console
+$ home-manager switch
+$ . "$HOME/.nix-profile/etc/profile.d/hm-session-vars.sh"
+$ systemctl --user status patchbay
+$ journalctl --user -u patchbay -f
+$ patchbay check
+$ patchbay contexts
+$ patchbay seats
+$ patchbay bindings --ctx personal
+```
+
+The activation creates `~/.config/patchbay/caller.key` with mode 0600 when it is
+missing, unless `generateCallerKey` is disabled. The module exports
+`PATCHBAY_LISTEN`, `PATCHBAY_REGISTRY`, and `PATCHBAY_CALLER_KEY_FILE` to Home
+Manager sessions.
+
+Configure Claude Code separately:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4100",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Patchbay-Key: <contents of ~/.config/patchbay/caller.key>"
+  }
+}
+```
+
+Leave `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` unset to keep using the
+Claude Code subscription login. Keep the listener on loopback.
+
+Ledger v2 records are JSONL under `~/.local/state/patchbay/ledger` unless
+`ledgerDir` overrides the path:
+
+```console
+$ tail -f "$HOME/.local/state/patchbay/ledger/patchbay-v2-$(date -u +%F).jsonl"
+```
+
+## Module options
+
+| Option | Default | Description |
 |---|---|---|
-| `enable` | `false` | Run the gateway as a systemd user service. |
-| `package` | the flake's `patchbay` | The gateway binary. |
-| `listen` | `"127.0.0.1:4100"` | Bind address, and what the CLI subcommands dial. Keep it loopback. |
-| `registry` | one empty `personal` context | The registry document as Nix attrs, generated to JSON. The default is a pure Anthropic passthrough. Schema: [configuration.md](configuration.md). |
-| `callerKeyFile` | `~/.config/patchbay/caller.key` | Path (a string, never a store path) of the caller key file. |
-| `generateCallerKey` | `true` | Create `callerKeyFile` on activation when missing: 32 random bytes, base64, 0600. Disable if a secrets tool places it. |
-| `environment` | `{ }` | Extra unit environment — the key-file and model-map variables the registry names. |
-| `path` | `[ ]` | Packages on the unit's PATH. A registry with `sigv4` routes needs `[ pkgs.awscli2 ]` here; nothing else needs a PATH at all. |
-| `ledgerDir` | patchbay's default | Where JSONL ledger records land. |
+| `enable` | `false` | Install and run patchbay as a systemd user service. |
+| `package` | flake package | Gateway package. |
+| `listen` | `127.0.0.1:4100` | Service and CLI address. |
+| `registry` | strict Anthropic Seat plus `personal` Context | Registry rendered to JSON. |
+| `callerKeyFile` | `~/.config/patchbay/caller.key` | String path to the caller key. |
+| `generateCallerKey` | `true` | Create the caller key when missing. |
+| `environment` | `{ }` | Extra unit environment, normally key and model-map file paths. |
+| `path` | `[ ]` | Packages added to the unit `PATH`. SigV4 needs `pkgs.awscli2`. |
+| `ledgerDir` | `null` | Override the default ledger directory. |
 
-The module also exports `PATCHBAY_LISTEN` and `PATCHBAY_CALLER_KEY_FILE` as
-session variables, so the CLI subcommands (`patchbay routes`, `resolve`,
-`tail`, …) work in an interactive shell with no further ceremony.
+The module does not manage provider-key files or Claude Code settings.
 
-What it deliberately does not manage: the key files themselves, and
-`.claude/settings.json` — which project selects which context is the
-project's own business ([README, Contexts](../README.md#contexts)).
+## ChatGPT subscription Seats
 
-## `codexUpstream`: ChatGPT subscription routes in one flag
-
-Read [chatgpt-subscription.md](chatgpt-subscription.md) first. It opens with
-the part that matters: fronting a ChatGPT subscription this way is at best a
-gray area of OpenAI's Terms of Use, and enabling this option is accepting
-that risk for the account you log in. The option exists to make the setup
-seamless, not the decision.
+Read [chatgpt-subscription.md](chatgpt-subscription.md) before enabling this
+feature. `codexUpstream` runs CLIProxyAPI on loopback, creates global `inject`
+Seats, and publishes bindings in selected Contexts:
 
 ```nix
 services.patchbay.codexUpstream = {
   enable = true;
-  routes = {
+  bindings = {
     "chatgpt/sol" = "gpt-5.6-sol";
     "chatgpt/luna" = "gpt-5.6-luna";
   };
+  contexts = [ "personal" ];
 };
 ```
 
-With that, one `home-manager switch`:
+With `contexts = null`, bindings are added to every registry Context. A
+hand-written Context binding with the same selector wins. Naming an unknown
+Context fails the Home Manager assertion.
 
-- runs the flake's `cliproxyapi` as a second user service on loopback `:8317`,
-  with a generated config (management API and control panel disabled);
-- merges an `inject` route per entry of `routes` into every context of your
-  registry (narrow it with `codexUpstream.contexts = [ "personal" ]`), keyed
-  through the usual file indirection — the service, the routes, and the
-  listener key can never drift apart, because one module defines all three;
-- leaves a hand-written route of the same name alone: the reviewed registry
-  wins over the generated convenience.
+A generated selector must be non-empty. It is published as a public model name,
+and patchbay refuses an empty selector key in a Context's bindings, so an empty
+one fails a Home Manager assertion whichever Contexts are selected.
 
-One step is yours, once per machine, because it mints the credential:
+A generated binding may not name Claude — in any case, anywhere in the string —
+and each side is checked where it lands. Every entry generates an `inject` Seat,
+so a target containing `claude` always fails a Home Manager assertion; patchbay
+admits no inject model naming Claude. A selector containing `claude` fails only
+where it is actually published, because a hand-written Context binding of the
+same selector wins: a generated selector overridden in every Context it would
+reach binds no inject Seat, and that assertion leaves it alone. Both refusals
+happen at evaluation instead of at gateway startup. Hand-written registry Seats
+and Context bindings are validated by patchbay itself.
+
+Each entry gets a stable generated Seat ID: `codex-` followed by the full SHA-256
+digest of the selector. The whole digest keeps SHA-256's full collision resistance.
+The earlier 16-character prefix discarded three quarters of it for no benefit,
+leaving 64 bits in which two selectors could collapse onto a single Seat — an
+unlikely failure, but a silent one, and an avoidable one. The module rejects a
+generated ID that collides with a hand-written global Seat ID. Generated Seats
+use:
+
+- `auth_mode = "inject"`;
+- loopback CLIProxyAPI `upstream`;
+- `PATCHBAY_CHATGPT_KEY_FILE` indirection;
+- the configured upstream model;
+- `maxInputTokens` metadata.
+
+Apply, log in, and verify:
 
 ```console
-$ cli-proxy-api --config ~/.config/cliproxyapi/config.yaml --codex-login
+$ home-manager switch
+$ cli-proxy-api --config "$HOME/.config/cliproxyapi/config.yaml" --codex-login
+$ systemctl --user status cli-proxy-api patchbay
+$ patchbay seats
+$ patchbay bindings --ctx personal
+$ patchbay resolve personal chatgpt/sol
 ```
 
-(`--codex-device-login` on headless hosts; the module puts `cli-proxy-api` on
-your PATH.) The OAuth state lands in `~/.cli-proxy-api`, and only machines
-holding it can answer — which is why `enable` belongs only on those hosts.
-Model ids drift as OpenAI ships; list the current ones as
-[chatgpt-subscription.md](chatgpt-subscription.md#the-proxy) shows and update
-`routes` when one starts refusing.
+Use `--codex-device-login` on a headless host. OAuth state is stored under
+`~/.cli-proxy-api` by default.
 
-Remaining `codexUpstream` options, all with working defaults: `package`,
-`port` (8317), `maxInputTokens` (372000, the subscription's enforced window),
-`listenerKey` (`"patchbay-local"` — a label, not a secret: it gates only the
-loopback listener, and the OAuth state is the real credential), `authDir`
-(`~/.cli-proxy-api`), and `contexts` (null: all of them).
+List currently available model IDs before choosing Seat targets:
+
+```console
+$ curl -fsS -H 'Authorization: Bearer patchbay-local' \
+    http://127.0.0.1:8317/v1/models | jq -r '.data[].id'
+```
+
+`codexUpstream` also provides:
+
+| Option | Default |
+|---|---|
+| `package` | flake `cliproxyapi` package |
+| `port` | `8317` |
+| `bindings` | `{ }` |
+| `contexts` | `null`, meaning all Contexts |
+| `maxInputTokens` | `372000`, advertised but not enforced. Unsigned: the registry refuses a negative ceiling, so evaluation refuses one too |
+| `listenerKey` | `patchbay-local` |
+| `authDir` | `~/.cli-proxy-api` |
+
+The listener key is stored in the Nix store because it protects only a loopback
+listener. The OAuth files in `authDir` are the subscription credential.

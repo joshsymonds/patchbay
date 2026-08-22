@@ -1,244 +1,338 @@
 # Configuration
 
-patchbay is configured by two things: a handful of environment variables, and
-one JSON registry file. There are no flags on `patchbay serve` — deployment is
-meant to be declarative, so the unit file is generated rather than typed.
+`patchbay serve` reads environment variables and one strict JSON registry. It
+accepts no flags. `patchbay check` uses the same registry path rules plus an
+optional `--registry <path>` override.
 
-## Environment variables
+## Environment
 
-| Variable | Read by | Default | Meaning |
-|---|---|---|---|
-| `PATCHBAY_LISTEN` | `serve`, and every CLI subcommand that asks the daemon | `127.0.0.1:4100` | The address the gateway binds, and the address the CLI dials. Empty is treated as unset. |
-| `PATCHBAY_REGISTRY` | `serve`, `check` | `$XDG_CONFIG_HOME/patchbay/routes.json`, else `$HOME/.config/patchbay/routes.json` | The registry file. `check --registry <path>` overrides it for that one invocation. |
-| `PATCHBAY_LEDGER_DIR` | `serve` | `$XDG_STATE_HOME/patchbay/ledger`, else `$HOME/.local/state/patchbay/ledger` | Where JSONL records are written. Created 0700 if missing. |
-| `PATCHBAY_CALLER_KEY_FILE` | `serve`, and every CLI subcommand that asks the daemon | none | Path of the file holding the caller key. Required by `inject` routes, `sigv4` routes and `/_patchbay/registry`; without it those refuse with 500 and the CLI fails before dialing. |
-| `XDG_CONFIG_HOME` | `serve`, `check` | unset | Base for the default registry path. |
-| `XDG_STATE_HOME` | `serve` | unset | Base for the default ledger directory. |
-| `HOME` | `serve`, `check`, `project` | unset | Fallback base for both defaults, and where `project` looks for the user-level `~/.claude/settings.json`. |
-| *(named by a route's `api_key_env_file`)* | `serve` | none | Its value is the path of a file holding that route's API key. You choose the variable name. |
-| *(named by a route's `model_map_env_file`)* | `serve` | none | Its value is the path of the JSON model map a `sigv4` route translates through. You choose the variable name. (`patchbay resolve` reads the map *file*, at the path the gateway reports — never the variable.) |
-| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | `serve` | unset | Honored by Go's standard transport for upstream calls, as in any Go program. |
+| Variable | Default | Meaning |
+|---|---|---|
+| `PATCHBAY_LISTEN` | `127.0.0.1:4100` | Address used by the gateway and daemon-backed CLI commands. |
+| `PATCHBAY_REGISTRY` | XDG config path, then `~/.config/patchbay/routes.json` | Registry path. `check --registry` takes precedence. |
+| `PATCHBAY_LEDGER_DIR` | XDG state path, then `~/.local/state/patchbay/ledger` | Ledger directory. Missing directories are created with mode 0700. |
+| `PATCHBAY_USAGE_DB` | XDG state path, then `~/.local/state/patchbay/usage.sqlite` | Accounting database. Unlike the ledger, `serve` fails if it cannot be opened. |
+| `PATCHBAY_RATE_CARDS` | none | JSON file of immutable effective-dated per-million-token rates. `serve` fails if it cannot be read, parsed, or reconciled with a card already recorded. |
+| `PATCHBAY_CALLER_KEY_FILE` | none | File containing the caller key. |
+| Variable named by `api_key_env_file` | none | Path to an `inject` Seat's key file. |
+| Variable named by `model_map_env_file` | none | Path to a `sigv4` Seat's JSON model map. |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | unset | Standard Go proxy settings for upstream requests. |
 
-If neither the XDG variable nor `HOME` is set, `serve` refuses to start: there
-is nowhere honest to put a registry or a ledger, and guessing would be worse
-than failing.
+Registry and ledger paths resolve independently: the `PATCHBAY_*` override, then
+the matching XDG base, then `HOME`. `serve` fails if either path cannot be
+resolved. `check` needs only the registry path.
 
-`AWS_PROFILE` is not read from patchbay's own environment. It is *set* on the
-`aws configure export-credentials` child process, to the `aws_profile` the route
-names; the rest of the gateway's environment (`AWS_CONFIG_FILE`,
-`AWS_SHARED_CREDENTIALS_FILE`, `AWS_REGION`, …) is inherited by that child, so
-the CLI resolves the profile exactly as it would in your shell. See
-[auth-modes.md](auth-modes.md).
+The Home Manager module exports the listen, registry, and caller-key variables.
+Additional key and map variables go in `services.patchbay.environment`. SigV4
+also needs the AWS CLI on the service `PATH`. See [nix.md](nix.md).
 
-## The registry file
-
-The registry is a JSON document of **contexts**. Each context has an optional
-`default_route` and an optional map of `routes` keyed by the model name that
-selects them.
+## Strict registry
 
 ```json
 {
+  "default_context": "personal",
+  "seats": {
+    "anthropic": {
+      "upstream": "https://api.anthropic.com",
+      "auth_mode": "forward"
+    },
+    "openrouter-kimi-k2": {
+      "upstream": "https://openrouter.ai/api",
+      "model": "moonshotai/kimi-k2",
+      "auth_mode": "inject",
+      "api_key_env_file": "PATCHBAY_OPENROUTER_KEY_FILE",
+      "billing": "metered"
+    },
+    "work-bedrock": {
+      "auth_mode": "sigv4",
+      "aws_profile": "work-bedrock",
+      "aws_region": "us-west-2",
+      "model_map_env_file": "PATCHBAY_BEDROCK_MODEL_MAP_FILE"
+    }
+  },
   "contexts": {
     "personal": {
-      "routes": {
-        "openrouter/kimi-k2": {
-          "auth": "inject",
-          "base_url": "https://openrouter.ai/api",
-          "model": "moonshotai/kimi-k2",
-          "api_key_env_file": "PATCHBAY_OPENROUTER_KEY_FILE"
+      "default_seat": "anthropic",
+      "models": {
+        "openrouter/kimi-k2": "openrouter-kimi-k2"
+      },
+      "subagents": {
+        "default_seat": "openrouter-kimi-k2",
+        "models": {
+          "claude-opus-5": "openrouter-kimi-k2"
         }
       }
     },
     "work": {
-      "default_route": {
-        "auth": "sigv4",
-        "aws_profile": "work-bedrock",
-        "aws_region": "us-west-2",
-        "model_map_env_file": "PATCHBAY_BEDROCK_MODEL_MAP_FILE"
-      },
-      "routes": {}
+      "default_seat": "work-bedrock",
+      "models": {}
     }
   }
 }
 ```
 
-Parsing is strict. The top level accepts exactly one key, `contexts`; a context
-object accepts exactly `default_route` and `routes`; a route object accepts
-exactly the fields below. Anything else — an unknown key, a misspelled key,
-trailing data after the document — rejects the **whole file** by name, and so
-does any single validation failure. There is no partial application: a document
-with one bad route is a document you did not review.
+The root fields are exactly these three, and all are required:
 
-### Context names
+- `default_context`
+- `seats`
+- `contexts`
 
-A context name rides in a URL path, so it may contain only lowercase letters,
-digits and dashes, and may not be empty. `personal` is special only in that a
-request with no `/ctx/<name>` prefix resolves there; you do not have to define
-it, and if you do not, the personal context is the built-in forward to Anthropic
-with no aliases.
+A Context has exactly:
 
-Alias keys inside `routes` are unconstrained and are matched whole as opaque
-strings. `openrouter/sol` is a convention, not a syntax — the slash means
-nothing to patchbay. An alias may deliberately shadow a real Anthropic model id;
-that is how you pin `claude-sonnet-4-5` to a different upstream inside one
-context.
+- required `default_seat`;
+- required `models`;
+- optional `subagents`.
 
-A rewrite target is not an alias. A request naming the model a route rewrites
-*to* — `deepseek/deepseek-v4-flash-0731` instead of the alias that rewrites to
-it — is refused with a **404** in Anthropic's `not_found_error` shape, naming
-the alias to ask for, rather than falling through: the default route's upstream
-does not serve that name, and falling through would send the conversation, on
-the default route's credentials, exactly where it was routed away from. The
-observed shape is a client echoing a response's `model` field back as its next
-request's model. The refusal only covers targets no route serves from the
-upstream the default route reaches — a pinning route that rewrites one Claude
-id to another leaves the target's own fallthrough intact, and a context whose
-default route points at the same server its aliases do (the [local
-models](#local-models) shape) keeps serving that server's model ids bare.
+A present `subagents` object has exactly:
 
-### Route fields
+- required `default_seat`;
+- optional `models`, defaulting to an empty exact-binding map.
 
-| Field | Type | Meaning |
-|---|---|---|
-| `auth` | string | Required. `forward`, `inject` or `sigv4`. See [auth-modes.md](auth-modes.md). |
-| `base_url` | string | The upstream API root. The inbound path and raw query are appended verbatim, so `https://openrouter.ai/api` + `/v1/messages` is what gets requested. Absolute `https` URL, or `http` for `127.0.0.1`/`localhost` — any other `http` host requires `insecure`. |
-| `model` | string | Rewrite target: the model actually asked of the upstream. Omitted or empty means identity — forward whatever model the caller named. |
-| `api_key_env_file` | string | The NAME of an environment variable whose VALUE is the path of a file holding the API key. Never the key, and never a path. |
-| `aws_profile` | string | `sigv4` only. The AWS profile whose credentials sign the request. |
-| `aws_region` | string | `sigv4` only. The region signed for, and the region of the `bedrock-runtime` endpoint derived from it. |
-| `model_map_env_file` | string | `sigv4` only. The NAME of an environment variable whose VALUE is the path of a JSON object mapping requested model ids to Bedrock model ids. |
-| `extra_body` | object | Merged over the request document's top-level keys at forward time; the route's values win over the caller's. Must be a JSON object. |
-| `max_input_tokens` | integer ≥ 0 | Advertised as `max_input_tokens` on `/v1/models`. **Not enforced** — it is a published ceiling, not an applied one. Zero omits it. |
-| `max_output_tokens` | integer ≥ 0 | Clamps the request's `max_tokens` down to this when the caller asks for more. Also advertised as `max_tokens` in the listing. Zero means no cap. |
-| `insecure` | bool | Permits a plain-`http` `base_url` on a non-loopback host, accepting that the route travels an unencrypted link — see [Local models](#local-models). Setting it anywhere it changes nothing (an `https` route, a loopback `http` route, a `sigv4` route) fails validation, so a set flag always means what it says. On an `inject` route the injected API key travels in cleartext over that link. |
-| `strip_cache_control` | bool | Removes every `cache_control` key from the request document, at any depth. Prompt caching is Anthropic's; a foreign upstream may reject the marker. |
-| `capture_bodies` | bool | Records the forwarded request body and the response body in this route's ledger records. Off by default. |
+Every binding value is a Seat ID string. Inline Seat objects are invalid.
+`default_context`, Context IDs, Seat IDs, and all Seat references must resolve.
+Context and Seat IDs match `^[a-z0-9][a-z0-9-]*$`.
 
-A route that sets `model`, `extra_body`, `strip_cache_control` or
-`max_output_tokens` has its request body decoded, rewritten and re-encoded. A
-route that sets none of the four is on the identity path: the caller's exact
-bytes are what travel upstream.
+Model selector keys are exact opaque non-empty strings. They are not normalized,
+trimmed, decoded, or restricted to the ID grammar.
 
-### Required and forbidden fields, by auth mode
+The registry rejects:
 
-These rules are enforced on `default_route` and on every alias alike, and a
-violation fails the whole document.
+- missing required fields;
+- null root, `seats`, `contexts`, Context, `models`, `subagents`, or
+  `subagents.models` values;
+- null or non-object `extra_body`, or an exact top-level `model` member within it;
+- unknown fields;
+- incompatible types;
+- malformed JSON or trailing data;
+- duplicate JSON member names in every object at every depth — the root,
+  `seats`, each Seat, `contexts`, each Context, each binding map, `subagents`,
+  and every object nested anywhere inside an `extra_body`, including objects
+  carried in arrays;
+- unresolved Context or Seat references;
+- inline Seats in binding maps;
+- legacy `routes`, `default_route`, `base_url`, or `auth` spellings.
 
-| | `forward` | `inject` | `sigv4` |
+A repeated member name is rejected rather than resolved last-wins, so a reviewed
+value can never be silently shadowed by a second one further down the file.
+
+There is no compatibility parser.
+
+## Seats
+
+A Seat is global and reusable. Contexts and marked-subagent policy reference it
+by ID.
+
+| Field | Meaning |
+|---|---|
+| `upstream` | API root for `forward` and `inject`. HTTPS is required except for loopback HTTP or an `inject` Seat with `insecure: true`. |
+| `model` | Upstream model rewrite. Empty preserves the requested model. |
+| `auth_mode` | `forward`, `inject`, or `sigv4`. |
+| `billing` | `subscription`, `metered`, or `self_hosted`. Required by `inject` and forbidden elsewhere: a `forward` Seat's class follows the caller's credential and a `sigv4` Seat is metered by the account that signed it. |
+| `api_key_env_file` | Environment variable whose value is the provider-key file path. Required by `inject` and matched against `^[A-Za-z_][A-Za-z0-9_]*$` — the same grammar the ledger validates `config_source` with. |
+| `aws_profile` | AWS profile for a `sigv4` Seat. |
+| `aws_region` | AWS region used for signing and the Bedrock endpoint. |
+| `model_map_env_file` | Environment variable whose value is the Bedrock model-map path. |
+| `extra_body` | Object merged over top-level request fields. The exact top-level member `model` is reserved; `Seat.model` is the sole model authority. Other Seat values win. |
+| `max_input_tokens` | Non-negative metadata published by model endpoints. It is not enforced. |
+| `max_output_tokens` | Non-negative ceiling applied to numeric request `max_tokens` values. |
+| `insecure` | Allows non-loopback HTTP on an `inject` Seat. |
+| `strip_cache_control` | Recursively removes object fields named `cache_control`. |
+| `capture_bodies` | Stores rewritten request and captured response bodies in ledger v2. |
+
+For `forward` and `inject`, the original request bytes are preserved unless the
+Seat sets `model`, `extra_body`, `strip_cache_control`, or `max_output_tokens`.
+When a rewrite is needed, the body must be a JSON object and is re-encoded after
+those operations. SigV4 always performs an additional Bedrock translation. See
+[auth-modes.md](auth-modes.md).
+
+### Auth-mode validation
+
+| Rule | `forward` | `inject` | `sigv4` |
 |---|---|---|---|
-| `base_url` | **required**, and must be exactly `https://api.anthropic.com` | required, `https` (or `http` for loopback, or with `insecure`) | **forbidden** — the endpoint is derived from `aws_region` |
-| `api_key_env_file` | **forbidden** | **required**, non-empty | **forbidden** |
-| `insecure` | forbidden — the Anthropic endpoint is `https` | allowed only on a non-loopback `http` `base_url` | **forbidden** — the Bedrock endpoint is always `https` |
-| `aws_profile` | forbidden | forbidden | **required**, non-blank, and only lowercase letters, digits, dashes, dots and underscores |
-| `aws_region` | forbidden | forbidden | **required**, non-blank, and only lowercase letters, digits and dashes |
-| `model_map_env_file` | forbidden | forbidden | **required**, non-blank |
-| `claude` in the alias or in `model` | allowed | **forbidden** (case-insensitive) | allowed |
+| `upstream` | Exactly `https://api.anthropic.com` | Required | Forbidden; derived from region |
+| `api_key_env_file` | Forbidden | Required | Forbidden |
+| `billing` | Forbidden | Required | Forbidden |
+| `insecure` | Forbidden | Non-loopback HTTP only | Forbidden |
+| AWS fields | Forbidden | Forbidden | Profile, region, and model-map variable required |
+| `claude` in Seat rewrite | Allowed | Forbidden, case-insensitive | Allowed |
 
-Everything else applies to all three modes: `max_input_tokens` and
-`max_output_tokens` must not be negative, and `extra_body` must be a JSON
-object.
+All token ceilings must be non-negative. `extra_body` must be an object when
+present. Its exact top-level `model` member is reserved so `Seat.model` remains
+the sole model authority; member names are case-sensitive, and nested `model`
+members remain allowed. Other contents are arbitrary: an operator merges
+whatever the provider accepts, so no schema constrains their member names,
+values, or depth. Every object inside `extra_body`, at any depth and including
+objects carried in arrays, must use unique member names.
 
-The `forward` restriction is the exfiltration rule: that mode passes the
-caller's own subscription token upstream, so Anthropic is the only place it may
-go. The `claude` restriction on `inject` is the misbilling rule: a route paid
-for with a foreign key must not present itself as a Claude model, in the ledger
-or anywhere else.
+A public `context.models` selector containing `claude`, case-insensitively,
+cannot bind to an inject Seat. Marked-subagent model selectors are observed input
+model names and are exempt from that selector rule. Every inject Seat referenced
+by a marked-subagent exact or default binding must configure a non-empty,
+non-Claude rewrite model.
 
-### Local models
+Registry validation is structural and referential only. It does not read
+credential files or model maps, export AWS credentials, validate AWS sessions,
+probe upstreams, or perform network requests.
 
-A route can point at a model server on your own network — anything that speaks
-the Anthropic Messages API, such as a recent Ollama. Nothing about the upstream
-has to be a cloud:
+## Context and Seat selection
+
+Bare paths select `default_context`; `/ctx/<name>` explicitly selects that Context.
+While the registry is valid, an unknown explicit Context returns 404 rather than
+falling back.
+
+Selection precedence is:
+
+1. exact public `context.models` binding;
+2. valid marked subagent plus exact `context.subagents.models` binding;
+3. valid marked subagent plus `context.subagents.default_seat`;
+4. refusal of a protected foreign rewrite target;
+5. `context.default_seat`.
+
+### Marked-subagent observation
+
+Only `x-claude-code-agent-id` creates a positive observation, and only when:
+
+- exactly one value is present;
+- length is 1–256 bytes;
+- every byte is printable ASCII `0x21`–`0x7e`.
+
+The value is used verbatim without trimming, decoding, or prefix assumptions.
+Empty, duplicate, oversized, whitespace-containing, control-containing, or
+non-ASCII values make the request unmarked.
+
+`x-claude-code-parent-agent-id` never marks traffic by itself. When the agent ID
+is valid, a parent value is recorded only if it independently passes the same
+validation. Invalid parent values are omitted and never affect selection.
+
+Both headers continue upstream unchanged under ordinary header forwarding. They
+are observations only, never authentication, identity, authorization, permission,
+or a security boundary. Parent-only and unmarked auxiliary traffic uses ordinary
+selection. Patchbay performs no prompt matching or semantic agent inference.
+
+### Foreign rewrite-target refusal
+
+A protected target is computed only from public `context.models` bindings:
+
+1. consider bindings whose Seat has a non-empty model rewrite;
+2. protect the target when that Seat's effective upstream differs from the
+   Context default Seat's effective upstream;
+3. remove protection when any public binding serves the same target through the
+   default upstream;
+4. name the lexically first public selector in the error.
+
+Exact public and marked-subagent selection happen before this guard.
+`subagents.models`, `subagents.default_seat`, and unused Seats never contribute
+protected targets. Requesting a protected target directly returns 404 and names
+the public selector to use.
+
+## Local models
+
+An `inject` Seat can target a local Anthropic-compatible server:
 
 ```json
-"local/qwen": {
-  "base_url": "http://gpubox.lan:11434",
-  "auth": "inject",
+"local-qwen": {
+  "upstream": "http://gpubox.lan:11434",
+  "model": "qwen3",
+  "auth_mode": "inject",
   "api_key_env_file": "PATCHBAY_LOCAL_KEY_FILE",
+  "billing": "self_hosted",
   "insecure": true
 }
 ```
 
-patchbay appends `/v1/messages` verbatim, so the server must answer the
-Messages API at that path — an OpenAI-style `/v1/chat/completions` server needs
-a translating proxy in front.
-[chatgpt-subscription.md](chatgpt-subscription.md) is a worked example of
-exactly that shape: CLIProxyAPI on loopback translating Messages to the Codex
-backend.
+The server must implement `/v1/messages` and, if used,
+`/v1/messages/count_tokens`. A keyless server still needs a non-empty placeholder
+key file because `inject` requires one. Prefer TLS or a loopback tunnel to
+`insecure: true`.
 
-`insecure` is the operator accepting, in the reviewed document itself, that
-this route travels an unencrypted link: anyone on that network path can read
-the conversation and the injected API key. For a keyless local server the key
-file can hold a placeholder, but the flag is still the honest description of
-the link. The alternatives that avoid it are an SSH tunnel (`base_url` becomes
-loopback) or TLS in front of the model server — for example `tailscale serve`,
-which yields a valid `https` endpoint with no certificate management.
+## Reload and failure behavior
 
-Validate before you deploy:
+Initial registry validation occurs synchronously before the listener binds.
+Initial missing, unreadable, malformed, or invalid configuration is fatal.
 
-```console
-$ patchbay check --registry examples/routes.json
-OK examples/routes.json: 2 contexts (personal, work), 4 routes
+Patchbay reloads when registry existence, size, modification time, or resolved
+symlink target changes. This detects ordinary replacement and new Home Manager
+generations. A request uses one immutable resolution snapshot.
+
+| Failure | Result |
+|---|---|
+| Hot registry missing or invalid | Installs an invalid sentinel; every new proxy and model request returns 503 `api_error`. |
+| Unknown explicit Context while valid | 404, with no fallback. |
+| Protected foreign rewrite target requested directly | 404 naming a public selector. |
+| Valid replacement after hot failure | Restores routing atomically on the next request. |
+| Ledger unavailable | Requests continue; affected records are dropped and warned. |
+| Listen address unavailable | Startup fails. |
+
+Stale valid snapshots are never used for new requests after a hot failure.
+Already-resolved requests finish on their attached immutable resolution. Registry
+invalidity takes precedence over unknown-Context handling.
+
+## Local endpoints
+
+| Path | Behavior |
+|---|---|
+| `GET`, `HEAD /_patchbay/registry` | Caller-key-gated non-secret registry state used by the CLI. |
+| `GET /v1/models` | Lists public selectors and models available through the selected default Seat. |
+| `GET /v1/models/{id}` | Describes a public selector or default-Seat model. |
+| Everything else | Enters the proxy pipeline and is ledger-eligible. |
+
+Explicit-Context model endpoints require the caller key. Bare model endpoints do
+not. Model and introspection endpoints do not write ledger records.
+
+Public models expose selectors only, never Seat IDs or marked-subagent policy. A
+forward default merges selectors with Anthropic's listing. An inject default adds
+its non-empty rewrite model. A SigV4 default adds non-empty model-map keys.
+Mapped Bedrock identifiers remain private. Public selectors shadow duplicate
+upstream/default IDs on every page, and Anthropic pagination semantics are
+preserved.
+
+The binding entries are emitted once, on the unqualified initial page only,
+ahead of the upstream's first page. A page requested with either cursor —
+`after_id` paging forward or `before_id` paging back — carries the upstream's
+own entries alone. Shadowing still applies on every page, cursor-qualified or
+not, because a selector this Context serves is what that name means here
+whichever upstream page the colliding ID arrives on.
+
+A cursor-qualified page, in either direction, relays the upstream's own
+`first_id` and `last_id` unchanged, whatever `has_more` says — including when
+the entry a cursor names was shadowed away locally, since a substituted cursor
+would page from an ID the upstream never listed. Only the unqualified page
+begins and ends with the merged listing's own IDs, and there `last_id` becomes
+the upstream's whenever `has_more` is true, so the next page is one Anthropic
+can be asked for.
+
+Unprefixed caller-key-gated introspection remains HTTP 200 while the registry is
+invalid and reports:
+
+```json
+{
+  "default_context": null,
+  "seats": {},
+  "contexts": {},
+  "registry_valid": false,
+  "validation_error": "sanitized message"
+}
 ```
 
-## Hot reload
-
-The registry file is re-read whenever it has changed, checked on every request
-that consults it. "Changed" means the file's existence, size, modification time
-or resolved symlink target differs from the last load — the symlink target
-matters because a Nix-managed file is a symlink into `/nix/store`, where two
-generations can share a normalized timestamp.
-
-Nothing needs restarting after a rebuild. Both outcomes are cached, success and
-failure alike, so a broken file is not re-parsed and re-logged on every single
-request.
-
-## Failure semantics
-
-patchbay degrades on everything except the socket it was asked to bind.
-
-| Failure | Effect |
-|---|---|
-| Registry file missing | No foreign aliases. Bare paths ride the built-in forward to Anthropic. `registry_loaded` is `false`. Not an error and not logged as one. |
-| Registry file broken (parse or validation) | Same as missing, plus an error log naming the file, the context or alias, and the rule it broke. Re-logged on `/v1/models` requests, since a rebuild can break it long after startup. |
-| Request names a context (`/ctx/<name>/…`) that cannot be produced | **404**, in Anthropic's `not_found_error` shape, naming the context. Never falls back to another context or to the built-in route. This includes `/ctx`, `/ctx/`, and `/ctx//x`, which name no context at all. |
-| Request names no context | Always resolves. The built-in default route — plain forward to Anthropic, no rewrite, no capture — is a fixed value that is never read from the registry, so no registry failure can take it away. |
-| Request names a model that is a foreign route's rewrite target | **404**, in Anthropic's `not_found_error` shape, naming the alias to ask for instead. Never falls through to the default route — see [Context names](#context-names). |
-| Ledger directory cannot be created or opened | The gateway serves without recording, and logs it once at startup. |
-| Hostname unavailable | Records are rejected by ledger validation and logged as dropped; serving is unaffected. |
-| Listen address cannot be bound | Fatal. This is the one thing that stops the gateway. |
-
-The asymmetry is deliberate: an unprefixed path is what every Anthropic client
-sends, so it must keep working with no configuration at all; a prefixed path is
-an explicit request for one particular world, and serving it from somewhere else
-would be worse than refusing.
-
-## Endpoints
-
-| Path | Answered by |
-|---|---|
-| `GET`/`HEAD` `/_patchbay/registry` | patchbay, gated on the caller key. Returns the routing document the CLI reads. Another method → 405 with `Allow`; any other path under `/_patchbay/` → 404. |
-| `GET /v1/models` | patchbay: the selected context's aliases, then the models the caller's own credentials can see from Anthropic, minus any id an alias already claims. A context whose default route does not forward to Anthropic gets a listing synthesized entirely from the registry — for a `sigv4` default route that is the KEYS of its model map, never the Bedrock ids they map to. Never fails — an unreachable upstream costs the upstream half and logs a warning. |
-| `GET /v1/models/{id}` | patchbay when `{id}` is an alias in the selected context, or a model the context's non-forwarding default route serves. Otherwise: relayed to Anthropic with the caller's credentials and returned verbatim when the context still forwards there, and 404 `not_found_error` when it does not — a context that never reaches Anthropic is never described by it. |
-| everything else | The proxy pipeline, including `/v1/messages`, `/v1/messages/count_tokens`, these two paths under any other method, and every endpoint patchbay has never heard of. |
-
-Neither model endpoint writes a ledger record: nothing was proxied.
-
-Both model endpoints are gated on the caller key when the path NAMES a context
-(`/ctx/<name>/v1/models`), with the same 403 and 500 `/_patchbay/registry` gives:
-asking what another world of this machine serves is what that key protects. The
-bare path is never gated — it is what Claude Code sends knowing nothing about
-patchbay, and it describes only the context that caller was already riding.
+Valid introspection includes global non-secret Seat summaries, public Context
+bindings, and optional marked-subagent policy. It omits `extra_body` contents,
+resolved key and model-map paths, credential values, AWS credentials, and mapped
+Bedrock identifiers.
 
 ## Limits
 
 | Limit | Value |
 |---|---|
-| Request body held in memory | 64 MiB; over it, 413 |
-| Response capture held for the ledger | 64 MiB; over it the capture is dropped whole and the record carries no summary |
-| Upstream model-listing body | 4 MiB |
-| Introspection document the CLI will decode | 4 MiB |
-| One Bedrock event-stream message | 16 MiB |
-| Request header read timeout | 10 s |
-| Upstream response *header* timeout | 10 min (there is no overall request timeout: a long thinking turn may stream for many minutes) |
-| Graceful shutdown, and ledger drain after it | 5 s each |
+| Request body | 64 MiB |
+| Ledger response capture | 64 MiB |
+| Model endpoint upstream body | 4 MiB |
+| CLI introspection document | 4 MiB |
+| Agent and parent observation | 256 bytes each |
+| Bedrock event-stream message | 16 MiB |
+| Request-header, upstream dial, and TLS handshake timeouts | 10 s |
+| Proxy upstream response-header timeout | 10 min |
+| Model endpoint fetch timeout | 5 s |
+| AWS credential export timeout | 10 s |
+| HTTP shutdown and ledger drain | 5 s each |
+
+There is no overall proxy request timeout after upstream response headers arrive.

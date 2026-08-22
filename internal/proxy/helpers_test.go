@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,25 +30,35 @@ const (
 	keyEnvName = "PATCHBAY_TEST_KEY_FILE"
 	testAPIKey = "sk-upstream-secret"
 
-	// callerKeyEnvName is the real environment variable the inject-route caller
+	// callerKeyEnvName is the real environment variable the inject-Seat caller
 	// gate reads; testCallerKey is the secret the canonical inbound request
 	// presents in its X-Patchbay-Key header.
 	callerKeyEnvName = "PATCHBAY_CALLER_KEY_FILE"
 	callerKeyHeader  = "X-Patchbay-Key"
 	testCallerKey    = "sk-caller-secret"
 
-	echoAlias = "local/echo"
-	sseType   = "text/event-stream"
-	jsonType  = "application/json"
-
-	// noModel is what a record carries when the request named no model at all,
-	// standing in for the empty string the ledger refuses to store.
-	noModel = "(none)"
+	echoSelector = "local/echo"
+	sseType      = "text/event-stream"
+	jsonType     = "application/json"
 
 	// callBuffer sizes the recorded-call channel: wide enough that a concurrent
 	// test never blocks the stub upstream.
 	callBuffer = 64
 )
+
+// modelIs reports whether a record's nullable model is exactly want. A nil model
+// is a model that was absent, which is never equal to any string.
+func modelIs(value *string, want string) bool { return value != nil && *value == want }
+
+// shownModel renders a record's nullable model for a failure message, marking
+// absence as something no model could be mistaken for.
+func shownModel(value *string) string {
+	if value == nil {
+		return "<absent>"
+	}
+
+	return strconv.Quote(*value)
+}
 
 // upstreamCall is one request as the stub upstream received it.
 type upstreamCall struct {
@@ -82,8 +93,8 @@ func newUpstream(t *testing.T, handle http.HandlerFunc) *upstream {
 	return stub
 }
 
-// newTLSUpstream starts an https stub on 127.0.0.1, for exercising the built-in
-// default route without leaving the machine.
+// newTLSUpstream starts an https stub on 127.0.0.1, for exercising an Anthropic
+// default Seat without leaving the machine.
 func newTLSUpstream(t *testing.T, handle http.HandlerFunc) *upstream {
 	t.Helper()
 
@@ -120,7 +131,7 @@ func (u *upstream) wrap(t *testing.T, handle http.HandlerFunc) http.Handler {
 	})
 }
 
-// url returns the stub's base URL, suitable for a route's base_url.
+// url returns the stub's base URL, suitable for a Seat's upstream.
 func (u *upstream) url() string {
 	return u.server.URL
 }
@@ -196,24 +207,56 @@ func boundaries(body string, splits []int) []int {
 	return append(offsets, len(body))
 }
 
-// newRegistry writes a registry file holding the given route entries in the
-// personal context and returns a Registry reading it.
-func newRegistry(t *testing.T, routes string) *registry.Registry {
+// newRegistry writes global Seats for the selector-keyed fixture entries and
+// binds them in the personal Context.
+func newRegistry(t *testing.T, entries string) *registry.Registry {
 	t.Helper()
 
-	return newContextRegistry(t, `"personal":{"routes":{`+routes+`}}`)
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(`{`+entries+`}`), &parsed); err != nil {
+		t.Fatalf("decode seat fixtures: %v", err)
+	}
+	selectors := make([]string, 0, len(parsed))
+	for selector := range parsed {
+		selectors = append(selectors, selector)
+	}
+	sort.Strings(selectors)
+	seats := map[string]json.RawMessage{
+		"anthropic": json.RawMessage(
+			`{"upstream":"https://api.anthropic.com","auth_mode":"forward"}`,
+		),
+	}
+	models := make(map[string]string, len(parsed))
+	for index, selector := range selectors {
+		seatID := fmt.Sprintf("seat-%d", index)
+		seats[seatID] = parsed[selector]
+		models[selector] = seatID
+	}
+	doc := map[string]any{
+		"default_context": "personal",
+		"seats":           seats,
+		"contexts": map[string]any{
+			"personal": map[string]any{"default_seat": "anthropic", "models": models},
+		},
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("encode registry fixture: %v", err)
+	}
+	return newRegistryDocument(t, body)
 }
 
-// newContextRegistry writes a registry file holding whole context entries.
-func newContextRegistry(t *testing.T, contexts string) *registry.Registry {
+func newRegistryDocument(t *testing.T, body []byte) *registry.Registry {
 	t.Helper()
-
 	path := filepath.Join(t.TempDir(), "registry.json")
-	if err := os.WriteFile(path, []byte(`{"contexts":{`+contexts+`}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatalf("write registry: %v", err)
 	}
-
-	return registry.New(path)
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatalf("load registry: %v\n%s", err, body)
+	}
+	return reg
 }
 
 // inContext returns req routed as if the HTTP surface had stripped a
@@ -224,14 +267,23 @@ func inContext(req *http.Request, name string) *http.Request {
 		registry.Selection{Name: name, Explicit: true}))
 }
 
-// identityRoute is an inject route with no rewrite of any kind: the identity
+// identitySeat is an inject Seat with no rewrite of any kind: the identity
 // case D2 protects, pointed at a local stub.
-func identityRoute(baseURL string) string {
-	return fmt.Sprintf(`%q:{"base_url":%q,"auth":"inject","api_key_env_file":%q}`,
-		echoAlias, baseURL, keyEnvName)
+func identitySeat(baseURL string) string {
+	return billedSeat(baseURL, "metered")
 }
 
-// writeKeyFile provisions an inject route's server-side secrets: it points the
+// billedSeat is identitySeat declaring a named billing class. An inject Seat
+// spends an operator key, so the registry admits one only when it says who
+// pays; a test that cares which class that is names it here rather than
+// splicing a second "billing" key onto a fixture that already has one.
+func billedSeat(baseURL, class string) string {
+	return fmt.Sprintf(
+		`%q:{"upstream":%q,"auth_mode":"inject","api_key_env_file":%q,"billing":%q}`,
+		echoSelector, baseURL, keyEnvName, class)
+}
+
+// writeKeyFile provisions an inject Seat's server-side secrets: it points the
 // upstream key environment variable at a file holding key (returning that path)
 // and, so a request carrying the canonical X-Patchbay-Key is accepted, also
 // provisions a valid caller key file. A test that needs a bad or absent caller
@@ -267,7 +319,7 @@ func writeCallerKeyFile(t *testing.T) string {
 }
 
 // anthropicClient returns a client whose every connection lands on srv, so a
-// request to the default route's https://api.anthropic.com never leaves the
+// request to the default Seat's https://api.anthropic.com never leaves the
 // machine.
 func anthropicClient(t *testing.T, stub *upstream) *http.Client {
 	t.Helper()
@@ -443,7 +495,7 @@ func serve(t *testing.T, cfg proxy.Config, req *http.Request) *httptest.Response
 
 // messagesRequest builds an inbound /v1/messages request carrying body. It
 // presents the canonical caller secret in X-Patchbay-Key, matching the file
-// writeKeyFile provisions, so an inject route accepts it.
+// writeKeyFile provisions, so an inject Seat accepts it.
 func messagesRequest(body string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
 	req.Header.Set("Content-Type", jsonType)
@@ -472,14 +524,14 @@ func hash(data []byte) string {
 	return fmt.Sprintf("%x", sum)
 }
 
-// resolveRoute resolves model the way a bare, unprefixed request does.
-func resolveRoute(t *testing.T, reg *registry.Registry, model string) registry.Route {
+// resolveSeat resolves model the way a bare, unprefixed request does.
+func resolveSeat(t *testing.T, reg *registry.Registry, model string) registry.Seat {
 	t.Helper()
 
-	res, err := reg.Resolve(registry.Selection{}, model)
+	res, err := reg.Resolve(registry.Selection{}, model, nil)
 	if err != nil {
 		t.Fatalf("Resolve(%q) = %v; want no error", model, err)
 	}
 
-	return res.Route
+	return res.Seat
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -14,8 +13,18 @@ import (
 
 	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/server"
+	"github.com/joshsymonds/patchbay/internal/testlog"
 	"github.com/joshsymonds/patchbay/internal/usage"
 )
+
+// usageRegistry is a valid seat registry for the usage endpoint's own tests.
+// Nothing here resolves a Seat — the summary is served from the accounting
+// store, not the registry — but the surface refuses to answer at all behind an
+// invalid one, so the registry has to be real.
+const usageRegistry = `{"default_context":"personal","seats":{` +
+	`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"}},` +
+	`"contexts":{"personal":{"default_seat":"anthropic","models":{}},` +
+	`"work":{"default_seat":"anthropic","models":{}}}}`
 
 const usageSummaryPath = "/_patchbay/usage/summary"
 
@@ -69,7 +78,7 @@ func TestUsageSummaryAnswersAuthenticatedRequests(t *testing.T) {
 	proxy := newSentinel()
 	rec := serve(t, server.Config{
 		Proxy:    proxy,
-		Registry: newRegistry(t, lunaRoute),
+		Registry: newRegistryDocument(t, usageRegistry),
 		Usage:    service,
 	}, usageRequest(http.MethodGet, usageSummaryPath+"?since="+start.Format(time.RFC3339)+"&until="+end.Format(time.RFC3339)+"&context=work", callerKey))
 
@@ -112,7 +121,7 @@ func TestUsageSummaryRefusesMissingOrBadCallerKey(t *testing.T) {
 				t,
 				server.Config{
 					Proxy:    newSentinel(),
-					Registry: newRegistry(t, lunaRoute),
+					Registry: newRegistryDocument(t, usageRegistry),
 					Usage:    service,
 				},
 				usageRequest(
@@ -143,7 +152,7 @@ func TestUsageSummaryFailsWhenCallerKeyIsUnavailable(t *testing.T) {
 		t,
 		server.Config{
 			Proxy:    newSentinel(),
-			Registry: newRegistry(t, lunaRoute),
+			Registry: newRegistryDocument(t, usageRegistry),
 			Usage:    service,
 		},
 		usageRequest(
@@ -212,7 +221,7 @@ func TestUsageSummaryAuthFailuresMatchRegistry(t *testing.T) {
 			tc.setup(t)
 			cfg := server.Config{
 				Proxy:    newSentinel(),
-				Registry: newRegistry(t, lunaRoute),
+				Registry: newRegistryDocument(t, usageRegistry),
 				Usage:    &summaryService{},
 			}
 			registryResponse := serve(t, cfg, usageRequest(tc.method, introspectPath+query, tc.key))
@@ -253,6 +262,10 @@ func TestUsageSummaryRejectsInvalidQuery(t *testing.T) {
 		usageSummaryPath + "?since=2026-08-20T12:00:00Z&until=wrong",
 		usageSummaryPath + "?since=2026-08-20T13:00:00Z&until=2026-08-20T12:00:00Z",
 		usageSummaryPath + "?since=2026-08-20T12:00:00Z&until=2026-08-20T13:00:00Z&context=Work",
+		// A leading dash is a name the registry's ID grammar refuses, so the
+		// summary filter refuses it too: the query names a Context the current
+		// registry could produce, or it never reaches the store.
+		usageSummaryPath + "?since=2026-08-20T12:00:00Z&until=2026-08-20T13:00:00Z&context=-work",
 	} {
 		t.Run(target, func(t *testing.T) {
 			service := &summaryService{}
@@ -260,7 +273,7 @@ func TestUsageSummaryRejectsInvalidQuery(t *testing.T) {
 				t,
 				server.Config{
 					Proxy:    newSentinel(),
-					Registry: newRegistry(t, lunaRoute),
+					Registry: newRegistryDocument(t, usageRegistry),
 					Usage:    service,
 				},
 				usageRequest(http.MethodGet, target, callerKey),
@@ -301,7 +314,7 @@ func TestUsageSummaryMethodsAndUnavailableStore(t *testing.T) {
 				t,
 				server.Config{
 					Proxy:    newSentinel(),
-					Registry: newRegistry(t, lunaRoute),
+					Registry: newRegistryDocument(t, usageRegistry),
 					Usage:    tc.usage,
 				},
 				usageRequest(tc.method, usageSummaryPath+query, callerKey),
@@ -329,12 +342,12 @@ func TestUsageSummaryMethodsAndUnavailableStore(t *testing.T) {
 func TestUsageSummaryReportsStoreFailureWithoutLeakingIt(t *testing.T) {
 	callerKeyFile(t)
 	storeErr := errors.New("SQLite diagnostic that callers must not see")
-	logs := newLogSink()
+	logs := testlog.New(callBuffer)
 	rec := serve(t, server.Config{
 		Proxy:    newSentinel(),
-		Registry: newRegistry(t, lunaRoute),
+		Registry: newRegistryDocument(t, usageRegistry),
 		Usage:    &summaryService{err: storeErr},
-		Logger:   slog.New(logs),
+		Logger:   logs.Logger(),
 	}, usageRequest(http.MethodGet, usageSummaryPath+"?since=2026-08-20T12:00:00Z&until=2026-08-20T13:00:00Z", callerKey))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d; want %d", rec.Code, http.StatusInternalServerError)
@@ -342,5 +355,7 @@ func TestUsageSummaryReportsStoreFailureWithoutLeakingIt(t *testing.T) {
 	if strings.Contains(rec.Body.String(), storeErr.Error()) {
 		t.Fatalf("store error leaked to caller: %q", rec.Body)
 	}
-	logs.waitFor(t, "gateway error")
+	if len(logs.Matching("gateway error")) == 0 {
+		t.Fatalf("the store failure was never reported to the operator: %s", logs)
+	}
 }

@@ -5,13 +5,15 @@
 //
 // The gateway itself is configured entirely by environment, with no flags,
 // because deployment is declarative: the unit file is generated, not typed.
-// Everything it needs has a default that works on a machine where nothing has
-// been set up. The usage database, hostname, and socket are required to serve;
-// a registry or ledger failure leaves the built-in route available without them.
+// Runtime paths have deterministic defaults, while the strict registry must
+// already exist and validate before the process binds its listener. So must the
+// hostname, the usage database and the socket: accounting is the durable
+// evidence that upstream contact is allowed, so a machine that cannot account
+// does not serve. A ledger failure costs only the records.
 //
 // The subcommands are the other half. "patchbay serve" is the daemon; every
 // other subcommand answers a question an operator would otherwise answer by
-// reading JSON — which context a directory selects, which route a model rides,
+// reading JSON — which Context a directory selects, which Seat a model uses,
 // whether a registry file is valid. Serving is deliberately not the default: a
 // bare invocation is far more likely to be a mistyped subcommand than a request
 // to bind the port, and starting a second gateway on a typo is worse than
@@ -56,7 +58,8 @@ const (
 const (
 	cmdServe    = "serve"
 	cmdContexts = "contexts"
-	cmdRoutes   = "routes"
+	cmdSeats    = "seats"
+	cmdBindings = "bindings"
 	cmdResolve  = "resolve"
 	cmdProject  = "project"
 	cmdCheck    = "check"
@@ -71,8 +74,10 @@ const usageText = `usage: patchbay <command> [arguments]
 commands:
   serve                        run the gateway until it is signaled to stop
   contexts                     list every context the running gateway serves
-  routes [--ctx <name>]        list one context's aliases (default: personal)
-  resolve <context> <model>    show which route one request would ride
+  seats                        list global reusable Seats
+  bindings --ctx <name>        list one Context's public model bindings
+  resolve [--subagent] <context> <model>
+                               show the complete non-secret resolution
   project [dir]                show which context a directory's Claude Code settings select
   check [--registry <path>]    validate a registry file without asking the gateway
   usage snapshot <dest>        write a consistent SQLite usage database snapshot
@@ -81,7 +86,7 @@ commands:
 
   -h, --help                   print this text
 
-The contexts, routes, resolve, and project subcommands ask the running gateway,
+The contexts, seats, bindings, resolve, and project subcommands ask the running gateway,
 at $PATCHBAY_LISTEN (default ` + defaultListen + `), presenting the caller key
 named by $` + proxy.CallerKeyEnvFile + `. Usage snapshot and export operate
 directly on $PATCHBAY_USAGE_DB and need neither a running gateway nor a caller key.
@@ -129,6 +134,13 @@ const readHeaderTimeout = 10 * time.Second
 // shutdownTimeout bounds how long in-flight requests have to finish once a
 // signal arrives.
 const shutdownTimeout = 5 * time.Second
+
+// The ASCII control bytes an operational diagnostic escapes: everything below
+// the first printable byte, and DEL above the printable range.
+const (
+	firstPrintableByte = 0x20
+	deleteByte         = 0x7f
+)
 
 // lookupEnvFunc reads one environment variable, reporting whether it was set.
 // os.LookupEnv satisfies it; a test supplies its own.
@@ -198,8 +210,10 @@ func dispatch(ctx context.Context, args []string, invocation cli) int {
 		return invocation.serve(ctx)
 	case cmdContexts:
 		return invocation.contexts(ctx, rest)
-	case cmdRoutes:
-		return invocation.routes(ctx, rest)
+	case cmdSeats:
+		return invocation.seats(ctx, rest)
+	case cmdBindings:
+		return invocation.bindings(ctx, rest)
 	case cmdResolve:
 		return invocation.resolve(ctx, rest)
 	case cmdProject:
@@ -335,13 +349,52 @@ func isLedgerImportFile(name string) bool {
 
 // fail reports an operational failure on stderr, marked as patchbay's own.
 func (c cli) fail(err error) {
-	fmt.Fprintf(c.stderr, "patchbay: %v\n", err)
+	fmt.Fprintf(c.stderr, "patchbay: %s\n", escapeControls(err.Error()))
 }
 
 // noticef reports something an operator should see but that did not stop the
 // command. It goes to stderr so stdout stays a clean table.
 func (c cli) noticef(format string, args ...any) {
-	fmt.Fprintf(c.stderr, "patchbay: "+format+"\n", args...)
+	fmt.Fprintf(c.stderr, "patchbay: %s\n", escapeControls(fmt.Sprintf(format, args...)))
+}
+
+// escapeControls renders every ASCII control byte in text as a readable escape
+// and leaves every other byte exactly as it was.
+//
+// A diagnostic is prose, so it is not quoted the way a table cell or a
+// "key: value" field is — quoting patchbay's own sentence would make its words
+// look like something a file said. But the values inside that sentence are
+// still byte strings nobody vetted: a registry path, a listen address, the text
+// an upstream error carries. A newline in one written raw stops being part of
+// the message and becomes the end of it, and whatever followed reads as a
+// second diagnostic patchbay never issued. Escaping just the control bytes
+// keeps one diagnostic on one physical line while the prose around them stays
+// prose.
+//
+// The work is byte-wise rather than rune-wise because a path is a byte string.
+// A byte no rune starts is not an error to be replaced with U+FFFD here; it is
+// part of the filename, and an operator looking for that file needs to see it.
+func escapeControls(text string) string {
+	var escaped strings.Builder
+
+	escaped.Grow(len(text))
+
+	for index := range len(text) {
+		switch char := text[index]; {
+		case char == '\n':
+			escaped.WriteString(`\n`)
+		case char == '\r':
+			escaped.WriteString(`\r`)
+		case char == '\t':
+			escaped.WriteString(`\t`)
+		case char < firstPrintableByte || char == deleteByte:
+			fmt.Fprintf(&escaped, `\x%02x`, char)
+		default:
+			escaped.WriteByte(char)
+		}
+	}
+
+	return escaped.String()
 }
 
 // serve runs the gateway until the process is signaled to stop.
@@ -360,20 +413,28 @@ func (c cli) serve(ctx context.Context) int {
 	return exitOK
 }
 
-// serveGateway starts the gateway and serves until ctx is canceled. It returns an error
-// only for a failure that leaves nothing to serve: a configuration or hostname
-// that cannot be resolved, a usage database that cannot be opened, or a socket
-// that cannot be bound. A registry that will not parse costs the aliases, and a
-// ledger that will not open costs the records; accounting is the durable evidence that
-// upstream contact is allowed, so it is required before serving.
+// serveGateway validates the registry, opens the accounting store, binds the
+// listener, and serves until ctx is canceled. It returns an error only for a
+// failure that leaves nothing to serve: a configuration, registry or hostname
+// that cannot be resolved, a usage database or rate-card file that cannot be
+// loaded, or a socket that cannot be bound. Runtime registry reload failures
+// install a fail-closed sentinel; ledger failures drop records.
 //
 // client is the upstream HTTP client both halves of the gateway use. A nil
 // client means each package builds its own default, which is what production
 // passes; a test passes one that never leaves the machine.
-func serveGateway(ctx context.Context, lookupEnv lookupEnvFunc, logger *slog.Logger, client *http.Client) error {
+func serveGateway(
+	ctx context.Context,
+	lookupEnv lookupEnvFunc,
+	logger *slog.Logger,
+	client *http.Client,
+) error {
 	return serveGatewayWithHostname(ctx, lookupEnv, logger, client, os.Hostname)
 }
 
+// serveGatewayWithHostname is serveGateway with the machine's own name supplied
+// rather than asked for, so the one startup failure that cannot be provoked by
+// arranging files on disk is still reachable from a test.
 func serveGatewayWithHostname(
 	ctx context.Context,
 	lookupEnv lookupEnvFunc,
@@ -384,6 +445,11 @@ func serveGatewayWithHostname(
 	cfg, err := resolveConfig(lookupEnv)
 	if err != nil {
 		return err
+	}
+
+	reg, regErr := registry.New(cfg.registry)
+	if regErr != nil {
+		return fmt.Errorf("load registry: %w", regErr)
 	}
 
 	host, hostnameErr := lookupHostname()
@@ -414,7 +480,6 @@ func serveGatewayWithHostname(
 	defer closeUsage(ctx, usageStore, logger)
 
 	var listen net.ListenConfig
-
 	listener, listenErr := listen.Listen(ctx, "tcp", cfg.listen)
 	if listenErr != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.listen, listenErr)
@@ -425,12 +490,6 @@ func serveGatewayWithHostname(
 		slog.String("listen", listener.Addr().String()),
 		slog.String("registry", cfg.registry),
 		slog.String("ledger_dir", cfg.ledgerDir))
-
-	reg := registry.New(cfg.registry)
-	if regErr := reg.Err(); regErr != nil {
-		logger.ErrorContext(ctx, "registry file is broken; foreign aliases are unavailable",
-			slog.String("registry", cfg.registry), slog.Any("error", regErr))
-	}
 
 	// A nil *ledger.Ledger must never be handed over as a typed nil: the
 	// pipeline skips a Recorder that is nil, and panics on one that only looks
@@ -657,8 +716,8 @@ func valueOr(lookupEnv lookupEnvFunc, name, fallback string) string {
 }
 
 // openLedger prepares the ledger directory and opens it. A failure is reported
-// and returns no ledger: the gateway serves without records rather than not at
-// all, and the built-in default route never fails closed.
+// and returns no ledger: the gateway serves without records while registry and
+// Context failures remain fail closed.
 func openLedger(ctx context.Context, dir string, logger *slog.Logger) *ledger.Ledger {
 	if err := os.MkdirAll(dir, ledgerDirMode); err != nil {
 		logger.ErrorContext(ctx, "ledger unavailable; requests will not be recorded",
@@ -685,6 +744,9 @@ func closeLedger(ctx context.Context, led *ledger.Ledger, logger *slog.Logger) {
 	}
 }
 
+// closeUsageAfterRateCardError reports a rate-card failure with the store
+// already released. The store was opened moments earlier and nothing has been
+// deferred yet, so this is the one path that has to close it by hand.
 func closeUsageAfterRateCardError(store *usage.Store, path string, cause error) error {
 	cause = fmt.Errorf("load rate cards %s: %w", path, cause)
 	if err := store.Close(); err != nil {
@@ -703,7 +765,12 @@ func closeUsage(ctx context.Context, store *usage.Store, logger *slog.Logger) {
 // serve runs the HTTP server on listener until ctx is canceled, then gives
 // in-flight requests a bounded chance to finish. The shutdown deadline is its
 // own context: the one that just ended is in no position to bound anything.
-func serve(ctx context.Context, listener net.Listener, handler http.Handler, logger *slog.Logger) error {
+func serve(
+	ctx context.Context,
+	listener net.Listener,
+	handler http.Handler,
+	logger *slog.Logger,
+) error {
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: readHeaderTimeout}
 
 	failed := make(chan error, 1)

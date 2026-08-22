@@ -32,10 +32,10 @@ func TestDefaultClientRelaysARedirectRatherThanFollowingIt(t *testing.T) {
 	})
 
 	rec := serve(t, proxy.Config{
-		Registry: newRegistry(t, identityRoute(stub.url())),
+		Registry: newRegistry(t, identitySeat(stub.url())),
 		Client:   nil,
 		Host:     testHost,
-	}, messagesRequest(`{"model":"`+echoAlias+`"}`))
+	}, messagesRequest(`{"model":"`+echoSelector+`"}`))
 
 	if attacker.hits() != 0 {
 		t.Fatalf("the redirect target saw %d requests; want 0 — following one leaks the caller's credentials",

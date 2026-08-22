@@ -32,7 +32,10 @@ services:
       - ./caller.key:/etc/patchbay/caller.key:ro
       - ./openrouter.key:/etc/patchbay/openrouter.key:ro
       - ./chatgpt.key:/etc/patchbay/chatgpt.key:ro
-      - ledger:/var/lib/patchbay/ledger
+      # The whole state directory, not just the ledger under it: the accounting
+      # database lives beside the ledger and is the durable record of what was
+      # spent, so a container recreate must not take it with it.
+      - state:/var/lib/patchbay
 
   # The optional Codex-subscription upstream: CLIProxyAPI, translating
   # Anthropic Messages to the ChatGPT Codex OAuth backend. Upstream's own
@@ -49,5 +52,5 @@ services:
       - codex-auth:/root/.cli-proxy-api
 
 volumes:
-  ledger:
+  state:
   codex-auth:

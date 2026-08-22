@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/joshsymonds/patchbay/internal/billing"
+	"github.com/joshsymonds/patchbay/internal/ledger"
 )
 
 func writeLedger(t *testing.T, dir, name, contents string) string {
@@ -175,7 +179,8 @@ func TestImportLedgerFileBoundaryAndIdempotence(t *testing.T) {
 			Kind:            RequestOther,
 			Host:            "host",
 			Context:         "personal",
-			Route:           validPendingRequest().Route,
+			SeatID:          validPendingRequest().SeatID,
+			Seat:            validPendingRequest().Seat,
 			RequestModel:    "model",
 			CredentialClass: "oauth",
 		},
@@ -287,6 +292,623 @@ func TestImportLedgerFileRejectsMalformedLineWithFileAndLine(t *testing.T) {
 	if _, err := store.ImportLedgerFile(context.Background(), invalid, filepath.Base(invalid), 0); err == nil ||
 		!strings.Contains(err.Error(), invalid+":1") {
 		t.Fatalf("invalid record import error = %v; want %s:1", err, invalid)
+	}
+}
+
+// TestImportLedgerFileKeepsV1ReadLeniency pins the four ways a v1 line differs
+// from anything this build writes, and that each still imports.
+//
+// The live ledger is strict on purpose: it refuses an unknown member, requires
+// the context it stores to match today's ID grammar, and never omits a
+// credential class. Every one of those rules would reject real history. A v1
+// record predating attribution carries no credential class; one predating
+// contexts carries no context; v1's context grammar admitted a leading dash that
+// registry.ValidID now refuses; and a later writer may add Seat metadata to a
+// v1-named file. Import keeps both historical alias and current Seat fields,
+// preferring the Seat when present.
+func TestImportLedgerFileKeepsV1ReadLeniency(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+	dir := t.TempDir()
+	path := writeLedger(t, dir, "patchbay-2026-08-18.jsonl", strings.Join([]string{
+		`{"timestamp":"2026-08-18T12:00:00Z","host":"gnomon","context":"","credential_class":"","alias":"","upstream":"https://api.anthropic.com","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+		`{"timestamp":"2026-08-18T12:01:00Z","host":"gnomon","upstream":"https://api.anthropic.com","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+		`{"timestamp":"2026-08-18T12:02:00Z","host":"gnomon","context":"-legacy","credential_class":"oauth","alias":"opus","upstream":"https://api.anthropic.com","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+		`{"timestamp":"2026-08-18T12:03:00Z","host":"gnomon","context":"work","credential_class":"api_key","upstream":"https://api.anthropic.com","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[],"seat":"opus-seat","selection":{"kind":"model","model":"m"},"subagent":{"agent_id":"agent-1"},"config_source":"caller"}`,
+	}, "\n")+"\n")
+
+	result, err := store.ImportLedgerFile(context.Background(), path, filepath.Base(path), 0)
+	if err != nil {
+		t.Fatalf("ImportLedgerFile() error: %v", err)
+	}
+	if want := (ImportResult{Imported: 4}); result != want {
+		t.Fatalf("ImportLedgerFile() = %#v; want %#v", result, want)
+	}
+
+	rows, err := store.db.Query(
+		`SELECT route_context, credential_class, route_alias FROM accounting_requests ORDER BY import_line`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	type imported struct {
+		context, credential string
+		alias               sql.NullString
+	}
+	var got []imported
+	for rows.Next() {
+		var value imported
+		if err := rows.Scan(&value.context, &value.credential, &value.alias); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, value)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []imported{
+		{context: "", credential: ""},
+		{context: "", credential: ""},
+		{context: "-legacy", credential: "oauth", alias: sql.NullString{String: "opus", Valid: true}},
+		{context: "work", credential: "api_key", alias: sql.NullString{String: "opus-seat", Valid: true}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("imported v1 identities:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+// TestImportLedgerFileRejectsInvalidV1Records pins that leniency is not
+// permissiveness. Every rule v1 enforced is still enforced, and a line that
+// breaks one costs the whole file rather than being skipped: a ledger that
+// cannot be read whole is corruption, and importing only its readable part
+// would silently understate what was spent.
+func TestImportLedgerFileRejectsInvalidV1Records(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		line         string
+		wantContains string
+	}{
+		{
+			name:         "missing host",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","upstream":"u","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "host must not be empty",
+		},
+		{
+			name:         "whitespace upstream",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":" \t","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "upstream must not be empty",
+		},
+		{
+			name:         "missing model",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":"u","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "model must not be empty",
+		},
+		{
+			name:         "null model",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":"u","model":null,"request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "model must not be empty",
+		},
+		{
+			name:         "missing request model",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":"u","model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "request_model must not be empty",
+		},
+		{
+			name:         "missing auth mode",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":"u","model":"m","request_model":"m","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "invalid auth_mode",
+		},
+		{
+			name:         "credential class outside the vocabulary",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","credential_class":"bearer","upstream":"u","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "invalid credential_class",
+		},
+		{
+			name:         "context outside the v1 grammar",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","context":"Work/Dev","upstream":"u","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "invalid context",
+		},
+		{
+			name:         "missing timestamp",
+			line:         `{"host":"h","upstream":"u","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "timestamp must not be zero",
+		},
+		{
+			name:         "negative status",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":"u","model":"m","request_model":"m","auth_mode":"forward","status":-1,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "status must not be negative",
+		},
+		{
+			name:         "negative output tokens",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":"u","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":-2,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "token counts must not be negative",
+		},
+		{
+			name:         "negative upstream duration",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":"u","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":-3,"block_shape":[]}`,
+			wantContains: "durations must not be negative",
+		},
+		{
+			name:         "token count is not a number",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":"u","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":"ten","output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+			wantContains: "parse JSON",
+		},
+		{
+			name:         "trailing garbage after the record",
+			line:         `{"timestamp":"2026-08-18T12:00:00Z","host":"h","upstream":"u","model":"m","request_model":"m","auth_mode":"forward","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]} oops`,
+			wantContains: "parse JSON",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+			path := writeLedger(t, t.TempDir(), "patchbay-2026-08-18.jsonl", test.line+"\n")
+			result, err := store.ImportLedgerFile(
+				context.Background(),
+				path,
+				filepath.Base(path),
+				0,
+			)
+			if err == nil {
+				t.Fatalf("ImportLedgerFile() = %#v, nil; want refusal", result)
+			}
+			if !strings.Contains(err.Error(), path+":1") {
+				t.Fatalf("error = %v; want it to name %s:1", err, path)
+			}
+			if !strings.Contains(err.Error(), test.wantContains) {
+				t.Fatalf("error = %v; want it to contain %q", err, test.wantContains)
+			}
+			if count := countStoredRequests(t, store.db); count != 0 {
+				t.Fatalf("rows after refused file = %d; want none", count)
+			}
+		})
+	}
+}
+
+// v2Encoded renders a record exactly as the live ledger would write it, so a
+// fixture can never drift from the shape the writer actually produces.
+func v2Encoded(t *testing.T, record ledger.Record) string {
+	t.Helper()
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("encode v2 ledger record: %v", err)
+	}
+	return string(encoded)
+}
+
+// v2Line is the same, for a record that must also be one the ledger would have
+// accepted. A fixture that fails its own validation is testing nothing.
+func v2Line(t *testing.T, record ledger.Record) string {
+	t.Helper()
+	if err := record.Validate(); err != nil {
+		t.Fatalf("v2 fixture is not a valid ledger record: %v", err)
+	}
+	return v2Encoded(t, record)
+}
+
+type importedIdentity struct {
+	contextName, requestModel, resolvedModel, authMode, credential string
+	policy, kind, outcome, costStatus                              string
+	alias, class, basis                                            sql.NullString
+	upstream                                                       string
+	contacted                                                      int64
+	dispatched, finalCost                                          sql.NullInt64
+}
+
+func readImportedIdentities(t *testing.T, db *sql.DB) []importedIdentity {
+	t.Helper()
+
+	rows, err := db.Query(`SELECT route_context, route_alias, route_upstream, request_model,
+		resolved_model, auth_mode, credential_class, billing_policy, billing_class, request_kind,
+		outcome, upstream_contacted, upstream_dispatched_at, cost_status, cost_basis,
+		final_cost_nano_usd FROM accounting_requests ORDER BY import_line`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []importedIdentity
+	for rows.Next() {
+		var value importedIdentity
+		if err := rows.Scan(
+			&value.contextName,
+			&value.alias,
+			&value.upstream,
+			&value.requestModel,
+			&value.resolvedModel,
+			&value.authMode,
+			&value.credential,
+			&value.policy,
+			&value.class,
+			&value.kind,
+			&value.outcome,
+			&value.contacted,
+			&value.dispatched,
+			&value.costStatus,
+			&value.basis,
+			&value.finalCost,
+		); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, value)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// TestImportLedgerFileImportsV2Shapes pins the mapping from the live ledger's
+// three record shapes onto the accounting row.
+//
+// The Seat is the thing that must survive: it is the name an operator reads a
+// cost back by, and it lands in the same column v1 aliases occupy. A
+// pre-selection record has no Seat to carry, and the row says so with a NULL
+// rather than with an invented name — and says nothing about who paid, because
+// a request that reached no Seat spent nobody's money.
+func TestImportLedgerFileImportsV2Shapes(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	requested := "claude-opus-5"
+	rewritten := "claude-opus-5-20260101"
+
+	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+	path := writeLedger(t, t.TempDir(), "patchbay-v2-2026-08-20.jsonl", strings.Join([]string{
+		v2Line(t, ledger.Record{
+			Timestamp:       base,
+			Host:            "gnomon",
+			Context:         "personal",
+			Selection:       &ledger.Selection{Kind: ledger.SelectionModel, Model: &requested},
+			Seat:            "opus",
+			Upstream:        "https://api.anthropic.com",
+			Model:           &rewritten,
+			RequestModel:    &requested,
+			AuthMode:        "forward",
+			CredentialClass: billing.CredentialOAuth,
+			ConfigSource:    "caller",
+			Status:          200,
+			InputTokens:     10,
+			OutputTokens:    2,
+			DurationMS:      50,
+			UpstreamMS:      30,
+			BlockShape:      []string{"text"},
+			StopReason:      "end_turn",
+		}),
+		// A default selection with neither model present: the Context bound no
+		// rewrite and the caller named nothing.
+		v2Line(t, ledger.Record{
+			Timestamp:       base.Add(time.Minute),
+			Host:            "gnomon",
+			Context:         "work",
+			Selection:       &ledger.Selection{Kind: ledger.SelectionDefault},
+			Seat:            "bedrock",
+			Upstream:        "https://bedrock-runtime.us-west-2.amazonaws.com",
+			AuthMode:        "sigv4",
+			CredentialClass: billing.CredentialNone,
+			ConfigSource:    "aws_profile:default",
+			Status:          200,
+			DurationMS:      20,
+			UpstreamMS:      10,
+			BlockShape:      []string{},
+		}),
+		// A pre-selection record: the caller named a Context no registry could
+		// produce, so nothing was selected and nothing was contacted.
+		v2Line(t, ledger.Record{
+			Timestamp:       base.Add(2 * time.Minute),
+			Host:            "gnomon",
+			Context:         "Nope",
+			RequestModel:    &requested,
+			CredentialClass: billing.CredentialOAuth,
+			Status:          404,
+			DurationMS:      5,
+			BlockShape:      []string{},
+		}),
+	}, "\n")+"\n")
+
+	result, err := store.ImportLedgerFile(context.Background(), path, filepath.Base(path), 0)
+	if err != nil {
+		t.Fatalf("ImportLedgerFile() error: %v", err)
+	}
+	if want := (ImportResult{Imported: 3}); result != want {
+		t.Fatalf("ImportLedgerFile() = %#v; want %#v", result, want)
+	}
+
+	started := base.UnixNano()
+	defaultStarted := base.Add(time.Minute).UnixNano()
+	want := []importedIdentity{
+		{
+			contextName:   "personal",
+			alias:         sql.NullString{String: "opus", Valid: true},
+			upstream:      "https://api.anthropic.com",
+			requestModel:  "claude-opus-5",
+			resolvedModel: "claude-opus-5-20260101",
+			authMode:      "forward",
+			credential:    "oauth",
+			policy:        "credential_derived",
+			class:         sql.NullString{String: "subscription", Valid: true},
+			kind:          "messages",
+			outcome:       "success",
+			contacted:     1,
+			dispatched:    sql.NullInt64{Int64: started + 20_000_000, Valid: true},
+			costStatus:    "known",
+			basis:         sql.NullString{String: "zero_marginal", Valid: true},
+			finalCost:     sql.NullInt64{Int64: 0, Valid: true},
+		},
+		{
+			contextName:   "work",
+			alias:         sql.NullString{String: "bedrock", Valid: true},
+			upstream:      "https://bedrock-runtime.us-west-2.amazonaws.com",
+			requestModel:  "",
+			resolvedModel: "",
+			authMode:      "sigv4",
+			credential:    "none",
+			policy:        "sigv4_metered",
+			class:         sql.NullString{String: "metered", Valid: true},
+			kind:          "other",
+			outcome:       "success",
+			contacted:     1,
+			dispatched:    sql.NullInt64{Int64: defaultStarted + 10_000_000, Valid: true},
+			costStatus:    "unknown",
+			basis:         sql.NullString{String: "unknown", Valid: true},
+		},
+		{
+			contextName:   "Nope",
+			requestModel:  "claude-opus-5",
+			resolvedModel: "",
+			authMode:      "",
+			credential:    "oauth",
+			policy:        "",
+			kind:          "other",
+			outcome:       "local_rejection",
+			contacted:     0,
+			costStatus:    "unknown",
+			basis:         sql.NullString{String: "unknown", Valid: true},
+		},
+	}
+	if got := readImportedIdentities(t, store.db); !reflect.DeepEqual(got, want) {
+		t.Fatalf("imported v2 rows:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestImportLedgerFileV2ToleratesUnknownFieldsAndPrefersSeat(t *testing.T) {
+	t.Parallel()
+
+	model := "model"
+	record := ledger.Record{
+		Timestamp:       time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC),
+		Host:            "h",
+		Context:         "personal",
+		Selection:       &ledger.Selection{Kind: ledger.SelectionDefault},
+		Seat:            "current-seat",
+		Upstream:        "https://api.anthropic.com",
+		Model:           &model,
+		RequestModel:    &model,
+		AuthMode:        "forward",
+		CredentialClass: billing.CredentialOAuth,
+		ConfigSource:    "caller",
+		Status:          200,
+		BlockShape:      []string{},
+	}
+	line := v2Line(t, record)
+	line = strings.Replace(
+		line,
+		`"host":"h"`,
+		`"host":"h","alias":"legacy-alias","future_field":{"kept":"opaque"}`,
+		1,
+	)
+	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+	path := writeLedger(t, t.TempDir(), "patchbay-v2-2026-08-20.jsonl", line+"\n")
+	if result, err := store.ImportLedgerFile(
+		context.Background(),
+		path,
+		filepath.Base(path),
+		0,
+	); err != nil || result != (ImportResult{Imported: 1}) {
+		t.Fatalf("ImportLedgerFile() = %#v, %v; want one imported row", result, err)
+	}
+	got := readImportedIdentities(t, store.db)
+	if len(got) != 1 || got[0].alias != (sql.NullString{String: "current-seat", Valid: true}) {
+		t.Fatalf("imported identity = %#v; want current Seat to win over legacy alias", got)
+	}
+}
+
+// TestImportLedgerFileChoosesDecoderByFileName pins that the file's own name
+// decides which validation rules apply to the lenient union decode.
+func TestImportLedgerFileChoosesDecoderByFileName(t *testing.T) {
+	t.Parallel()
+
+	v1Line := `{"timestamp":"2026-08-20T12:00:00Z","host":"h","alias":"opus","upstream":"u","model":"m","request_model":"m","auth_mode":"inject","status":200,"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`
+
+	tests := []struct {
+		name         string
+		fileName     string
+		line         func(*testing.T) string
+		wantContains string
+	}{
+		{
+			name:     "v1 contents under a v2 name",
+			fileName: "patchbay-v2-2026-08-20.jsonl",
+			line: func(t *testing.T) string {
+				t.Helper()
+
+				return v1Line
+			},
+			// The union decoder retains alias, but v2 validation still refuses the
+			// missing credential attribution before considering routing fields.
+			wantContains: "invalid credential_class",
+		},
+		{
+			name:     "v2 contents under a v1 name",
+			fileName: "patchbay-2026-08-20.jsonl",
+			line: func(t *testing.T) string {
+				t.Helper()
+
+				return v2Line(t, ledger.Record{
+					Timestamp:       time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC),
+					Host:            "h",
+					Context:         "personal",
+					Selection:       &ledger.Selection{Kind: ledger.SelectionDefault},
+					Seat:            "anthropic",
+					Upstream:        "https://api.anthropic.com",
+					AuthMode:        "forward",
+					CredentialClass: billing.CredentialOAuth,
+					ConfigSource:    "caller",
+					Status:          200,
+					BlockShape:      []string{},
+				})
+			},
+			wantContains: "model must not be empty",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+			path := writeLedger(t, t.TempDir(), test.fileName, test.line(t)+"\n")
+			_, err := store.ImportLedgerFile(context.Background(), path, filepath.Base(path), 0)
+			if err == nil {
+				t.Fatal("ImportLedgerFile() = nil; want refusal")
+			}
+			if !strings.Contains(err.Error(), path+":1") ||
+				!strings.Contains(err.Error(), test.wantContains) {
+				t.Fatalf("error = %v; want %s:1 and %q", err, path, test.wantContains)
+			}
+			if count := countStoredRequests(t, store.db); count != 0 {
+				t.Fatalf("rows after refused file = %d; want none", count)
+			}
+		})
+	}
+
+	t.Run("name claims no schema", func(t *testing.T) {
+		t.Parallel()
+
+		store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+		path := writeLedger(t, t.TempDir(), "ledger.jsonl", v1Line+"\n")
+		_, err := store.ImportLedgerFile(context.Background(), path, filepath.Base(path), 0)
+		if err == nil || !strings.Contains(err.Error(), "names no known ledger schema") {
+			t.Fatalf("error = %v; want a refusal naming the unknown schema", err)
+		}
+		if count := countStoredRequests(t, store.db); count != 0 {
+			t.Fatalf("rows after refused file = %d; want none", count)
+		}
+	})
+}
+
+// TestImportLedgerFileRejectsInvalidV2Records pins that a v2 file is read under
+// the live ledger's own rules, not a looser import-only copy of them.
+func TestImportLedgerFileRejectsInvalidV2Records(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	seated := func() ledger.Record {
+		return ledger.Record{
+			Timestamp:       base,
+			Host:            "h",
+			Context:         "personal",
+			Selection:       &ledger.Selection{Kind: ledger.SelectionDefault},
+			Seat:            "anthropic",
+			Upstream:        "https://api.anthropic.com",
+			AuthMode:        "forward",
+			CredentialClass: billing.CredentialOAuth,
+			ConfigSource:    "caller",
+			Status:          200,
+			BlockShape:      []string{},
+		}
+	}
+
+	tests := []struct {
+		name         string
+		line         func(*testing.T) string
+		wantContains string
+	}{
+		{
+			name: "duplicate member name",
+			line: func(t *testing.T) string {
+				t.Helper()
+
+				encoded := v2Encoded(t, seated())
+				return strings.Replace(encoded, `"host":"h"`, `"host":"h","host":"other"`, 1)
+			},
+			wantContains: "parse JSON",
+		},
+		{
+			name: "seat no registry could have admitted",
+			line: func(t *testing.T) string {
+				t.Helper()
+
+				record := seated()
+				record.Seat = "Anthropic"
+				return v2Encoded(t, record)
+			},
+			wantContains: "invalid seat",
+		},
+		{
+			name: "selection kind outside the vocabulary",
+			line: func(t *testing.T) string {
+				t.Helper()
+
+				record := seated()
+				record.Selection = &ledger.Selection{Kind: "guessed"}
+				return v2Encoded(t, record)
+			},
+			wantContains: "invalid selection kind",
+		},
+		{
+			name: "pre-selection record carrying a seat",
+			line: func(t *testing.T) string {
+				t.Helper()
+
+				record := seated()
+				record.Selection = nil
+				return v2Encoded(t, record)
+			},
+			wantContains: "must omit selection-dependent fields",
+		},
+		{
+			name: "drop signature disagreeing with block shape",
+			line: func(t *testing.T) string {
+				t.Helper()
+
+				record := seated()
+				record.DropSignature = true
+				return v2Encoded(t, record)
+			},
+			wantContains: "drop_signature",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+			path := writeLedger(
+				t,
+				t.TempDir(),
+				"patchbay-v2-2026-08-20.jsonl",
+				test.line(t)+"\n",
+			)
+			_, err := store.ImportLedgerFile(context.Background(), path, filepath.Base(path), 0)
+			if err == nil {
+				t.Fatal("ImportLedgerFile() = nil; want refusal")
+			}
+			if !strings.Contains(err.Error(), path+":1") ||
+				!strings.Contains(err.Error(), test.wantContains) {
+				t.Fatalf("error = %v; want %s:1 and %q", err, path, test.wantContains)
+			}
+			if count := countStoredRequests(t, store.db); count != 0 {
+				t.Fatalf("rows after refused file = %d; want none", count)
+			}
+		})
 	}
 }
 

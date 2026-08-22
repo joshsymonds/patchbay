@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/joshsymonds/patchbay/internal/registry"
@@ -15,8 +16,11 @@ import (
 // it, and after a bad edit there may be nothing running to ask.
 func (c cli) check(args []string) int {
 	flags := c.flagSet(cmdCheck)
-	path := flags.String("registry", "",
-		"the registry file to validate (default: $"+envRegistry+", or the path the gateway would use)")
+	path := flags.String(
+		"registry",
+		"",
+		"the registry file to validate (default: $"+envRegistry+", or the path the gateway would use)",
+	)
 
 	if err := flags.Parse(args); err != nil {
 		return exitUsage
@@ -41,32 +45,63 @@ func (c cli) check(args []string) int {
 		return exitFailure
 	}
 
-	reg := registry.New(target)
-	if regErr := reg.Err(); regErr != nil {
+	reg, regErr := registry.New(target)
+	if regErr != nil {
 		c.fail(regErr)
+		return exitFailure
+	}
+
+	return c.reportCheck(target, reg)
+}
+
+// reportCheck renders the verdict for a registry that has already been opened.
+//
+// Opening the file and summarizing it are two reads of the same path, and a
+// home-manager generation can swap it between them. Summarized through a second
+// read of its own, a replacement the gateway will refuse is reported as the
+// empty document it is not — "0 seats, 0 contexts", exit 0 — because a
+// fail-closed snapshot answers with no summary at all and nothing here asked
+// whether it was valid. So the summary comes from one atomic inspection: a
+// registry that no longer validates is refused with the field and the value
+// behind it, and only an inspection that came back valid renders counts.
+func (c cli) reportCheck(target string, reg *registry.Registry) int {
+	state, inspectErr := reg.Inspect()
+	if inspectErr != nil {
+		c.fail(inspectErr)
+
+		return exitFailure
+	}
+	if !state.Valid {
+		c.fail(fmt.Errorf("registry %s: %s", quoted(target), state.Error))
 
 		return exitFailure
 	}
 
-	contexts, _ := reg.Contexts()
-
-	names := make([]string, 0, len(contexts))
-	routes := 0
-
-	for _, res := range contexts {
-		names = append(names, res.Context)
-		routes += len(res.Aliases())
+	names := make([]string, 0, len(state.Contexts))
+	bindings := 0
+	for name, ctx := range state.Contexts {
+		names = append(names, name)
+		bindings += len(ctx.Models)
 	}
-
-	fmt.Fprintf(c.stdout, "OK %s: %s (%s), %s\n",
-		target, count(len(names), "context", "contexts"), strings.Join(names, ", "),
-		count(routes, "route", "routes"))
+	slices.Sort(names)
+	fmt.Fprintf(
+		c.stdout,
+		"OK %s: %s, %s (%s), %s\n",
+		quoted(target),
+		count(
+			len(state.Seats),
+			"seat",
+			"seats",
+		),
+		count(len(names), "context", "contexts"),
+		strings.Join(names, ", "),
+		count(bindings, "binding", "bindings"),
+	)
 
 	return exitOK
 }
 
-// count renders a quantity with the right noun, so a valid registry with one
-// route does not report "1 routes".
+// count renders a quantity with the right singular or plural noun.
 func count(n int, singular, plural string) string {
 	if n == 1 {
 		return "1 " + singular

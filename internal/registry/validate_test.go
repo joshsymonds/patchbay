@@ -7,1152 +7,1036 @@ import (
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
-// siblingRoute is a valid route that shares every fixture file. A file-level
-// validation failure must take it down too: validation is whole-file.
-const siblingRoute = `"sibling-ok":{"base_url":"https://openrouter.ai/api",` +
-	`"model":"openai/gpt-5.6-luna","auth":"inject","api_key_env_file":"OPENROUTER_API_KEY_FILE"}`
-
-// fixture wraps one route under alias next to the always-valid sibling, in the
-// personal context.
-func fixture(alias, route string) string {
-	return personalDoc(siblingRoute + `,"` + alias + `":` + route)
-}
-
-// assertErrMentions fails unless err is non-nil and names every want fragment.
-func assertErrMentions(t *testing.T, err error, wants []string) {
-	t.Helper()
-
-	if err == nil {
-		t.Fatalf("Err() = nil; want an error mentioning %q", wants)
-	}
-
-	for _, want := range wants {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Err() = %q; want it to mention %q", err.Error(), want)
-		}
-	}
-}
-
-// assertErrOmits fails when err exposes any forbidden fragment.
-func assertErrOmits(t *testing.T, err error, forbids []string) {
-	t.Helper()
-
-	for _, forbid := range forbids {
-		if strings.Contains(err.Error(), forbid) {
-			t.Errorf("Err() = %q; must not mention %q", err.Error(), forbid)
-		}
-	}
-}
-
-// assertRejected checks the fail-closed contract: the whole file is discarded,
-// both aliases fall through to the default route, and Err explains why.
-func assertRejected(t *testing.T, body, alias string, wants []string) error {
-	t.Helper()
-
-	reg := newRegistry(t, body)
-
-	assertDefault(t, reg, alias)
-	assertDefault(t, reg, "sibling-ok")
-	err := reg.Err()
-	assertErrMentions(t, err, wants)
-	return err
-}
-
-// assertAccepted checks the file loads and alias resolves to its own route.
-func assertAccepted(t *testing.T, body, alias string) {
-	t.Helper()
-
-	reg := newRegistry(t, body)
-
-	if err := reg.Err(); err != nil {
-		t.Fatalf("Err() = %v; want nil for a valid registry", err)
-	}
-
-	if got := bare(t, reg, alias).Alias; got != alias {
-		t.Fatalf("Resolve(%q) returned alias %q; want the aliased route", alias, got)
-	}
-
-	if got := bare(t, reg, "sibling-ok").Alias; got != "sibling-ok" {
-		t.Fatalf("Resolve(%q) returned alias %q; want the sibling route", "sibling-ok", got)
-	}
-}
-
-// validationCase is one route object judged against the whole-file rules.
-type validationCase struct {
-	name    string
-	alias   string
-	route   string
-	wants   []string // error fragments; empty means the route must be accepted
-	forbids []string // sensitive fragments that must not appear in the error
-}
-
-func runValidationCases(t *testing.T, tests []validationCase) {
-	t.Helper()
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			body := fixture(tc.alias, tc.route)
-			if len(tc.wants) == 0 {
-				assertAccepted(t, body, tc.alias)
-
-				return
-			}
-
-			err := assertRejected(t, body, tc.alias, tc.wants)
-			assertErrOmits(t, err, tc.forbids)
-		})
-	}
-}
-
-// Rule 1: auth must be "forward" or "inject".
-func TestValidateAuthMode(t *testing.T) {
+func TestStrictNewGrammarAndLegacyRejection(t *testing.T) {
 	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "unknown mode rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com","auth":"bearer"}`,
-			wants: []string{`"probe"`, "auth", "bearer"},
-		},
-		{
-			name:  "missing auth rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com"}`,
-			wants: []string{`"probe"`, "auth"},
-		},
-		{
-			name:  "mixed case rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com","auth":"Forward"}`,
-			wants: []string{`"probe"`, "auth"},
-		},
-		{
-			name:  "forward accepted",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com","auth":"forward"}`,
-		},
-		{
-			name:  "inject accepted",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-		},
-	})
-}
-
-// Rule 2 (D1): a forward route carries the caller's own bearer token, so it may
-// only ever point at Anthropic.
-func TestValidateForwardBaseURLIsAnthropicOnly(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:    "foreign host rejected",
-			alias:   "probe",
-			route:   `{"base_url":"https://evil.example","auth":"forward"}`,
-			wants:   []string{`"probe"`, "forward", "base_url", "https://api.anthropic.com"},
-			forbids: []string{"https://evil.example"},
-		},
-		{
-			name:  "trailing slash rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com/","auth":"forward"}`,
-			wants: []string{`"probe"`, "forward", "base_url"},
-		},
-		{
-			name:  "path suffix rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com/v1","auth":"forward"}`,
-			wants: []string{`"probe"`, "forward", "base_url"},
-		},
-		{
-			name:  "lookalike subdomain rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com.evil.example","auth":"forward"}`,
-			wants: []string{`"probe"`, "forward", "base_url"},
-		},
-		{
-			name:  "localhost rejected for forward",
-			alias: "probe",
-			route: `{"base_url":"http://127.0.0.1:8080","auth":"forward"}`,
-			wants: []string{`"probe"`, "forward", "base_url"},
-		},
-		{
-			name:  "exact anthropic base accepted",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com","auth":"forward"}`,
-		},
-	})
-}
-
-// Rule 3 (D4): an inject route pays with a foreign key, so it must never look
-// like a Claude model in either the alias or the rewrite target.
-func TestValidateInjectNeverReferencesClaude(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "claude in alias rejected",
-			alias: "claude-fast",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"claude-fast"`, "inject", "claude"},
-		},
-		{
-			name:  "claude in alias rejected case-insensitively",
-			alias: "my-CLAUDE-pin",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"my-CLAUDE-pin"`, "inject", "claude"},
-		},
-		{
-			name:  "claude in model target rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","model":"anthropic/claude-sonnet-5",` +
-				`"auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "inject", "claude"},
-		},
-		{
-			name:  "claude in model target rejected case-insensitively",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","model":"vendor/Claude-Clone",` +
-				`"auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "inject", "claude"},
-		},
-		{
-			name:  "claude embedded mid-token rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","model":"vendor/notclaudeish",` +
-				`"auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "inject", "claude"},
-		},
-		{
-			name:  "claude inside a namespaced alias rejected",
-			alias: "openrouter/claude-clone",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"openrouter/claude-clone"`, "inject", "claude"},
-		},
-		{
-			name:  "namespaced foreign alias accepted",
-			alias: "openrouter/sol",
-			route: `{"base_url":"https://openrouter.ai/api","model":"openrouter/sol-1",` +
-				`"auth":"inject","api_key_env_file":"KEY_FILE"}`,
-		},
-		{
-			name:  "claude on a forward route accepted",
-			alias: "claude-sonnet-5",
-			route: `{"base_url":"https://api.anthropic.com","model":"claude-opus-5","auth":"forward"}`,
-		},
-		{
-			name:  "foreign alias and model accepted",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna",` +
-				`"auth":"inject","api_key_env_file":"KEY_FILE"}`,
-		},
-	})
-}
-
-// Rule 4: api_key_env_file is required by inject and forbidden on forward.
-func TestValidateAPIKeyEnvFilePairing(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "inject without a key file rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject"}`,
-			wants: []string{`"probe"`, "inject", "api_key_env_file"},
-		},
-		{
-			name:  "inject with an empty key file rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":""}`,
-			wants: []string{`"probe"`, "inject", "api_key_env_file"},
-		},
-		{
-			name:  "forward with a key file rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com","auth":"forward","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "forward", "api_key_env_file"},
-		},
-		{
-			name:  "inject with a key file accepted",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-		},
-		{
-			name:  "forward without a key file accepted",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com","auth":"forward"}`,
-		},
-	})
-}
-
-// Rule 5: base_url must be an absolute https URL; http only for loopback.
-func TestValidateBaseURL(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "missing base_url rejected",
-			alias: "probe",
-			route: `{"auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "base_url"},
-		},
-		{
-			name:    "relative path rejected",
-			alias:   "probe",
-			route:   `{"base_url":"/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url", "absolute URL"},
-			forbids: []string{"/api"},
-		},
-		{
-			name:    "bare host rejected",
-			alias:   "probe",
-			route:   `{"base_url":"openrouter.ai","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url", "absolute URL"},
-			forbids: []string{"openrouter.ai"},
-		},
-		{
-			name:  "scheme without a host rejected",
-			alias: "probe",
-			route: `{"base_url":"https://","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "base_url"},
-		},
-		{
-			name:    "unparsable url rejected",
-			alias:   "probe",
-			route:   `{"base_url":"https://%zz","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url", "not a valid URL"},
-			forbids: []string{"https://%zz", "%zz"},
-		},
-		{
-			name:    "non-http scheme rejected",
-			alias:   "probe",
-			route:   `{"base_url":"ftp://files.example","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url", "must use https"},
-			forbids: []string{"ftp://files.example"},
-		},
-		{
-			name:    "plain http rejected for a public host",
-			alias:   "probe",
-			route:   `{"base_url":"http://openrouter.ai","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url", "may only use http"},
-			forbids: []string{"http://openrouter.ai"},
-		},
-		{
-			name:  "https accepted",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-		},
-		{
-			name:  "http accepted for 127.0.0.1",
-			alias: "probe",
-			route: `{"base_url":"http://127.0.0.1:8080","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-		},
-		{
-			name:  "http accepted for localhost",
-			alias: "probe",
-			route: `{"base_url":"http://localhost:1234/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-		},
-	})
-}
-
-// Base URLs carry only endpoint identity. Credential material and request-specific
-// routing belong elsewhere and must never survive registry validation.
-func TestValidateBaseURLRejectsUserinfo(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:    "https username rejected",
-			alias:   "probe",
-			route:   `{"base_url":"https://ledgeruser@example.test/v1","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must not contain user information"},
-			forbids: []string{"ledgeruser"},
-		},
-		{
-			name:    "https username and password rejected",
-			alias:   "probe",
-			route:   `{"base_url":"https://ledgeruser:ledgerpass@example.test/v1","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must not contain user information"},
-			forbids: []string{"ledgeruser", "ledgerpass"},
-		},
-		{
-			name:    "loopback http username rejected",
-			alias:   "probe",
-			route:   `{"base_url":"http://ledgeruser@127.0.0.1:8080/v1","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must not contain user information"},
-			forbids: []string{"ledgeruser"},
-		},
-		{
-			name:    "loopback http username and password rejected",
-			alias:   "probe",
-			route:   `{"base_url":"http://ledgeruser:ledgerpass@127.0.0.1:8080/v1","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must not contain user information"},
-			forbids: []string{"ledgeruser", "ledgerpass"},
-		},
-		{
-			name:  "insecure http username rejected",
-			alias: "probe",
-			route: `{"base_url":"http://ledgeruser@gpubox.lan:11434/v1","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","insecure":true}`,
-			wants:   []string{`"probe"`, "base_url must not contain user information"},
-			forbids: []string{"ledgeruser"},
-		},
-		{
-			name:  "insecure http username and password rejected",
-			alias: "probe",
-			route: `{"base_url":"http://ledgeruser:ledgerpass@gpubox.lan:11434/v1","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","insecure":true}`,
-			wants:   []string{`"probe"`, "base_url must not contain user information"},
-			forbids: []string{"ledgeruser", "ledgerpass"},
-		},
-	})
-}
-
-func TestValidateBaseURLRejectsQuery(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "https query rejected",
-			alias: "probe",
-			route: `{"base_url":"https://example.test/v1?token=sk-query-placeholder","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must not contain query parameters"},
-			forbids: []string{"sk-query-placeholder"},
-		},
-		{
-			name:  "loopback http query rejected",
-			alias: "probe",
-			route: `{"base_url":"http://127.0.0.1:8080/v1?token=sk-query-placeholder","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must not contain query parameters"},
-			forbids: []string{"sk-query-placeholder"},
-		},
-		{
-			name:  "insecure http query rejected",
-			alias: "probe",
-			route: `{"base_url":"http://gpubox.lan:11434/v1?token=sk-query-placeholder","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","insecure":true}`,
-			wants:   []string{`"probe"`, "base_url must not contain query parameters"},
-			forbids: []string{"sk-query-placeholder"},
-		},
-	})
-}
-
-func TestValidateBaseURLRejectsFragment(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "https fragment rejected",
-			alias: "probe",
-			route: `{"base_url":"https://example.test/v1#fragment-placeholder","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must not contain a fragment"},
-			forbids: []string{"fragment-placeholder"},
-		},
-		{
-			name:  "loopback http fragment rejected",
-			alias: "probe",
-			route: `{"base_url":"http://127.0.0.1:8080/v1#fragment-placeholder","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must not contain a fragment"},
-			forbids: []string{"fragment-placeholder"},
-		},
-		{
-			name:  "insecure http fragment rejected",
-			alias: "probe",
-			route: `{"base_url":"http://gpubox.lan:11434/v1#fragment-placeholder","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","insecure":true}`,
-			wants:   []string{`"probe"`, "base_url must not contain a fragment"},
-			forbids: []string{"fragment-placeholder"},
-		},
-	})
-}
-
-// Base URL validation errors describe the violated rule without exposing the
-// operator-supplied value. Registries may carry credentials or request routing
-// material in a rejected URL, and Err must remain safe to report.
-func TestValidateBaseURLErrorsOmitSuppliedValues(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "forward user information rejected before identity validation",
-			alias: "probe",
-			route: `{"base_url":"https://ledgeruser:ledgerpass@api.anthropic.com","auth":"forward"}`,
-			wants: []string{`"probe"`, "base_url must not contain user information"},
-			forbids: []string{
-				"ledgeruser",
-				"ledgerpass",
-				"https://ledgeruser:ledgerpass@api.anthropic.com",
-			},
-		},
-		{
-			name:  "forward query rejected before identity validation",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com?token=sk-forward-query-placeholder","auth":"forward"}`,
-			wants: []string{`"probe"`, "base_url must not contain query parameters"},
-			forbids: []string{
-				"sk-forward-query-placeholder",
-				"https://api.anthropic.com?token=sk-forward-query-placeholder",
-			},
-		},
-		{
-			name:  "forward fragment rejected before identity validation",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com#forward-fragment-placeholder","auth":"forward"}`,
-			wants: []string{`"probe"`, "base_url must not contain a fragment"},
-			forbids: []string{
-				"forward-fragment-placeholder",
-				"https://api.anthropic.com#forward-fragment-placeholder",
-			},
-		},
-		{
-			name:    "relative query rejected before absolute URL validation",
-			alias:   "probe",
-			route:   `{"base_url":"/v1?token=sk-relative-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must not contain query parameters"},
-			forbids: []string{"sk-relative-placeholder", "/v1?token=sk-relative-placeholder"},
-		},
-		{
-			name:    "relative URL rejected without exposing its path",
-			alias:   "probe",
-			route:   `{"base_url":"/relative-url-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must be an absolute URL with a scheme and host"},
-			forbids: []string{"relative-url-placeholder", "/relative-url-placeholder"},
-		},
-		{
-			name:    "scheme URL without a host rejected without exposing its path",
-			alias:   "probe",
-			route:   `{"base_url":"https:/missing-host-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url must be an absolute URL with a scheme and host"},
-			forbids: []string{"missing-host-placeholder", "https:/missing-host-placeholder"},
-		},
-		{
-			name:    "malformed URL parser error omits parser rendering",
-			alias:   "probe",
-			route:   `{"base_url":"https://%zz/secret-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants:   []string{`"probe"`, "base_url is not a valid URL"},
-			forbids: []string{"secret-placeholder", "https://%zz/secret-placeholder", "%zz"},
-		},
-		{
-			name:  "wrong clean forward URL omits its path",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com/wrong-forward-path-placeholder","auth":"forward"}`,
-			wants: []string{`"probe"`, "forward", "base_url", "https://api.anthropic.com"},
-			forbids: []string{
-				"wrong-forward-path-placeholder",
-				"https://api.anthropic.com/wrong-forward-path-placeholder",
-			},
-		},
-		{
-			name:  "unsupported scheme omits its path",
-			alias: "probe",
-			route: `{"base_url":"ftp://files.example/unsupported-scheme-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "base_url must use https"},
-			forbids: []string{
-				"unsupported-scheme-placeholder",
-				"ftp://files.example/unsupported-scheme-placeholder",
-			},
-		},
-		{
-			name:  "public HTTP rejection omits its path",
-			alias: "probe",
-			route: `{"base_url":"http://files.example/public-http-placeholder","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "base_url may only use http", "insecure"},
-			forbids: []string{
-				"public-http-placeholder",
-				"http://files.example/public-http-placeholder",
-			},
-		},
-		{
-			name:  "insecure loopback conflict omits its path",
-			alias: "probe",
-			route: `{"base_url":"http://127.0.0.1:8080/loopback-insecure-placeholder","auth":"inject","api_key_env_file":"KEY_FILE","insecure":true}`,
-			wants: []string{`"probe"`, "insecure is set", "loopback"},
-			forbids: []string{
-				"loopback-insecure-placeholder",
-				"http://127.0.0.1:8080/loopback-insecure-placeholder",
-			},
-		},
-		{
-			name:  "insecure HTTPS conflict omits its path",
-			alias: "probe",
-			route: `{"base_url":"https://files.example/insecure-https-placeholder","auth":"inject","api_key_env_file":"KEY_FILE","insecure":true}`,
-			wants: []string{`"probe"`, "insecure is set", "base_url already uses https"},
-			forbids: []string{
-				"insecure-https-placeholder",
-				"https://files.example/insecure-https-placeholder",
-			},
-		},
-	})
-}
-
-// Rule 6: extra_body, when present, must be a JSON object.
-func TestValidateExtraBody(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "array rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","extra_body":[1,2]}`,
-			wants: []string{`"probe"`, "extra_body"},
-		},
-		{
-			name:  "string rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","extra_body":"reasoning"}`,
-			wants: []string{`"probe"`, "extra_body"},
-		},
-		{
-			name:  "null rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","extra_body":null}`,
-			wants: []string{`"probe"`, "extra_body"},
-		},
-		{
-			name:  "object accepted",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","extra_body":{"reasoning_effort":"low"}}`,
-		},
-		{
-			name:  "empty object accepted",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","extra_body":{}}`,
-		},
-		{
-			name:  "absent extra_body accepted",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE"}`,
-		},
-	})
-}
-
-// Rule 7: a token ceiling is a positive limit or absent (zero). A negative
-// value would silently disable the output clamp and advertise a nonsense
-// max_input_tokens, so it is rejected.
-func TestValidateTokenCeilingsAreNotNegative(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "negative max_input_tokens rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","max_input_tokens":-1}`,
-			wants: []string{`"probe"`, "max_input_tokens"},
-		},
-		{
-			name:  "negative max_output_tokens rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","max_output_tokens":-100}`,
-			wants: []string{`"probe"`, "max_output_tokens"},
-		},
-		{
-			name:  "zero ceilings accepted",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","max_input_tokens":0,"max_output_tokens":0}`,
-		},
-		{
-			name:  "positive ceilings accepted",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","max_input_tokens":262144,"max_output_tokens":65536}`,
-		},
-	})
-}
-
-func TestStrictDecodeRejectsMalformedRegistries(t *testing.T) {
-	t.Parallel()
-
 	tests := []struct {
-		name  string
-		body  string
-		wants []string
+		name, body string
+		wants      []string
 	}{
 		{
-			name: "unknown field inside a route",
-			body: fixture(
-				"probe",
-				`{"base_url":"https://api.anthropic.com","auth":"forward","bogus":1}`,
-			),
-			wants: []string{`"probe"`, "unknown field", "bogus"},
+			name:  "missing default_context",
+			body:  `{"seats":{},"contexts":{}}`,
+			wants: []string{"default_context"},
 		},
 		{
-			name:  "camelCase spelling of a known field",
-			body:  fixture("probe", `{"baseUrl":"https://api.anthropic.com","auth":"forward"}`),
-			wants: []string{`"probe"`, "unknown field", "baseUrl"},
+			name:  "missing seats",
+			body:  `{"default_context":"personal","contexts":{}}`,
+			wants: []string{"seats"},
 		},
 		{
-			name:  "unknown top-level field",
-			body:  `{"contexts":{},"bogus":1}`,
-			wants: []string{"unknown field", "bogus"},
-		},
-		{
-			name:  "v1 document keyed by routes",
-			body:  `{"routes":{` + siblingRoute + `}}`,
-			wants: []string{"unknown field", "routes"},
-		},
-		{
-			name:  "unknown field inside a context",
-			body:  contextDoc(`"personal":{"routes":{},"bogus":1}`),
-			wants: []string{`context "personal"`, "unknown field", "bogus"},
-		},
-		{
-			name:  "trailing json value",
-			body:  `{"contexts":{}} {"contexts":{}}`,
-			wants: []string{"trailing"},
-		},
-		{
-			name:  "trailing garbage",
-			body:  `{"contexts":{}}xyzzy`,
-			wants: []string{"trailing"},
-		},
-		{
-			name:  "empty alias key",
-			body:  personalDoc(`"":{"base_url":"https://api.anthropic.com","auth":"forward"}`),
-			wants: []string{"empty alias"},
-		},
-		{
-			name:  "empty context name",
-			body:  contextDoc(`"":{"routes":{}}`),
-			wants: []string{"empty contexts key"},
-		},
-		{
-			name:  "context name with an uppercase letter",
-			body:  contextDoc(`"Work":{"routes":{}}`),
-			wants: []string{`"Work"`, "lowercase"},
-		},
-		{
-			name:  "context name with a slash",
-			body:  contextDoc(`"work/eu":{"routes":{}}`),
-			wants: []string{`"work/eu"`, "lowercase"},
-		},
-		{
-			name:  "context name with a dot",
-			body:  contextDoc(`"..":{"routes":{}}`),
-			wants: []string{"lowercase"},
-		},
-		{
-			name:  "contexts is not an object",
-			body:  `{"contexts":[]}`,
+			name:  "missing contexts",
+			body:  `{"default_context":"personal","seats":{}}`,
 			wants: []string{"contexts"},
 		},
 		{
-			name:  "context value is not an object",
-			body:  contextDoc(`"personal":5`),
-			wants: []string{`context "personal"`},
+			name:  "null seats",
+			body:  `{"default_context":"personal","seats":null,"contexts":{}}`,
+			wants: []string{"seats", "null"},
 		},
 		{
-			name:  "routes is not an object",
-			body:  contextDoc(`"personal":{"routes":[]}`),
+			name:  "null contexts",
+			body:  `{"default_context":"personal","seats":{},"contexts":null}`,
+			wants: []string{"contexts", "null"},
+		},
+		{
+			name:  "unknown root",
+			body:  `{"default_context":"personal","seats":{},"contexts":{},"bogus":1}`,
+			wants: []string{"unknown field", "bogus"},
+		},
+		{
+			name:  "trailing data",
+			body:  `{"default_context":"personal","seats":{},"contexts":{}} {}`,
+			wants: []string{"trailing"},
+		},
+		{name: "legacy routes root", body: `{"routes":{}}`, wants: []string{"routes"}},
+		{
+			name:  "legacy default_route",
+			body:  `{"default_context":"personal","seats":{},"contexts":{"personal":{"default_route":{},"models":{}}}}`,
+			wants: []string{"default_route"},
+		},
+		{
+			name:  "legacy context routes",
+			body:  `{"default_context":"personal","seats":{},"contexts":{"personal":{"default_seat":"x","routes":{}}}}`,
 			wants: []string{"routes"},
 		},
 		{
-			name:  "route value is not an object",
-			body:  personalDoc(`"probe":5`),
-			wants: []string{`"probe"`},
+			name:  "legacy seat base_url",
+			body:  `{"default_context":"personal","seats":{"x":{"base_url":"https://api.anthropic.com","auth_mode":"forward"}},"contexts":{"personal":{"default_seat":"x","models":{}}}}`,
+			wants: []string{"base_url"},
 		},
 		{
-			name: "invalid default route",
-			body: contextDoc(`"personal":{"default_route":` +
-				`{"base_url":"https://evil.example","auth":"forward"},"routes":{}}`),
-			wants: []string{"default_route", "forward"},
+			name:  "legacy seat auth",
+			body:  `{"default_context":"personal","seats":{"x":{"upstream":"https://api.anthropic.com","auth":"forward"}},"contexts":{"personal":{"default_seat":"x","models":{}}}}`,
+			wants: []string{"auth"},
 		},
 		{
-			name: "unknown field inside a default route",
-			body: contextDoc(`"personal":{"default_route":` +
-				`{"base_url":"https://api.anthropic.com","auth":"forward","bogus":1},"routes":{}}`),
-			wants: []string{"default_route", "unknown field", "bogus"},
+			name:  "inline seat",
+			body:  `{"default_context":"personal","seats":{"x":{"upstream":"https://api.anthropic.com","auth_mode":"forward"}},"contexts":{"personal":{"default_seat":"x","models":{"m":{"seat":"x"}}}}}`,
+			wants: []string{"models", "string"},
 		},
 		{
-			name: "invalid route in a second context takes the whole file down",
-			body: contextDoc(`"personal":{"routes":{` + siblingRoute + `}},` +
-				`"work":{"routes":{"probe":{"auth":"nonsense"}}}`),
-			wants: []string{`context "work"`, `"probe"`, "auth"},
+			name:  "null models",
+			body:  `{"default_context":"personal","seats":{"x":{"upstream":"https://api.anthropic.com","auth_mode":"forward"}},"contexts":{"personal":{"default_seat":"x","models":null}}}`,
+			wants: []string{"models", "null"},
 		},
 		{
-			name:  "field with the wrong json type",
-			body:  fixture("probe", `{"base_url":5,"auth":"forward"}`),
-			wants: []string{`"probe"`, "base_url"},
+			name:  "null subagents",
+			body:  `{"default_context":"personal","seats":{"x":{"upstream":"https://api.anthropic.com","auth_mode":"forward"}},"contexts":{"personal":{"default_seat":"x","models":{},"subagents":null}}}`,
+			wants: []string{"subagents", "null"},
 		},
 		{
-			name: "token limit is not a number",
-			body: fixture("probe", `{"base_url":"https://api.anthropic.com","auth":"forward",`+
-				`"max_input_tokens":"many"}`),
-			wants: []string{`"probe"`, "max_input_tokens"},
-		},
-		{
-			name: "boolean field is not a boolean",
-			body: fixture("probe", `{"base_url":"https://api.anthropic.com","auth":"forward",`+
-				`"strip_cache_control":"yes"}`),
-			wants: []string{`"probe"`, "strip_cache_control"},
-		},
-		{
-			name:  "truncated json",
-			body:  `{"contexts":{`,
-			wants: []string{"registry"},
-		},
-		{
-			name:  "empty file",
-			body:  ``,
-			wants: []string{"registry"},
+			name:  "null subagent models",
+			body:  `{"default_context":"personal","seats":{"x":{"upstream":"https://api.anthropic.com","auth_mode":"forward"}},"contexts":{"personal":{"default_seat":"x","models":{},"subagents":{"default_seat":"x","models":null}}}}`,
+			wants: []string{"subagents", "models", "null"},
 		},
 	}
-
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
-			reg := newRegistry(t, tc.body)
-
-			assertDefault(t, reg, "probe")
-			assertDefault(t, reg, "sibling-ok")
-			assertErrMentions(t, reg.Err(), tc.wants)
-		})
-	}
-}
-
-// Rule 8: a sigv4 route signs with AWS credentials, so it needs a profile, a
-// region and a model map, and it has no base_url of its own — the Bedrock
-// endpoint is derived from the region.
-func TestValidateSigV4FieldPairing(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "complete sigv4 route accepted",
-			alias: "bedrock/sonnet",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
-				`"model_map_env_file":"BEDROCK_MODEL_MAP_FILE","model":"claude-sonnet-5"}`,
-		},
-		{
-			name:  "sigv4 without aws_profile rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "sigv4", "aws_profile"},
-		},
-		{
-			name:  "sigv4 with an empty aws_profile rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "sigv4", "aws_profile"},
-		},
-		{
-			name:  "sigv4 without aws_region rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "sigv4", "aws_region"},
-		},
-		{
-			name:  "sigv4 with an empty aws_region rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"","model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "sigv4", "aws_region"},
-		},
-		{
-			name:  "sigv4 without model_map_env_file rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2"}`,
-			wants: []string{`"probe"`, "sigv4", "model_map_env_file"},
-		},
-		{
-			name:  "sigv4 with an empty model_map_env_file rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":""}`,
-			wants: []string{`"probe"`, "sigv4", "model_map_env_file"},
-		},
-		{
-			name:  "sigv4 with a hostile aws_region rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2.example.com/x?",` +
-				`"model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "aws_region", "us-east-2.example.com/x?"},
-		},
-		{
-			name:  "sigv4 with an uppercase aws_region rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"US-EAST-2","model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "aws_region"},
-		},
-		{
-			name:  "sigv4 with a dotted aws_region rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us.east.2","model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "aws_region"},
-		},
-		{
-			name:  "sigv4 with a spaced aws_profile rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work bedrock","aws_region":"us-east-2",` +
-				`"model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "aws_profile", "work bedrock"},
-		},
-		{
-			name:  "sigv4 with a slashed aws_profile rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"../other","aws_region":"us-east-2",` +
-				`"model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "aws_profile"},
-		},
-		{
-			name:  "sigv4 with an uppercase aws_profile rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"Work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "aws_profile"},
-		},
-		{
-			name:  "sigv4 with dots and underscores in aws_profile accepted",
-			alias: "bedrock/dots",
-			route: `{"auth":"sigv4","aws_profile":"work_bedrock.prod-1","aws_region":"us-east-2",` +
-				`"model_map_env_file":"MAP_FILE"}`,
-		},
-		{
-			name:  "sigv4 with a base_url rejected",
-			alias: "probe",
-			route: `{"base_url":"https://bedrock-runtime.us-east-2.amazonaws.com","auth":"sigv4",` +
-				`"aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "sigv4", "base_url", "aws_region"},
-		},
-		{
-			name:  "sigv4 with an api key file rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
-				`"model_map_env_file":"MAP_FILE","api_key_env_file":"KEY_FILE"}`,
-			wants: []string{`"probe"`, "sigv4", "api_key_env_file"},
-		},
-		{
-			name:  "forward with aws_profile rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com","auth":"forward","aws_profile":"work"}`,
-			wants: []string{`"probe"`, "forward", "aws_profile"},
-		},
-		{
-			name:  "forward with aws_region rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com","auth":"forward","aws_region":"us-east-2"}`,
-			wants: []string{`"probe"`, "forward", "aws_region"},
-		},
-		{
-			name:  "inject with model_map_env_file rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
-				`"model_map_env_file":"MAP_FILE"}`,
-			wants: []string{`"probe"`, "inject", "model_map_env_file"},
-		},
-		{
-			name:  "inject with aws_region rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
-				`"aws_region":"us-east-2"}`,
-			wants: []string{`"probe"`, "inject", "aws_region"},
-		},
-		{
-			name:  "sigv4 naming a claude model accepted",
-			alias: "bedrock/claude",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
-				`"model_map_env_file":"MAP_FILE","model":"claude-sonnet-5","max_input_tokens":200000}`,
-		},
-	})
-}
-
-// Rule 9: insecure permits plain http on a non-loopback host, and is rejected
-// anywhere it would change nothing.
-func TestValidateInsecure(t *testing.T) {
-	t.Parallel()
-
-	runValidationCases(t, []validationCase{
-		{
-			name:  "insecure http accepted for a lan host",
-			alias: "local/qwen",
-			route: `{"base_url":"http://gpubox.lan:11434","auth":"inject","api_key_env_file":"KEY_FILE",` +
-				`"insecure":true}`,
-		},
-		{
-			name:  "insecure on an https route rejected",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
-				`"insecure":true}`,
-			wants:   []string{`"probe"`, "insecure", "base_url already uses https"},
-			forbids: []string{"https://openrouter.ai/api"},
-		},
-		{
-			name:  "insecure on a loopback http route rejected",
-			alias: "probe",
-			route: `{"base_url":"http://127.0.0.1:8080","auth":"inject","api_key_env_file":"KEY_FILE",` +
-				`"insecure":true}`,
-			wants:   []string{`"probe"`, "insecure", "base_url is loopback"},
-			forbids: []string{"http://127.0.0.1:8080"},
-		},
-		{
-			name:  "insecure on a localhost http route rejected",
-			alias: "probe",
-			route: `{"base_url":"http://localhost:1234/api","auth":"inject","api_key_env_file":"KEY_FILE",` +
-				`"insecure":true}`,
-			wants:   []string{`"probe"`, "insecure", "base_url is loopback"},
-			forbids: []string{"http://localhost:1234/api"},
-		},
-		{
-			name:  "insecure on a sigv4 route rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
-				`"model_map_env_file":"MAP_FILE","insecure":true}`,
-			wants: []string{`"probe"`, "sigv4", "insecure"},
-		},
-	})
-}
-
-// A sigv4 route's schema fields survive parsing into the resolved Route, since
-// the pipeline signs and maps models from them.
-func TestSigV4RouteFieldsResolve(t *testing.T) {
-	t.Parallel()
-
-	reg := newRegistry(t, personalDoc(`"bedrock/sonnet":{"auth":"sigv4","aws_profile":"work",`+
-		`"aws_region":"us-east-2","model_map_env_file":"MAP_FILE","model":"claude-sonnet-5"}`))
-
-	if err := reg.Err(); err != nil {
-		t.Fatalf("Err() = %v; want nil for a valid registry", err)
-	}
-
-	route := bare(t, reg, "bedrock/sonnet")
-
-	if route.Auth != registry.AuthSigV4 {
-		t.Errorf("Auth = %q; want %q", route.Auth, registry.AuthSigV4)
-	}
-
-	if route.AWSProfile != "work" {
-		t.Errorf("AWSProfile = %q; want %q", route.AWSProfile, "work")
-	}
-
-	if route.AWSRegion != "us-east-2" {
-		t.Errorf("AWSRegion = %q; want %q", route.AWSRegion, "us-east-2")
-	}
-
-	if route.ModelMapEnvFile != "MAP_FILE" {
-		t.Errorf("ModelMapEnvFile = %q; want %q", route.ModelMapEnvFile, "MAP_FILE")
-	}
-}
-
-// The context-name rule is declared once and exported, because the ledger holds
-// a stored context name to exactly the same shape before accepting a record. A
-// second copy of the rule is how the two ends drift.
-func TestValidContextNameIsTheOneSharedRule(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		context string
-		wantErr bool
-	}{
-		{name: "lowercase", context: "personal", wantErr: false},
-		{name: "digits and dashes", context: "work-eu-2", wantErr: false},
-		{name: "uppercase", context: "Work", wantErr: true},
-		{name: "slash", context: "work/eu", wantErr: true},
-		{name: "traversal", context: "..", wantErr: true},
-		{name: "space", context: "work eu", wantErr: true},
-		{name: "underscore", context: "work_eu", wantErr: true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			err := registry.ValidContextName(tc.context)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("ValidContextName(%q) = %v; wantErr %v", tc.context, err, tc.wantErr)
+			path := writeRegistry(t, t.TempDir()+"/registry.json", tc.body)
+			_, err := registry.New(path)
+			if err == nil {
+				t.Fatal("New() = nil error")
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err, want)
+				}
 			}
 		})
 	}
 }
 
-func TestValidateBillingClassPairing(t *testing.T) {
+func TestSubagentsModelsMayBeOmitted(t *testing.T) {
 	t.Parallel()
+	body := `{"default_context":"personal","seats":{` +
+		`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},` +
+		`"worker":{"upstream":"https://openrouter.ai/api","model":"worker-model",` +
+		`"auth_mode":"inject","billing":"metered","api_key_env_file":"WORKER_KEY_FILE"}},` +
+		`"contexts":{"personal":{"default_seat":"anthropic","models":{},` +
+		`"subagents":{"default_seat":"worker"}}}}`
+	reg, err := registry.New(writeRegistry(t, t.TempDir()+"/registry.json", body))
+	if err != nil {
+		t.Fatalf("New() = %v; want default-only subagents admitted", err)
+	}
 
-	runValidationCases(t, []validationCase{
+	state := reg.State()
+	if got := state.Contexts["personal"].Subagents.Models; len(got) != 0 {
+		t.Fatalf("subagents models = %v; want empty exact-binding map", got)
+	}
+	res, err := reg.Resolve(
+		registry.Selection{Name: "personal", Explicit: true},
+		"unbound-model",
+		&registry.SubagentObservation{AgentID: "test-agent"},
+	)
+	if err != nil {
+		t.Fatalf("Resolve() = %v", err)
+	}
+	if res.SeatID != "worker" || res.Match.Kind != registry.SelectionSubagent || res.Match.Model != nil {
+		t.Fatalf("Resolve() = seat %q match %+v; want worker subagent default", res.SeatID, res.Match)
+	}
+}
+
+func TestSubagentsStrictFields(t *testing.T) {
+	t.Parallel()
+	const prefix = `{"default_context":"personal","seats":{"x":{"upstream":"https://api.anthropic.com","auth_mode":"forward"}},"contexts":{"personal":{"default_seat":"x","models":{},"subagents":`
+	for _, tc := range []struct {
+		name, subagents string
+		wants           []string
+	}{
+		{name: "missing default_seat", subagents: `{"models":{}}`, wants: []string{"default_seat"}},
+		{name: "null models", subagents: `{"default_seat":"x","models":null}`, wants: []string{"models", "null"}},
+		{name: "unknown field", subagents: `{"default_seat":"x","bogus":true}`, wants: []string{"unknown field", "bogus"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := registry.New(writeRegistry(t, t.TempDir()+"/registry.json", prefix+tc.subagents+`}}}`))
+			if err == nil {
+				t.Fatal("New() = nil error")
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestReferenceIDAndSelectorValidation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, mutation string
+		wants          []string
+	}{
 		{
-			name:  "inject subscription accepted",
-			alias: "subscription",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","billing":"subscription"}`,
+			name:     "bad seat id",
+			mutation: strings.Replace(validRegistry, `"anthropic":`, `"Bad":`, 1),
+			wants:    []string{"Bad", "seat"},
 		},
 		{
-			name:  "inject metered accepted",
-			alias: "metered",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","billing":"metered"}`,
+			name: "bad context id",
+			mutation: strings.Replace(
+				strings.Replace(validRegistry, `"personal":{`, `"bad/name":{`, 1),
+				`"default_context":"personal"`,
+				`"default_context":"bad/name"`,
+				1,
+			),
+			wants: []string{"bad/name"},
 		},
 		{
-			name:  "inject self hosted accepted",
-			alias: "self-hosted",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","billing":"self_hosted"}`,
+			name: "unknown default context",
+			mutation: strings.Replace(
+				validRegistry,
+				`"default_context":"personal"`,
+				`"default_context":"missing"`,
+				1,
+			),
+			wants: []string{"default_context", "missing"},
 		},
 		{
-			name:  "inject billing temporarily omitted",
-			alias: "omitted",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE"}`,
+			name: "unknown context default seat",
+			mutation: strings.Replace(
+				validRegistry,
+				`"default_seat":"anthropic"`,
+				`"default_seat":"missing"`,
+				1,
+			),
+			wants: []string{"default_seat", "missing"},
 		},
 		{
-			name:  "forward with an explicit class rejected",
-			alias: "probe",
-			route: `{"base_url":"https://api.anthropic.com","auth":"forward","billing":"subscription"}`,
-			wants: []string{`"probe"`, "forward", "billing"},
+			name: "unknown public binding",
+			mutation: strings.Replace(
+				validRegistry,
+				`"luna-fast":"luna"`,
+				`"luna-fast":"missing"`,
+				1,
+			),
+			wants: []string{"luna-fast", "missing"},
 		},
 		{
-			name:  "sigv4 with an explicit class rejected",
-			alias: "probe",
-			route: `{"auth":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
-				`"model_map_env_file":"MAP_FILE","billing":"metered"}`,
-			wants: []string{`"probe"`, "sigv4", "billing"},
+			name: "unknown subagent default",
+			mutation: strings.Replace(
+				validRegistry,
+				`"default_seat":"sol"`,
+				`"default_seat":"missing"`,
+				1,
+			),
+			wants: []string{"subagents", "missing"},
+		},
+		{
+			name: "unknown subagent binding",
+			mutation: strings.Replace(
+				validRegistry,
+				`"claude-opus-5":"bedrock"`,
+				`"claude-opus-5":"missing"`,
+				1,
+			),
+			wants: []string{"claude-opus-5", "missing"},
+		},
+		{
+			name:     "empty public selector",
+			mutation: strings.Replace(validRegistry, `"luna-fast":"luna"`, `"":"luna"`, 1),
+			wants:    []string{"empty", "selector"},
+		},
+		{
+			name: "empty subagent selector",
+			mutation: strings.Replace(
+				validRegistry,
+				`"claude-opus-5":"bedrock"`,
+				`"":"bedrock"`,
+				1,
+			),
+			wants: []string{"empty", "selector"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := registry.New(writeRegistry(t, t.TempDir()+"/registry.json", tc.mutation))
+			if err == nil {
+				t.Fatal("New() = nil error")
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestSeatAuthAndSafetyValidation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, body string
+		wants      []string
+	}{
+		{
+			name:  "forward foreign upstream",
+			body:  oneSeat(`{"upstream":"https://evil.example","auth_mode":"forward"}`),
+			wants: []string{"forward", "upstream"},
+		},
+		{
+			name: "inject missing key",
+			body: oneSeat(
+				`{"upstream":"https://openrouter.ai","auth_mode":"inject","billing":"metered","model":"gpt"}`,
+			),
+			wants: []string{"inject", "api_key_env_file"},
+		},
+		{
+			name: "inject claude rewrite",
+			body: oneSeat(
+				`{"upstream":"https://openrouter.ai","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY","model":"Claude-clone"}`,
+			),
+			wants: []string{"inject", "claude"},
+		},
+		{
+			name: "public claude selector on inject",
+			body: oneSeatContext(
+				`{"upstream":"https://openrouter.ai","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY","model":"gpt"}`,
+				`{"claude-opus-5":"x"}`,
+			),
+			wants: []string{"claude-opus-5", "inject"},
+		},
+		{
+			name: "subagent inject exact needs rewrite",
+			body: subagentSeat(
+				`{"upstream":"https://openrouter.ai","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY"}`,
+				`"x"`,
+				`{"claude-opus-5":"x"}`,
+			),
+			wants: []string{"subagents", "model"},
+		},
+		{
+			name: "subagent inject default needs rewrite",
+			body: subagentSeat(
+				`{"upstream":"https://openrouter.ai","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY"}`,
+				`"x"`,
+				`{}`,
+			),
+			wants: []string{"subagents", "default", "model"},
+		},
+		{
+			name:  "sigv4 fields required",
+			body:  oneSeat(`{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2"}`),
+			wants: []string{"model_map_env_file"},
+		},
+		{
+			name: "sigv4 upstream forbidden",
+			body: oneSeat(
+				`{"upstream":"https://bedrock.example","auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP"}`,
+			),
+			wants: []string{"sigv4", "upstream"},
+		},
+		{
+			name: "negative ceiling",
+			body: oneSeat(
+				`{"upstream":"https://api.anthropic.com","auth_mode":"forward","max_output_tokens":-1}`,
+			),
+			wants: []string{"max_output_tokens"},
+		},
+		{
+			name: "null extra body",
+			body: oneSeat(
+				`{"upstream":"https://api.anthropic.com","auth_mode":"forward","extra_body":null}`,
+			),
+			wants: []string{"extra_body"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := registry.New(writeRegistry(t, t.TempDir()+"/registry.json", tc.body))
+			if err == nil {
+				t.Fatal("New() = nil error")
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(want)) {
+					t.Errorf("error %q missing %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestDuplicateJSONMemberNamesAreRejectedAtEveryObject pins strict duplicate
+// rejection at every object the registry grammar owns. Encoding/json keeps the
+// last member of a repeated name, so a document whose reviewed value is shadowed
+// by a second one further down would load as something nobody read.
+func TestDuplicateJSONMemberNamesAreRejectedAtEveryObject(t *testing.T) {
+	t.Parallel()
+	const seat = `{"upstream":"https://api.anthropic.com","auth_mode":"forward"}`
+	tests := []struct {
+		name, body string
+		want       string
+	}{
+		{
+			name: "root",
+			body: `{"default_context":"personal","default_context":"personal",` +
+				`"seats":{"x":` + seat + `},"contexts":{"personal":{"default_seat":"x","models":{}}}}`,
+			want: "default_context",
+		},
+		{
+			name: "seats map",
+			body: `{"default_context":"personal","seats":{"x":` + seat + `,"x":` + seat + `},` +
+				`"contexts":{"personal":{"default_seat":"x","models":{}}}}`,
+			want: "x",
+		},
+		{
+			name: "seat object",
+			body: `{"default_context":"personal","seats":{"x":{"upstream":"https://api.anthropic.com",` +
+				`"upstream":"https://api.anthropic.com","auth_mode":"forward"}},` +
+				`"contexts":{"personal":{"default_seat":"x","models":{}}}}`,
+			want: "upstream",
+		},
+		{
+			name: "contexts map",
+			body: `{"default_context":"personal","seats":{"x":` + seat + `},"contexts":{` +
+				`"personal":{"default_seat":"x","models":{}},"personal":{"default_seat":"x","models":{}}}}`,
+			want: "personal",
+		},
+		{
+			name: "context object",
+			body: `{"default_context":"personal","seats":{"x":` + seat + `},"contexts":{` +
+				`"personal":{"default_seat":"x","default_seat":"x","models":{}}}}`,
+			want: "default_seat",
+		},
+		{
+			name: "public binding map",
+			body: `{"default_context":"personal","seats":{"x":` + seat + `},"contexts":{` +
+				`"personal":{"default_seat":"x","models":{"m":"x","m":"x"}}}}`,
+			want: "m",
+		},
+		{
+			name: "subagents object",
+			body: `{"default_context":"personal","seats":{"x":` + seat + `},"contexts":{` +
+				`"personal":{"default_seat":"x","models":{},"subagents":{"default_seat":"x",` +
+				`"default_seat":"x","models":{}}}}}`,
+			want: "default_seat",
+		},
+		{
+			name: "subagent binding map",
+			body: `{"default_context":"personal","seats":{"x":` + seat + `},"contexts":{` +
+				`"personal":{"default_seat":"x","models":{},"subagents":{"default_seat":"x",` +
+				`"models":{"m":"x","m":"x"}}}}}`,
+			want: "m",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := registry.New(writeRegistry(t, t.TempDir()+"/registry.json", tc.body))
+			if err == nil {
+				t.Fatal("New() = nil error for a duplicate member name")
+			}
+			if !strings.Contains(err.Error(), "duplicate") ||
+				!strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not name the duplicate %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestAPIKeyEnvFileUsesEnvironmentVariableGrammar pins registry admission to the
+// same environment-variable-name grammar the ledger validates config_source
+// with, so a Seat that loads can never produce a record the ledger refuses.
+func TestAPIKeyEnvFileUsesEnvironmentVariableGrammar(t *testing.T) {
+	t.Parallel()
+	injectSeat := func(envFile string) string {
+		return oneSeat(
+			`{"upstream":"https://openrouter.ai","auth_mode":"inject","billing":"metered","model":"gpt",` +
+				`"api_key_env_file":"` + envFile + `"}`,
+		)
+	}
+	for _, name := range []string{"KEY", "_key", "PATCHBAY_OPENROUTER_KEY_FILE9", "k"} {
+		if _, err := registry.New(
+			writeRegistry(t, t.TempDir()+"/registry.json", injectSeat(name)),
+		); err != nil {
+			t.Errorf("api_key_env_file %q rejected: %v", name, err)
+		}
+	}
+	for _, name := range []string{"", "1KEY", "KEY-FILE", "KEY FILE", "KEY/FILE", "aws_profile:work"} {
+		_, err := registry.New(writeRegistry(t, t.TempDir()+"/registry.json", injectSeat(name)))
+		if err == nil {
+			t.Errorf("api_key_env_file %q accepted", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "api_key_env_file") {
+			t.Errorf("api_key_env_file %q error %q does not name the field", name, err)
+		}
+	}
+}
+
+// TestValidEnvNameIsTheOneSharedGrammar pins the exported validator the ledger
+// reuses, so the two ends of the config_source contract cannot drift.
+func TestValidEnvNameIsTheOneSharedGrammar(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		valid bool
+	}{
+		{"KEY", true}, {"_KEY", true}, {"k9", true}, {"_", true},
+		{"", false}, {"9KEY", false}, {"KEY-FILE", false}, {"KEY.FILE", false},
+		{"KEY FILE", false}, {"caller", true}, {"aws_profile:work", false},
+	} {
+		if got := registry.ValidEnvName(tc.name) == nil; got != tc.valid {
+			t.Errorf("ValidEnvName(%q) valid=%v, want %v", tc.name, got, tc.valid)
+		}
+	}
+}
+
+func TestValidContextAndSeatIDsShareExactRule(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		id    string
+		valid bool
+	}{{"a", true}, {"a-1", true}, {"1-a", true}, {"a-", true}, {"", false}, {"A", false}, {"a_b", false}, {"-a", false}, {"a/b", false}} {
+		if got := registry.ValidID(tc.id) == nil; got != tc.valid {
+			t.Errorf("ValidID(%q) valid=%v", tc.id, got)
+		}
+	}
+}
+
+func oneSeat(seat string) string { return oneSeatContext(seat, `{}`) }
+func oneSeatContext(seat, models string) string {
+	return `{"default_context":"personal","seats":{"x":` + seat + `},"contexts":{"personal":{"default_seat":"x","models":` + models + `}}}`
+}
+func subagentSeat(seat, defaultSeat, models string) string {
+	return `{"default_context":"personal","seats":{"x":` + seat + `},"contexts":{"personal":{"default_seat":"x","models":{},"subagents":{"default_seat":` + defaultSeat + `,"models":` + models + `}}}}`
+}
+
+// seatCase is one Seat body and what admission must say about it.
+type seatCase struct {
+	name, seat string
+	wants      []string
+	forbids    []string
+}
+
+// runSeatCases loads each Seat as the only Seat of a one-Context document. A
+// case with no wants must be admitted; a case with wants must be refused by an
+// error naming every one of them.
+func runSeatCases(t *testing.T, cases []seatCase) {
+	t.Helper()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := registry.New(writeRegistry(t, t.TempDir()+"/registry.json", oneSeat(tc.seat)))
+			if len(tc.wants) == 0 {
+				if err != nil {
+					t.Fatalf("New() = %v; want the Seat admitted", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("New() = nil error; want the Seat refused")
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(want)) {
+					t.Errorf("error %q missing %q", err, want)
+				}
+			}
+			for _, forbid := range tc.forbids {
+				if strings.Contains(err.Error(), forbid) {
+					t.Errorf("error %q must not mention %q", err, forbid)
+				}
+			}
+		})
+	}
+}
+
+// TestSeatAuthFieldPairings pins every required-and-forbidden field pairing the
+// three auth modes carry. Each mode spends a different credential, so a field
+// belonging to another mode is not merely unused — it is a Seat whose operator
+// believes something about it that is not true.
+func TestSeatAuthFieldPairings(t *testing.T) {
+	t.Parallel()
+	runSeatCases(t, []seatCase{
+		{
+			name:  "unknown auth mode",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"passthrough"}`,
+			wants: []string{"auth_mode", "passthrough"},
+		},
+		{name: "missing auth mode", seat: `{"upstream":"https://api.anthropic.com"}`, wants: []string{"auth_mode"}},
+
+		{name: "forward to anthropic accepted", seat: `{"upstream":"https://api.anthropic.com","auth_mode":"forward"}`},
+		{
+			name:  "forward elsewhere rejected",
+			seat:  `{"upstream":"https://evil.example","auth_mode":"forward"}`,
+			wants: []string{"forward", "upstream"},
+		},
+		{
+			name:  "forward with a key file rejected",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","api_key_env_file":"KEY_FILE"}`,
+			wants: []string{"forward", "api_key_env_file"},
+		},
+		{
+			name:  "forward with aws_profile rejected",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","aws_profile":"work"}`,
+			wants: []string{"forward", "aws_profile"},
+		},
+		{
+			name:  "forward with aws_region rejected",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","aws_region":"us-east-2"}`,
+			wants: []string{"forward", "aws_region"},
+		},
+		{
+			name:  "forward with model_map_env_file rejected",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"forward", "model_map_env_file"},
+		},
+
+		{
+			name: "inject with a key file accepted",
+			seat: `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+		},
+		{
+			name:  "inject without a key file rejected",
+			seat:  `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered"}`,
+			wants: []string{"inject", "api_key_env_file"},
+		},
+		{
+			name:  "inject with an empty key file rejected",
+			seat:  `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":""}`,
+			wants: []string{"inject", "api_key_env_file"},
+		},
+		{
+			name:  "inject naming claude rejected",
+			seat:  `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","model":"Claude-clone"}`,
+			wants: []string{"inject", "claude"},
+		},
+		{
+			name:  "inject with model_map_env_file rejected",
+			seat:  `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"inject", "model_map_env_file"},
+		},
+		{
+			name:  "inject with aws_region rejected",
+			seat:  `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","aws_region":"us-east-2"}`,
+			wants: []string{"inject", "aws_region"},
+		},
+		{
+			name:  "inject with aws_profile rejected",
+			seat:  `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","aws_profile":"work"}`,
+			wants: []string{"inject", "aws_profile"},
+		},
+
+		{
+			name: "complete sigv4 accepted",
+			seat: `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"BEDROCK_MODEL_MAP_FILE","model":"claude-sonnet-5"}`,
+		},
+		{
+			name: "sigv4 with dots and underscores in aws_profile accepted",
+			seat: `{"auth_mode":"sigv4","aws_profile":"work_bedrock.prod-1","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+		},
+		{
+			name:  "sigv4 without aws_profile rejected",
+			seat:  `{"auth_mode":"sigv4","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"sigv4", "aws_profile"},
+		},
+		{
+			name:  "sigv4 with an empty aws_profile rejected",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"sigv4", "aws_profile"},
+		},
+		{
+			name:  "sigv4 without aws_region rejected",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"sigv4", "aws_region"},
+		},
+		{
+			name:  "sigv4 with an empty aws_region rejected",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"sigv4", "aws_region"},
+		},
+		{
+			name:  "sigv4 without model_map_env_file rejected",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2"}`,
+			wants: []string{"sigv4", "model_map_env_file"},
+		},
+		{
+			name:  "sigv4 with an empty model_map_env_file rejected",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":""}`,
+			wants: []string{"sigv4", "model_map_env_file"},
+		},
+		{
+			name:  "sigv4 with an upstream rejected",
+			seat:  `{"upstream":"https://bedrock-runtime.us-east-2.amazonaws.com","auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"sigv4", "upstream", "aws_region"},
+		},
+		{
+			name:  "sigv4 with an api key file rejected",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE","api_key_env_file":"KEY_FILE"}`,
+			wants: []string{"sigv4", "api_key_env_file"},
+		},
+		{
+			name: "sigv4 naming a claude model accepted",
+			seat: `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE","model":"claude-sonnet-5","max_input_tokens":200000}`,
 		},
 	})
 }
 
-func TestBillingFieldRejectsInvalidValues(t *testing.T) {
+// TestSigV4NamesAreConstrainedToASafeAlphabet keeps a hostile region or profile
+// out of a signed endpoint and an exec'd AWS CLI invocation: the region becomes
+// a hostname and the profile a command argument.
+func TestSigV4NamesAreConstrainedToASafeAlphabet(t *testing.T) {
 	t.Parallel()
+	runSeatCases(t, []seatCase{
+		{
+			name:  "hostile region",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2.example.com/x?","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"aws_region", "us-east-2.example.com/x?"},
+		},
+		{
+			name:  "uppercase region",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"US-EAST-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"aws_region"},
+		},
+		{
+			name:  "dotted region",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us.east.2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"aws_region"},
+		},
+		{
+			name:  "spaced profile",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work bedrock","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"aws_profile", "work bedrock"},
+		},
+		{
+			name:  "traversing profile",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"../other","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"aws_profile"},
+		},
+		{
+			name:  "uppercase profile",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"Work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"}`,
+			wants: []string{"aws_profile"},
+		},
+	})
+}
 
-	tests := []validationCase{
+// TestSeatUpstreamMustBeAnAbsoluteHTTPSURL pins the destination rule. The
+// upstream is where a provider key gets spent, so a relative, hostless or
+// unsupported reference is refused rather than resolved into something.
+func TestSeatUpstreamMustBeAnAbsoluteHTTPSURL(t *testing.T) {
+	t.Parallel()
+	runSeatCases(t, []seatCase{
+		{
+			name:  "missing upstream",
+			seat:  `{"auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+			wants: []string{"upstream"},
+		},
+		{
+			name:    "relative path",
+			seat:    `{"upstream":"/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{"upstream", "absolute URL"},
+			forbids: []string{"/api"},
+		},
+		{
+			name:    "bare host",
+			seat:    `{"upstream":"openrouter.ai","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{"upstream", "absolute URL"},
+			forbids: []string{"openrouter.ai"},
+		},
+		{
+			name:  "scheme without a host",
+			seat:  `{"upstream":"https://","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+			wants: []string{"upstream"},
+		},
+		{
+			name:  "unparsable url",
+			seat:  `{"upstream":"https://%zz","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+			wants: []string{"upstream"},
+		},
+		{
+			name:    "non-http scheme",
+			seat:    `{"upstream":"ftp://files.example","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{"upstream", "must use https"},
+			forbids: []string{"files.example"},
+		},
+		{
+			name:    "plain http for a public host",
+			seat:    `{"upstream":"http://openrouter.ai","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+			wants:   []string{"upstream", "may only use http", "insecure"},
+			forbids: []string{"openrouter.ai"},
+		},
+		{
+			name: "https accepted",
+			seat: `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+		},
+		{
+			name: "loopback http accepted",
+			seat: `{"upstream":"http://127.0.0.1:8080","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+		},
+		{
+			name: "localhost http accepted",
+			seat: `{"upstream":"http://localhost:1234/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`,
+		},
+	})
+}
+
+// TestSeatInsecureOnlyBuysNonLoopbackHTTP pins insecure to the one thing it
+// does. Anywhere it would change nothing it is refused, so it can never sit in a
+// registry looking like it is protecting something.
+func TestSeatInsecureOnlyBuysNonLoopbackHTTP(t *testing.T) {
+	t.Parallel()
+	runSeatCases(t, []seatCase{
+		{
+			name: "lan host with insecure accepted",
+			seat: `{"upstream":"http://gpubox.lan:11434","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","insecure":true}`,
+		},
+		{
+			name:    "insecure on https rejected",
+			seat:    `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","insecure":true}`,
+			wants:   []string{"insecure", "upstream", "https"},
+			forbids: []string{"openrouter.ai"},
+		},
+		{
+			name:    "insecure on loopback rejected",
+			seat:    `{"upstream":"http://127.0.0.1:8080","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","insecure":true}`,
+			wants:   []string{"insecure", "upstream", "loopback"},
+			forbids: []string{"127.0.0.1"},
+		},
+		{
+			name:  "insecure on localhost rejected",
+			seat:  `{"upstream":"http://localhost:1234/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","insecure":true}`,
+			wants: []string{"insecure", "upstream", "loopback"},
+		},
+		{
+			name:  "insecure on sigv4 rejected",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE","insecure":true}`,
+			wants: []string{"sigv4", "insecure"},
+		},
+	})
+}
+
+func TestSeatUpstreamRejectsCredentialAndRoutingMaterialWithoutEchoingIt(t *testing.T) {
+	t.Parallel()
+	const injectTail = `","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`
+	runSeatCases(t, []seatCase{
+		{
+			name:    "userinfo",
+			seat:    `{"upstream":"https://ledgeruser:ledgerpass@example.test/v1` + injectTail,
+			wants:   []string{"upstream", "must not contain user information"},
+			forbids: []string{"ledgeruser", "ledgerpass"},
+		},
+		{
+			name:    "query",
+			seat:    `{"upstream":"https://example.test/v1?token=sk-query-placeholder` + injectTail,
+			wants:   []string{"upstream", "must not contain query parameters"},
+			forbids: []string{"sk-query-placeholder"},
+		},
+		{
+			name:    "fragment",
+			seat:    `{"upstream":"https://example.test/v1#fragment-placeholder` + injectTail,
+			wants:   []string{"upstream", "must not contain a fragment"},
+			forbids: []string{"fragment-placeholder"},
+		},
+		{
+			name:    "malformed URL",
+			seat:    `{"upstream":"https://%zz/secret-placeholder` + injectTail,
+			wants:   []string{"upstream", "is not a valid URL"},
+			forbids: []string{"%zz", "secret-placeholder"},
+		},
+		{
+			name:    "relative URL",
+			seat:    `{"upstream":"/relative-secret-placeholder` + injectTail,
+			wants:   []string{"upstream", "absolute URL"},
+			forbids: []string{"relative-secret-placeholder"},
+		},
+		{
+			name:    "unsupported scheme",
+			seat:    `{"upstream":"ftp://files.example/secret-placeholder` + injectTail,
+			wants:   []string{"upstream", "must use https"},
+			forbids: []string{"secret-placeholder"},
+		},
+		{
+			name:    "public HTTP",
+			seat:    `{"upstream":"http://files.example/secret-placeholder` + injectTail,
+			wants:   []string{"upstream", "may only use http", "insecure"},
+			forbids: []string{"secret-placeholder"},
+		},
+		{
+			name:    "forward userinfo checked before exact destination",
+			seat:    `{"upstream":"https://ledgeruser:ledgerpass@api.anthropic.com","auth_mode":"forward"}`,
+			wants:   []string{"upstream", "must not contain user information"},
+			forbids: []string{"ledgeruser", "ledgerpass"},
+		},
+		{
+			name:    "wrong forward path",
+			seat:    `{"upstream":"https://api.anthropic.com/secret-placeholder","auth_mode":"forward"}`,
+			wants:   []string{"forward", "upstream", "https://api.anthropic.com"},
+			forbids: []string{"secret-placeholder"},
+		},
+	})
+}
+
+// TestSeatTokenCeilingsAreNotNegative pins both ceilings. A negative one would
+// silently disable the output clamp and advertise a nonsense max_input_tokens on
+// the model endpoints.
+func TestSeatTokenCeilingsAreNotNegative(t *testing.T) {
+	t.Parallel()
+	runSeatCases(t, []seatCase{
+		{
+			name:  "negative max_input_tokens",
+			seat:  `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","max_input_tokens":-1}`,
+			wants: []string{"max_input_tokens"},
+		},
+		{
+			name:  "negative max_output_tokens",
+			seat:  `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","max_output_tokens":-1}`,
+			wants: []string{"max_output_tokens"},
+		},
+		{
+			name: "zero ceilings accepted",
+			seat: `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","max_input_tokens":0,"max_output_tokens":0}`,
+		},
+		{
+			name: "positive ceilings accepted",
+			seat: `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","max_input_tokens":262144,"max_output_tokens":32000}`,
+		},
+	})
+}
+
+// TestSeatExtraBodyMustBeAnObject pins the one field merged over the caller's
+// own request: anything that is not an object cannot be merged, and would fail
+// per-request instead of at admission.
+func TestSeatExtraBodyMustBeAnObject(t *testing.T) {
+	t.Parallel()
+	const base = `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"`
+	runSeatCases(t, []seatCase{
+		{name: "array rejected", seat: base + `,"extra_body":[1,2]}`, wants: []string{"extra_body"}},
+		{name: "string rejected", seat: base + `,"extra_body":"reasoning"}`, wants: []string{"extra_body"}},
+		{name: "number rejected", seat: base + `,"extra_body":7}`, wants: []string{"extra_body"}},
+		{name: "null rejected", seat: base + `,"extra_body":null}`, wants: []string{"extra_body"}},
+		{name: "object accepted", seat: base + `,"extra_body":{"reasoning_effort":"low"}}`},
+		{name: "empty object accepted", seat: base + `,"extra_body":{}}`},
+		{name: "absent accepted", seat: base + `}`},
+	})
+}
+
+func TestSeatExtraBodyReservesTopLevelModel(t *testing.T) {
+	t.Parallel()
+	runSeatCases(t, []seatCase{
+		{
+			name:  "inject seat with rewrite",
+			seat:  `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","extra_body":{"model":"x"}}`,
+			wants: []string{"extra_body", "model"},
+		},
+		{
+			name:  "forward seat",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","extra_body":{"model":"x"}}`,
+			wants: []string{"extra_body", "model"},
+		},
+		{
+			name:  "sigv4 seat",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-west-2","model_map_env_file":"MODEL_MAP_FILE","extra_body":{"model":"x"}}`,
+			wants: []string{"extra_body", "model"},
+		},
+		{
+			name: "nested model accepted",
+			seat: `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","extra_body":{"provider":{"model":"x"}}}`,
+		},
+		{
+			name: "case-sensitive Model accepted",
+			seat: `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","extra_body":{"Model":"x"}}`,
+		},
+	})
+}
+
+// TestSeatExtraBodyRefusesRepeatedMembers holds the one arbitrary document the
+// registry carries to the same canonical rule as the document around it.
+//
+// Its keys are not schema-known — an operator merges whatever the provider
+// takes — so nothing here judges a name. What it cannot be is ambiguous: a
+// repeated member is two values for one key, and merging keeps whichever the
+// decoder happened to land on, at any depth and inside any array the operator
+// wrote.
+func TestSeatExtraBodyRefusesRepeatedMembers(t *testing.T) {
+	t.Parallel()
+	const base = `{"upstream":"https://openrouter.ai/api","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"`
+	runSeatCases(t, []seatCase{
+		{
+			name:  "repeated member at the root",
+			seat:  base + `,"extra_body":{"reasoning_effort":"low","reasoning_effort":"high"}}`,
+			wants: []string{"extra_body", "duplicate", "reasoning_effort"},
+		},
+		{
+			name:  "repeated member inside a nested object",
+			seat:  base + `,"extra_body":{"reasoning":{"effort":"low","effort":"high"}}}`,
+			wants: []string{"extra_body", "duplicate", "effort"},
+		},
+		{
+			name:  "repeated member inside an object in an array",
+			seat:  base + `,"extra_body":{"tools":[{"name":"first"},{"name":"second","name":"third"}]}}`,
+			wants: []string{"extra_body", "duplicate", "name"},
+		},
+		{
+			name:  "repeated member deep under an array of arrays",
+			seat:  base + `,"extra_body":{"matrix":[[{"cell":1,"cell":2}]]}}`,
+			wants: []string{"extra_body", "duplicate", "cell"},
+		},
+		{
+			name: "a deeply nested unique document is admitted whole",
+			seat: base + `,"extra_body":{"reasoning":{"effort":"low","summary":{"style":"concise"}},` +
+				`"tools":[{"name":"first","args":{"depth":1}},{"name":"second"}],` +
+				`"flags":[true,false,null],"Effort":"case is a different member","temperature":1}}`,
+		},
+		{
+			name: "repeated equal scalars in an array are not a repeated member",
+			seat: base + `,"extra_body":{"stop":["x","x","x"]}}`,
+		},
+	})
+}
+
+// TestSeatBillingDeclarationPairing pins which Seats declare who pays for them.
+// An inject Seat spends an operator key that nothing downstream can classify,
+// so it must name its class; a forward Seat spends the caller's own credential
+// and a sigv4 Seat is metered against the account that signed it, so a
+// declaration on either is a second answer to a settled question.
+func TestSeatBillingDeclarationPairing(t *testing.T) {
+	t.Parallel()
+	const injectSeat = `{"upstream":"https://openrouter.ai/api","auth_mode":"inject",` +
+		`"api_key_env_file":"KEY_FILE"`
+	runSeatCases(t, []seatCase{
+		{name: "inject subscription accepted", seat: injectSeat + `,"billing":"subscription"}`},
+		{name: "inject metered accepted", seat: injectSeat + `,"billing":"metered"}`},
+		{name: "inject self hosted accepted", seat: injectSeat + `,"billing":"self_hosted"}`},
+		{
+			name:  "inject without a class rejected",
+			seat:  injectSeat + `}`,
+			wants: []string{"inject", "billing"},
+		},
+		{
+			name:  "forward with a class rejected",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","billing":"subscription"}`,
+			wants: []string{"forward", "billing"},
+		},
+		{
+			name: "sigv4 with a class rejected",
+			seat: `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2",` +
+				`"model_map_env_file":"MAP_FILE","billing":"metered"}`,
+			wants: []string{"sigv4", "billing"},
+		},
+	})
+}
+
+// TestSeatBillingRejectsValuesOutsideTheVocabulary holds the declaration to the
+// closed billing-class vocabulary. A class nothing recognizes would be carried
+// onto every accounting row the Seat produces, so it is refused at admission
+// rather than stored and puzzled over later.
+func TestSeatBillingRejectsValuesOutsideTheVocabulary(t *testing.T) {
+	t.Parallel()
+	const base = `{"upstream":"https://openrouter.ai/api","auth_mode":"inject",` +
+		`"api_key_env_file":"KEY_FILE"`
+	runSeatCases(t, []seatCase{
 		{
 			name:  "unknown class",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","billing":"prepaid"}`,
-			wants: []string{`"probe"`, "billing", "prepaid"},
+			seat:  base + `,"billing":"prepaid"}`,
+			wants: []string{"billing", "prepaid"},
 		},
-		{
-			name:  "explicit blank",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","billing":""}`,
-			wants: []string{`"probe"`, "billing"},
-		},
-		{
-			name:  "wrong json type",
-			alias: "probe",
-			route: `{"base_url":"https://openrouter.ai/api","auth":"inject",` +
-				`"api_key_env_file":"KEY_FILE","billing":5}`,
-			wants: []string{`"probe"`, "billing"},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			assertRejected(t, fixture(tc.alias, tc.route), tc.alias, tc.wants)
-		})
-	}
+		{name: "blank class", seat: base + `,"billing":""}`, wants: []string{"billing"}},
+		{name: "wrong JSON type", seat: base + `,"billing":5}`, wants: []string{"billing"}},
+		{name: "null", seat: base + `,"billing":null}`, wants: []string{"billing"}},
+	})
 }

@@ -22,21 +22,20 @@ import (
 
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/proxy"
-	"github.com/joshsymonds/patchbay/internal/registry"
 	"github.com/joshsymonds/patchbay/internal/usage"
 )
 
 const (
-	// bedrockAlias is the sigv4 route every test in this file resolves through,
+	// bedrockSelector is the sigv4 Seat every test in this file resolves through,
 	// and bedrockModel the map key it names.
-	bedrockAlias = "bedrock/sonnet"
-	bedrockModel = "claude-sonnet-5"
+	bedrockSelector = "bedrock/sonnet"
+	bedrockModel    = "claude-sonnet-5"
 
 	// bedrockARN is an application-inference-profile ARN: colons and a slash,
 	// which is exactly the escaping the request path has to get right.
 	bedrockARN = "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/abcdef123456"
 
-	// bedrockEndpoint is what a sigv4 route's region derives, and what the ledger
+	// bedrockEndpoint is what a sigv4 Seat's region derives, and what the ledger
 	// records as the upstream.
 	bedrockEndpoint = "https://bedrock-runtime.us-east-2.amazonaws.com"
 
@@ -52,21 +51,20 @@ const (
 	frameOverheadSize = 16
 )
 
-// sigv4Route is the registry entry for a Bedrock route: no base_url, since the
+// sigv4Seat is the registry entry for a Bedrock Seat: no upstream, since the
 // endpoint comes from the region.
-func sigv4Route(model string) string {
-	return fmt.Sprintf(`%q:{"auth":"sigv4","aws_profile":%q,"aws_region":"us-east-2",`+
-		`"model_map_env_file":%q,"model":%q}`, bedrockAlias, awsProfile, mapEnvName, model)
+func sigv4Seat(model string) string {
+	return fmt.Sprintf(`%q:{"auth_mode":"sigv4","aws_profile":%q,"aws_region":"us-east-2",`+
+		`"model_map_env_file":%q,"model":%q}`, bedrockSelector, awsProfile, mapEnvName, model)
 }
 
-// sigv4DefaultContext is a context whose default route signs for Bedrock, so
-// every model it does not claim is mapped through the map file.
-func sigv4DefaultContext(name string) string {
-	return fmt.Sprintf(`%q:{"default_route":{"auth":"sigv4","aws_profile":%q,"aws_region":"us-east-2",`+
-		`"model_map_env_file":%q},"routes":{}}`, name, awsProfile, mapEnvName)
+func sigv4DefaultRegistry(name string) []byte {
+	return []byte(fmt.Sprintf(`{"default_context":%q,"seats":{"bedrock":{"auth_mode":"sigv4",`+
+		`"aws_profile":%q,"aws_region":"us-east-2","model_map_env_file":%q}},`+
+		`"contexts":{%q:{"default_seat":"bedrock","models":{}}}}`, name, awsProfile, mapEnvName, name))
 }
 
-// writeModelMap points the route's model-map environment variable at a file
+// writeModelMap points the Seat's model-map environment variable at a file
 // holding mapping.
 func writeModelMap(t *testing.T, mapping string) {
 	t.Helper()
@@ -79,7 +77,7 @@ func writeModelMap(t *testing.T, mapping string) {
 	t.Setenv(mapEnvName, path)
 }
 
-// defaultModelMap maps the route's model key to the test ARN.
+// defaultModelMap maps the Seat's model key to the test ARN.
 func defaultModelMap(t *testing.T) {
 	t.Helper()
 
@@ -151,12 +149,12 @@ func bedrockSetup(t *testing.T, handle http.HandlerFunc) (*upstream, *http.Clien
 	return stub, anthropicClient(t, stub), logPath
 }
 
-// bedrockConfig is a pipeline serving one sigv4 alias against stub.
+// bedrockConfig is a pipeline serving one sigv4 binding against stub.
 func bedrockConfig(t *testing.T, client *http.Client, rec proxy.Recorder) proxy.Config {
 	t.Helper()
 
 	return proxy.Config{
-		Registry: newRegistry(t, sigv4Route(bedrockModel)),
+		Registry: newRegistry(t, sigv4Seat(bedrockModel)),
 		Recorder: rec,
 		Client:   client,
 		Logger:   nil,
@@ -202,7 +200,9 @@ func bedrockFrame(headers map[string]string, payload []byte) []byte {
 // bedrockEvent wraps one Anthropic stream event as Bedrock delivers it:
 // base64 inside a {"bytes":...} envelope inside an event frame.
 func bedrockEvent(eventType, event string) []byte {
-	payload, err := json.Marshal(map[string]string{"bytes": base64.StdEncoding.EncodeToString([]byte(event))})
+	payload, err := json.Marshal(
+		map[string]string{"bytes": base64.StdEncoding.EncodeToString([]byte(event))},
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -396,16 +396,16 @@ func TestSigV4RequestIsTranslatedAndSigned(t *testing.T) {
 		t.Errorf("record upstream = %q; want %q", rec.Upstream, bedrockEndpoint)
 	}
 
-	if rec.Model != bedrockModel {
-		t.Errorf("record model = %q; want %q", rec.Model, bedrockModel)
+	if !modelIs(rec.Model, bedrockModel) {
+		t.Errorf("record model = %s; want %q", shownModel(rec.Model), bedrockModel)
 	}
 
-	if rec.RequestModel != bedrockAlias {
-		t.Errorf("record request_model = %q; want %q", rec.RequestModel, bedrockAlias)
+	if !modelIs(rec.RequestModel, bedrockSelector) {
+		t.Errorf("record request_model = %s; want %q", shownModel(rec.RequestModel), bedrockSelector)
 	}
 
-	if rec.Context != registry.PersonalContext {
-		t.Errorf("record context = %q; want %q", rec.Context, registry.PersonalContext)
+	if rec.Context != "personal" {
+		t.Errorf("record context = %q; want %q", rec.Context, "personal")
 	}
 
 	if rec.InputTokens != 3 || rec.OutputTokens != 4 {
@@ -419,9 +419,9 @@ func TestSigV4RequestIsTranslatedAndSigned(t *testing.T) {
 	assertNoCredentialMaterial(t, rec)
 }
 
-// A sigv4 default route maps the model the caller asked for, since no alias
+// A sigv4 default Seat maps the model the caller asked for, since no binding
 // named one for it.
-func TestSigV4DefaultRouteMapsTheInboundModel(t *testing.T) {
+func TestSigV4DefaultSeatMapsTheInboundModel(t *testing.T) {
 	writeCallerKeyFile(t)
 	writeModelMap(t, fmt.Sprintf(`{"claude-opus-5":%q}`, bedrockARN))
 	workingAWS(t)
@@ -430,7 +430,7 @@ func TestSigV4DefaultRouteMapsTheInboundModel(t *testing.T) {
 	recorder := newRecorder()
 
 	cfg := proxy.Config{
-		Registry: newContextRegistry(t, sigv4DefaultContext("work")),
+		Registry: newRegistryDocument(t, sigv4DefaultRegistry("work")),
 		Recorder: recorder,
 		Client:   anthropicClient(t, stub),
 		Logger:   nil,
@@ -449,8 +449,12 @@ func TestSigV4DefaultRouteMapsTheInboundModel(t *testing.T) {
 	}
 
 	rec := recorder.wait(t)
-	if rec.Model != "claude-opus-5" || rec.Context != "work" {
-		t.Errorf("record = %q in %q; want the inbound model in the work context", rec.Model, rec.Context)
+	if !modelIs(rec.Model, "claude-opus-5") || rec.Context != "work" {
+		t.Errorf(
+			"record = %s in %q; want the inbound model in the work context",
+			shownModel(rec.Model),
+			rec.Context,
+		)
 	}
 }
 
@@ -506,7 +510,10 @@ func TestSigV4RequiresTheCallerKey(t *testing.T) {
 	}
 
 	if got := execCount(t, logPath); got != 0 {
-		t.Errorf("aws ran %d times; want none — an unauthenticated caller must not spend AWS credentials", got)
+		t.Errorf(
+			"aws ran %d times; want none — an unauthenticated caller must not spend AWS credentials",
+			got,
+		)
 	}
 }
 
@@ -521,7 +528,7 @@ func TestSigV4RefusesNonMessagesPaths(t *testing.T) {
 			name:   "count_tokens is not implemented",
 			path:   "/v1/messages/count_tokens",
 			status: http.StatusNotImplemented,
-			want:   "patchbay: count_tokens is not supported for Bedrock routes",
+			want:   "patchbay: count_tokens is not supported for Bedrock Seats",
 		},
 		{
 			name:   "another endpoint is not found",
@@ -570,8 +577,10 @@ func TestSigV4TranslatesAStreamToSSE(t *testing.T) {
 			`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
 		bedrockEvent("content_block_delta",
 			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`),
-		bedrockEvent("message_delta",
-			`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}`),
+		bedrockEvent(
+			"message_delta",
+			`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}`,
+		),
 		bedrockEvent("message_stop", `{"type":"message_stop"}`),
 	}
 
@@ -670,7 +679,11 @@ func TestSigV4EndsACorruptedStream(t *testing.T) {
 	cfg := bedrockConfig(t, client, newRecorder())
 	cfg.Logger = slog.New(sink)
 
-	answer := serve(t, cfg, messagesRequest(`{"model":"bedrock/sonnet","stream":true,"max_tokens":4}`))
+	answer := serve(
+		t,
+		cfg,
+		messagesRequest(`{"model":"bedrock/sonnet","stream":true,"max_tokens":4}`),
+	)
 
 	stream := answer.Body.String()
 
@@ -735,7 +748,11 @@ func TestSigV4RetriesOnceOnRejection(t *testing.T) {
 	answer := serve(t, cfg, messagesRequest(`{"model":"bedrock/sonnet","max_tokens":4}`))
 
 	if answer.Code != http.StatusOK {
-		t.Fatalf("status = %d (%s); want the retry to succeed with 200", answer.Code, answer.Body.String())
+		t.Fatalf(
+			"status = %d (%s); want the retry to succeed with 200",
+			answer.Code,
+			answer.Body.String(),
+		)
 	}
 
 	if stub.hits() != 2 {
@@ -846,6 +863,16 @@ func TestSigV4ReportsAnUnreadableModelMap(t *testing.T) {
 
 	if answer.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d (%s); want 500", answer.Code, answer.Body.String())
+	}
+
+	// It blames the Seat without naming one. A Seat ID belongs to the operator's
+	// registry, and a fabricated stand-in reads to everybody as a real one.
+	body := answer.Body.String()
+	if !strings.Contains(body, "the selected Seat has an unusable model map") {
+		t.Errorf("refusal %q does not blame the selected Seat's model map", body)
+	}
+	if strings.Contains(body, `selected\"`) || strings.Contains(body, `"selected"`) {
+		t.Errorf("refusal %q quotes a fabricated Seat ID", body)
 	}
 
 	if stub.hits() != 0 {

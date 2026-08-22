@@ -137,23 +137,40 @@ type FinalizedRequest struct {
 }
 
 // PendingRequest is the immutable request identity captured before upstream contact.
+//
+// SeatID and Seat are the Seat the request actually rides, taken from the one
+// Resolution the forward path and the ledger record read. They are recorded
+// together because neither answers for the other: the ID names the row an
+// operator can look up, and the Seat carries the upstream, the rewrite and the
+// billing policy that decide what the request costs.
+//
+// RequestModel is the exact string the caller asked with, and may be empty —
+// that is a request that named no model, not a model named "". A Seat that
+// binds no rewrite leaves the resolved model equally empty, and both are stored
+// as they stand.
 type PendingRequest struct {
 	StartedAt       time.Time
 	Kind            RequestKind
 	Host            string
 	Context         string
-	Route           registry.Route
+	SeatID          string
+	Seat            registry.Seat
 	RequestModel    string
 	CredentialClass billing.CredentialClass
 }
 
+// pendingSnapshot is the derived row one pending request inserts as.
+//
+// Its seatID and upstream land in the route_alias and route_upstream columns,
+// which keep their names so already-imported history stays readable. The names
+// are the schema's; the values are the Seat's.
 type pendingSnapshot struct {
 	startedAt     int64
-	routeAlias    any
-	routeUpstream string
+	seatID        string
+	upstream      string
 	resolvedModel string
 	billingPolicy billing.Policy
-	billingClass  billing.Class
+	billingClass  any
 }
 
 // InsertPending durably records an upstream-eligible request before contact.
@@ -192,14 +209,14 @@ func (store *Store) InsertPending(ctx context.Context, request PendingRequest) (
 		request.Kind.String(),
 		request.Host,
 		request.Context,
-		snapshot.routeAlias,
-		snapshot.routeUpstream,
+		snapshot.seatID,
+		snapshot.upstream,
 		request.RequestModel,
 		snapshot.resolvedModel,
-		string(request.Route.Auth),
+		string(request.Seat.AuthMode),
 		request.CredentialClass.String(),
 		snapshot.billingPolicy.String(),
-		snapshot.billingClass.String(),
+		snapshot.billingClass,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert pending request: %w", err)
@@ -1010,12 +1027,12 @@ func derivePendingSnapshot(ctx context.Context, request PendingRequest) (pending
 	if err != nil {
 		return pendingSnapshot{}, err
 	}
-	routeSnapshot, err := derivePendingRoute(request)
+	seatSnapshot, err := derivePendingSeat(request)
 	if err != nil {
 		return pendingSnapshot{}, err
 	}
-	routeSnapshot.startedAt = startedAt
-	return routeSnapshot, nil
+	seatSnapshot.startedAt = startedAt
+	return seatSnapshot, nil
 }
 
 func validatePendingIdentity(request PendingRequest) (int64, error) {
@@ -1035,96 +1052,116 @@ func validatePendingIdentity(request PendingRequest) (int64, error) {
 	if strings.TrimSpace(request.Context) == "" {
 		return 0, fmt.Errorf("pending request context is blank")
 	}
-	if err := registry.ValidContextName(request.Context); err != nil {
+	// A stored Context and Seat ID are the two names an operator later looks a
+	// row up by, and both came out of the same registry document. They are held
+	// to that document's own grammar, by calling it, so a row can never name a
+	// Context or a Seat no registry could have admitted.
+	if err := registry.ValidID(request.Context); err != nil {
 		return 0, fmt.Errorf("pending request context %q: %w", request.Context, err)
 	}
-	if strings.TrimSpace(request.RequestModel) == "" {
-		return 0, fmt.Errorf("pending request model is blank")
+	if strings.TrimSpace(request.SeatID) == "" {
+		return 0, fmt.Errorf("pending request seat is blank")
+	}
+	if err := registry.ValidID(request.SeatID); err != nil {
+		return 0, fmt.Errorf("pending request seat %q: %w", request.SeatID, err)
 	}
 	return startedAt, nil
 }
 
-func derivePendingRoute(request PendingRequest) (pendingSnapshot, error) {
-	upstream := request.Route.Upstream()
+// derivePendingSeat reads the accounting facts off the Seat the request rides.
+//
+// Neither model is judged. A model is an opaque exact string the registry bound
+// and the caller asked with, so a Seat that rewrites nothing leaves the resolved
+// model to the request's own — and a request that named no model leaves both
+// empty. Empty is stored as empty: a default-Seat request with no model is a
+// request that happened, and rounding it up to a model nobody named would be
+// the row lying about what was sent.
+func derivePendingSeat(request PendingRequest) (pendingSnapshot, error) {
+	upstream := request.Seat.EffectiveUpstream()
 	if strings.TrimSpace(upstream) == "" {
-		return pendingSnapshot{}, fmt.Errorf("pending request route upstream is blank")
+		return pendingSnapshot{}, fmt.Errorf("pending request seat upstream is blank")
 	}
-	resolvedModel := request.Route.Model
+	resolvedModel := request.Seat.Model
 	if resolvedModel == "" {
 		resolvedModel = request.RequestModel
 	}
-	if strings.TrimSpace(resolvedModel) == "" {
-		return pendingSnapshot{}, fmt.Errorf("pending request resolved model is blank")
-	}
-	if request.Route.Alias != "" && strings.TrimSpace(request.Route.Alias) == "" {
-		return pendingSnapshot{}, fmt.Errorf("pending request route alias is blank")
-	}
 
-	policy := request.Route.BillingPolicy()
+	policy := request.Seat.BillingPolicy()
 	if !policy.Valid() {
 		return pendingSnapshot{}, fmt.Errorf(
-			"pending request route auth mode %q yields invalid billing policy %q",
-			request.Route.Auth,
+			"pending request seat auth mode %q yields invalid billing policy %q",
+			request.Seat.AuthMode,
 			policy,
 		)
 	}
-	if err := validateBillingDeclaration(request.Route, policy); err != nil {
+	if err := validateBillingDeclaration(request.Seat, policy); err != nil {
 		return pendingSnapshot{}, err
 	}
 	if !request.CredentialClass.Valid() {
 		return pendingSnapshot{}, fmt.Errorf("pending request credential class %q is invalid", request.CredentialClass)
 	}
-	class, err := billing.RealizeClass(policy, request.Route.BillingClass, request.CredentialClass)
+	var storedClass any
+	class, err := billing.RealizeClass(policy, request.Seat.BillingClass, request.CredentialClass)
 	if err != nil {
-		return pendingSnapshot{}, fmt.Errorf("realize pending request billing class: %w", err)
-	}
-	if class == "" {
-		return pendingSnapshot{}, fmt.Errorf("realize pending request billing class returned an empty class")
+		// A forward Seat with no recognized credential is a selected local
+		// rejection, not an upstream-eligible request. Its pending row preserves the
+		// caller-derived policy and an unknown payer so the proxy can finalize the
+		// refusal as a 401 without inventing a billing class.
+		if policy != billing.PolicyCallerDerived || request.CredentialClass != billing.CredentialNone {
+			return pendingSnapshot{}, fmt.Errorf("realize pending request billing class: %w", err)
+		}
+	} else {
+		if class == "" {
+			return pendingSnapshot{}, fmt.Errorf("realize pending request billing class returned an empty class")
+		}
+		storedClass = class.String()
 	}
 
-	var alias any
-	if request.Route.Alias != "" {
-		alias = request.Route.Alias
-	}
 	return pendingSnapshot{
-		routeAlias:    alias,
-		routeUpstream: upstream,
+		seatID:        request.SeatID,
+		upstream:      upstream,
 		resolvedModel: resolvedModel,
 		billingPolicy: policy,
-		billingClass:  class,
+		billingClass:  storedClass,
 	}, nil
 }
 
-func validateBillingDeclaration(route registry.Route, policy billing.Policy) error {
+// validateBillingDeclaration holds a Seat to exactly one answer about who pays
+// for it, which is the same invariant registry admission enforces on the Seat
+// document. It is checked again here because a Seat can reach accounting
+// without passing through a file — a caller's own struct, a resolved state
+// built in process — and a row that realized its class from a declaration the
+// registry would have refused is a cost attributed to the wrong payer.
+func validateBillingDeclaration(seat registry.Seat, policy billing.Policy) error {
 	switch policy {
 	case billing.PolicyExplicit:
-		if !route.BillingClassSet {
+		if !seat.BillingClassSet {
 			return fmt.Errorf("explicit billing policy requires BillingClassSet=true")
 		}
-		if !route.BillingClass.Valid() {
+		if !seat.BillingClass.Valid() {
 			return fmt.Errorf(
 				"explicit billing policy requires a valid billing class, got %q",
-				route.BillingClass,
+				seat.BillingClass,
 			)
 		}
 	case billing.PolicyCallerDerived:
-		if route.BillingClassSet {
+		if seat.BillingClassSet {
 			return fmt.Errorf("caller-derived billing policy requires BillingClassSet=false")
 		}
-		if route.BillingClass != "" {
+		if seat.BillingClass != "" {
 			return fmt.Errorf(
 				"caller-derived billing policy cannot declare billing class %q",
-				route.BillingClass,
+				seat.BillingClass,
 			)
 		}
 	case billing.PolicySigV4Metered:
-		if route.BillingClassSet {
+		if seat.BillingClassSet {
 			return fmt.Errorf("sigv4-metered billing policy requires BillingClassSet=false")
 		}
-		if route.BillingClass != "" {
+		if seat.BillingClass != "" {
 			return fmt.Errorf(
 				"sigv4-metered billing policy cannot declare billing class %q",
-				route.BillingClass,
+				seat.BillingClass,
 			)
 		}
 	}

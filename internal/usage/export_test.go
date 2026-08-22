@@ -137,8 +137,15 @@ func TestExportIsDeterministicAndComplete(t *testing.T) {
 	if dispatched["upstream_dispatched_at"] == nil {
 		t.Fatal("dispatched upstream_dispatched_at = JSON null; want timestamp")
 	}
+	// route_alias is set before contact on every row this build writes: it
+	// carries the Seat the request rides, which is known at selection. The
+	// column stays nullable for imported v1 history, where an empty alias meant
+	// the built-in default route.
+	if got := undispatched["route_alias"]; got != defaultSeatID {
+		t.Fatalf("undispatched route_alias = %#v; want %q", got, defaultSeatID)
+	}
 	for _, column := range []string{
-		"completed_at", "upstream_dispatched_at", "upstream_target", "outcome", "route_alias", "response_id", "http_status", "normalization_complete", "input_tokens", "output_tokens",
+		"completed_at", "upstream_dispatched_at", "upstream_target", "outcome", "response_id", "http_status", "normalization_complete", "input_tokens", "output_tokens",
 		"cache_creation_input_tokens", "cache_read_input_tokens", "cache_creation_5m_input_tokens",
 		"cache_creation_1h_input_tokens", "provider_cost_present", "provider_cost_valid",
 		"provider_cost_nano_usd", "stop_reason", "block_shape", "duration_ms", "upstream_ms",

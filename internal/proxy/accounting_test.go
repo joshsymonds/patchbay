@@ -156,7 +156,7 @@ func TestAccountingLifecycleOutcomes(t *testing.T) {
 			accountant := newAccountant()
 
 			answer := serve(t, proxy.Config{
-				Registry:   newRegistry(t, identityRoute(stub.url())),
+				Registry:   newRegistry(t, identitySeat(stub.url())),
 				Host:       testHost,
 				Accountant: accountant,
 			}, tc.request)
@@ -198,7 +198,7 @@ func TestAccountingFailuresBlockUpstream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
 			answer := serve(t, proxy.Config{
-				Registry:   newRegistry(t, identityRoute(stub.url())),
+				Registry:   newRegistry(t, identitySeat(stub.url())),
 				Host:       testHost,
 				Accountant: tc.accountant,
 			}, messagesRequest(fidelityBody))
@@ -219,7 +219,7 @@ func TestAccountingFinalizationFailureIsLogged(t *testing.T) {
 	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
 	sink := newLogSink()
 	answer := serve(t, proxy.Config{
-		Registry:   newRegistry(t, identityRoute(stub.url())),
+		Registry:   newRegistry(t, identitySeat(stub.url())),
 		Host:       testHost,
 		Logger:     slog.New(sink),
 		Accountant: &stubAccountant{finalizeErr: errors.New("disk unavailable"), done: make(chan struct{}, 1)},
@@ -239,7 +239,7 @@ func TestAccountingFinalizesBeforeABlockingLedgerAppend(t *testing.T) {
 	t.Cleanup(func() { close(recorder.release) })
 
 	answer := serve(t, proxy.Config{
-		Registry:   newRegistry(t, identityRoute(stub.url())),
+		Registry:   newRegistry(t, identitySeat(stub.url())),
 		Recorder:   recorder,
 		Host:       testHost,
 		Accountant: accountant,
@@ -273,7 +273,7 @@ func TestAccountingTransportFailure(t *testing.T) {
 	accountant := newAccountant()
 	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
 	answer := serve(t, proxy.Config{
-		Registry:   newRegistry(t, identityRoute(stub.url())),
+		Registry:   newRegistry(t, identitySeat(stub.url())),
 		Client:     &http.Client{Transport: failingTransport{}},
 		Host:       testHost,
 		Accountant: accountant,
@@ -342,7 +342,7 @@ func TestAccountingRequestKinds(t *testing.T) {
 			stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
 			accountant := newAccountant()
 			serve(t, proxy.Config{
-				Registry:   newRegistry(t, identityRoute(stub.url())),
+				Registry:   newRegistry(t, identitySeat(stub.url())),
 				Host:       testHost,
 				Accountant: accountant,
 			}, tc.req())
@@ -362,7 +362,7 @@ func TestAccountingPreservesInvalidProviderCost(t *testing.T) {
 	stub := newUpstream(t, jsonHandler(http.StatusOK,
 		`{"type":"message","id":"msg_invalid_cost","content":[],"usage":{"cost":"not-a-cost"}}`))
 	serve(t, proxy.Config{
-		Registry:   newRegistry(t, identityRoute(stub.url())),
+		Registry:   newRegistry(t, identitySeat(stub.url())),
 		Host:       testHost,
 		Accountant: accountant,
 	}, messagesRequest(fidelityBody))
@@ -387,7 +387,7 @@ func TestAccountingSkipsPreRouteRejections(t *testing.T) {
 			cfg: func(t *testing.T) proxy.Config {
 				t.Helper()
 
-				return proxy.Config{Registry: newRegistry(t, identityRoute("http://upstream.invalid")), Host: testHost}
+				return proxy.Config{Registry: newRegistry(t, identitySeat("http://127.0.0.1:1")), Host: testHost}
 			},
 			req: func() *http.Request {
 				return httptest.NewRequest(http.MethodPost, "/v1/messages", iotest.ErrReader(errors.New("body failed")))
@@ -398,7 +398,7 @@ func TestAccountingSkipsPreRouteRejections(t *testing.T) {
 			cfg: func(t *testing.T) proxy.Config {
 				t.Helper()
 
-				return proxy.Config{Registry: newRegistry(t, identityRoute("http://upstream.invalid")), Host: testHost}
+				return proxy.Config{Registry: newRegistry(t, identitySeat("http://127.0.0.1:1")), Host: testHost}
 			},
 			req: func() *http.Request { return inContext(messagesRequest(fidelityBody), "vanished") },
 		},
@@ -450,7 +450,7 @@ func TestAccountingFinalizesCredentialRejections(t *testing.T) {
 				req.Header.Del(callerKeyHeader)
 
 				return stub, proxy.Config{
-					Registry: newRegistry(t, identityRoute(stub.url())),
+					Registry: newRegistry(t, identitySeat(stub.url())),
 					Host:     testHost,
 				}, req
 			},
@@ -553,10 +553,9 @@ func TestAccountingStoreLifecycle(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 		jsonHandler(http.StatusOK, accountingTurn)(w, nil)
 	})
-	route := identityRoute(stub.url())
-	route = route[:len(route)-1] + `,"billing":"self_hosted"}`
+	seat := billedSeat(stub.url(), "self_hosted")
 	pipeline := newProxy(t, proxy.Config{
-		Registry:   newRegistry(t, route),
+		Registry:   newRegistry(t, seat),
 		Host:       testHost,
 		Accountant: store,
 	})
@@ -658,10 +657,9 @@ func TestAccountingDrainTimeoutLeavesPendingRow(t *testing.T) {
 	}
 	sink := newLogSink()
 	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
-	route := identityRoute(stub.url())
-	route = route[:len(route)-1] + `,"billing":"self_hosted"}`
+	seat := billedSeat(stub.url(), "self_hosted")
 	pipeline := newProxy(t, proxy.Config{
-		Registry:   newRegistry(t, route),
+		Registry:   newRegistry(t, seat),
 		Host:       testHost,
 		Logger:     slog.New(sink),
 		Accountant: accountant,
