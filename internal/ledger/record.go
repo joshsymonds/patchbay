@@ -49,7 +49,7 @@ type Subagent struct {
 // writes absence as JSON null, while a pre-selection record has no model at all
 // and leaves an absent request model out. Reading needs no such distinction —
 // null and an omitted key both arrive as nil — so the tags are the whole of it,
-// and decodeRecord adds the shape rules a tag cannot state either.
+// and DecodeStrictLine adds the shape rules a tag cannot state either.
 type Record struct {
 	Timestamp time.Time `json:"timestamp"`
 	Host      string    `json:"host"`
@@ -198,9 +198,10 @@ func writtenModel(value *string, name string) (json.RawMessage, error) {
 	return encoded, nil
 }
 
-// decodeRecord reads one JSONL line as a record, holding it to the shape rules
-// its own selection implies. The value rules are Validate's, and the scanner
-// applies both.
+// DecodeStrictLine reads one JSONL line under the complete live v2 contract:
+// duplicate-name rejection, unknown-field refusal, selection-dependent model
+// key shape, and Record value validation. Ledger scans and external importers use
+// this one entry point so neither can accept a line the other rejects.
 //
 // It is a function rather than an UnmarshalJSON method because the rules it
 // enforces are about which KEYS a line carries, and by the time a decoded struct
@@ -222,7 +223,7 @@ func writtenModel(value *string, name string) (json.RawMessage, error) {
 // what keeps a v1-shaped line from being read as a v2 record that merely lost
 // something. The raw-key reading owns the model keys each record shape must and
 // must not carry.
-func decodeRecord(line []byte) (Record, error) {
+func DecodeStrictLine(line []byte) (Record, error) {
 	if err := jsonstrict.RejectDuplicateNames(line); err != nil {
 		return Record{}, fmt.Errorf("read ledger record: %w", err)
 	}
@@ -241,6 +242,9 @@ func decodeRecord(line []byte) (Record, error) {
 	}
 
 	if err := checkModelKeys(record, keys); err != nil {
+		return Record{}, err
+	}
+	if err := record.Validate(); err != nil {
 		return Record{}, err
 	}
 

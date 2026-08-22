@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/joshsymonds/patchbay/internal/billing"
-	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
@@ -109,52 +108,6 @@ func (record importRecord) validateMetrics(prefix string) error {
 		return fmt.Errorf("%s ledger record durations must not be negative", prefix)
 	}
 	return nil
-}
-
-// liveRecord projects the union shape onto today's strict Record after the
-// lenient import decode has ignored fields added by another build.
-func (record importRecord) liveRecord() (ledger.Record, error) {
-	var selection *ledger.Selection
-	if len(record.Selection) > 0 && string(record.Selection) != "null" {
-		var value ledger.Selection
-		if err := json.Unmarshal(record.Selection, &value); err != nil {
-			return ledger.Record{}, fmt.Errorf("decode selection: %w", err)
-		}
-		selection = &value
-	}
-	var subagent *ledger.Subagent
-	if len(record.Subagent) > 0 && string(record.Subagent) != "null" {
-		var value ledger.Subagent
-		if err := json.Unmarshal(record.Subagent, &value); err != nil {
-			return ledger.Record{}, fmt.Errorf("decode subagent: %w", err)
-		}
-		subagent = &value
-	}
-	return ledger.Record{
-		Timestamp:       record.Timestamp,
-		Host:            record.Host,
-		Context:         record.Context,
-		Selection:       selection,
-		Seat:            record.Seat,
-		Subagent:        subagent,
-		Upstream:        record.Upstream,
-		Model:           record.Model,
-		RequestModel:    record.RequestModel,
-		AuthMode:        record.AuthMode,
-		CredentialClass: record.CredentialClass,
-		ConfigSource:    record.ConfigSource,
-		Status:          record.Status,
-		InputTokens:     record.InputTokens,
-		OutputTokens:    record.OutputTokens,
-		DurationMS:      record.DurationMS,
-		UpstreamMS:      record.UpstreamMS,
-		BlockShape:      record.BlockShape,
-		DropSignature:   record.DropSignature,
-		StopReason:      record.StopReason,
-		ErrorBody:       record.ErrorBody,
-		RequestBody:     record.RequestBody,
-		ResponseBody:    record.ResponseBody,
-	}, nil
 }
 
 // validLegacyContext checks a v1 context name against v1's own grammar:

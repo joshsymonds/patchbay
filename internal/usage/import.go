@@ -15,6 +15,7 @@ import (
 
 	"github.com/joshsymonds/patchbay/internal/billing"
 	"github.com/joshsymonds/patchbay/internal/jsonstrict"
+	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/registry"
 )
 
@@ -110,12 +111,12 @@ type importPlan struct {
 // the accounting projection every version reduces to.
 type ledgerLineDecoder func([]byte) (importedRecord, error)
 
-// Ledger file prefixes. Each patchbay build stamps its own schema into the name
-// of every file it writes, which is what makes a file self-describing: v1 wrote
-// patchbay-<date>.jsonl and v2 writes patchbay-v2-<date>.jsonl.
+// Ledger filename components. Each schema has one exact dated writer shape.
 const (
 	ledgerV1FilePrefix = "patchbay-"
 	ledgerV2FilePrefix = "patchbay-v2-"
+	ledgerFileSuffix   = ".jsonl"
+	ledgerDateLayout   = "2006-01-02"
 )
 
 // ledgerDecoder picks the reader for one file from the name the build that
@@ -127,25 +128,32 @@ const (
 // would mean a corrupt v2 line could fall back to being read as a valid v1 one
 // and import wrong values under no error at all.
 //
-// The v2 prefix is tested first because it extends the v1 prefix; the other
-// order would read every v2 file as v1. A name matching neither is not a
-// patchbay ledger file, and is refused rather than guessed at.
+// The v2 shape is tested first because its prefix extends v1's. Prefix matches
+// are insufficient: backups and arbitrary names must not select a decoder.
 func ledgerDecoder(path string) (ledgerLineDecoder, error) {
 	name := filepath.Base(path)
 	switch {
-	case strings.HasPrefix(name, ledgerV2FilePrefix):
+	case isDatedLedgerName(name, ledgerV2FilePrefix):
 		return decodeLedgerV2Line, nil
-	case strings.HasPrefix(name, ledgerV1FilePrefix):
+	case isDatedLedgerName(name, ledgerV1FilePrefix):
 		return decodeLedgerV1Line, nil
 	default:
 		return nil, fmt.Errorf(
-			"import ledger %q: %q names no known ledger schema (want a %q or %q prefix)",
+			"import ledger %q: %q names no known ledger schema",
 			path,
 			name,
-			ledgerV1FilePrefix,
-			ledgerV2FilePrefix,
 		)
 	}
+}
+
+func isDatedLedgerName(name, prefix string) bool {
+	if len(name) != len(prefix)+len(ledgerDateLayout)+len(ledgerFileSuffix) ||
+		!strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ledgerFileSuffix) {
+		return false
+	}
+	date := name[len(prefix) : len(name)-len(ledgerFileSuffix)]
+	_, err := time.Parse(ledgerDateLayout, date)
+	return err == nil
 }
 
 func (store *Store) importLedgerChunks(
@@ -328,22 +336,15 @@ func decodeLedgerV1Line(contents []byte) (importedRecord, error) {
 	return record.imported(true), nil
 }
 
-// decodeLedgerV2Line uses the same lenient union decode as v1, then applies the
-// live Record's value rules. Unknown fields stay import-compatible; malformed
-// duplicate members and invalid values are still refused.
+// decodeLedgerV2Line delegates the entire live wire contract to the ledger
+// package, then projects the accepted Record onto accounting. There is no
+// import-side restatement of model-key or validation rules.
 func decodeLedgerV2Line(contents []byte) (importedRecord, error) {
-	record, err := decodeImportRecord(contents)
+	record, err := ledger.DecodeStrictLine(contents)
 	if err != nil {
-		return importedRecord{}, err
+		return importedRecord{}, fmt.Errorf("decode strict v2 ledger record: %w", err)
 	}
-	live, err := record.liveRecord()
-	if err != nil {
-		return importedRecord{}, fmt.Errorf("parse JSON: %w", err)
-	}
-	if validateErr := live.Validate(); validateErr != nil {
-		return importedRecord{}, fmt.Errorf("validate ledger record: %w", validateErr)
-	}
-	return record.imported(live.Selection != nil), nil
+	return importedV2Record(record), nil
 }
 
 func decodeImportRecord(contents []byte) (importRecord, error) {
@@ -357,10 +358,8 @@ func decodeImportRecord(contents []byte) (importRecord, error) {
 	return record, nil
 }
 
-// imported projects either wire version onto the accounting shape. Seat is the
-// current name and wins when present; alias preserves v1 history when it is not.
-// Nullable v2 models map to the empty string because the frozen accounting
-// columns are NOT NULL and live default-Seat requests use the same spelling.
+// imported projects the lenient v1 union shape onto accounting. A Seat added by
+// a later writer wins when present; alias preserves earlier history otherwise.
 func (record importRecord) imported(selected bool) importedRecord {
 	seat := record.Seat
 	if seat == "" {
@@ -377,6 +376,28 @@ func (record importRecord) imported(selected bool) importedRecord {
 		authMode:        record.AuthMode,
 		credentialClass: string(record.CredentialClass),
 		selected:        selected,
+		status:          record.Status,
+		inputTokens:     record.InputTokens,
+		outputTokens:    record.OutputTokens,
+		durationMS:      record.DurationMS,
+		upstreamMS:      record.UpstreamMS,
+		blockShape:      record.BlockShape,
+		stopReason:      record.StopReason,
+	}
+}
+
+func importedV2Record(record ledger.Record) importedRecord {
+	return importedRecord{
+		timestamp:       record.Timestamp,
+		host:            record.Host,
+		contextName:     record.Context,
+		seat:            record.Seat,
+		upstream:        record.Upstream,
+		requestModel:    importedModel(record.RequestModel),
+		resolvedModel:   importedModel(record.Model),
+		authMode:        record.AuthMode,
+		credentialClass: string(record.CredentialClass),
+		selected:        record.Selection != nil,
 		status:          record.Status,
 		inputTokens:     record.InputTokens,
 		outputTokens:    record.OutputTokens,

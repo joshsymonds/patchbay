@@ -155,16 +155,13 @@ func scanLines(reader io.Reader) ([]Record, error) {
 			if line[len(line)-1] != '\n' {
 				return records, &CorruptionError{Offset: offset, Err: io.ErrUnexpectedEOF}
 			}
-			// decodeRecord owns the whole reading of a line: unknown fields at
+			// DecodeStrictLine owns the whole reading of a line: unknown fields at
 			// every depth, trailing data, and the model keys each record shape must
 			// and must not carry — none of which survive as questions once a
 			// decoded struct is all that is left.
-			rec, decodeErr := decodeRecord(line[:len(line)-1])
+			rec, decodeErr := DecodeStrictLine(line[:len(line)-1])
 			if decodeErr != nil {
 				return records, &CorruptionError{Offset: offset, Err: decodeErr}
-			}
-			if validateErr := rec.Validate(); validateErr != nil {
-				return records, &CorruptionError{Offset: offset, Err: validateErr}
 			}
 			records = append(records, rec)
 			offset += int64(len(line))

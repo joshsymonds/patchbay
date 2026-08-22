@@ -677,7 +677,7 @@ func TestImportLedgerFileImportsV2Shapes(t *testing.T) {
 	}
 }
 
-func TestImportLedgerFileV2ToleratesUnknownFieldsAndPrefersSeat(t *testing.T) {
+func TestImportLedgerFileV2UsesStrictUnknownFieldRule(t *testing.T) {
 	t.Parallel()
 
 	model := "model"
@@ -696,31 +696,20 @@ func TestImportLedgerFileV2ToleratesUnknownFieldsAndPrefersSeat(t *testing.T) {
 		Status:          200,
 		BlockShape:      []string{},
 	}
-	line := v2Line(t, record)
-	line = strings.Replace(
-		line,
-		`"host":"h"`,
-		`"host":"h","alias":"legacy-alias","future_field":{"kept":"opaque"}`,
-		1,
-	)
+	line := strings.Replace(v2Line(t, record), `"host":"h"`, `"host":"h","alias":"legacy"`, 1)
 	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
 	path := writeLedger(t, t.TempDir(), "patchbay-v2-2026-08-20.jsonl", line+"\n")
-	if result, err := store.ImportLedgerFile(
-		context.Background(),
-		path,
-		filepath.Base(path),
-		0,
-	); err != nil || result != (ImportResult{Imported: 1}) {
-		t.Fatalf("ImportLedgerFile() = %#v, %v; want one imported row", result, err)
+	_, err := store.ImportLedgerFile(context.Background(), path, filepath.Base(path), 0)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "alias"`) {
+		t.Fatalf("ImportLedgerFile() error = %v; want strict unknown-field refusal", err)
 	}
-	got := readImportedIdentities(t, store.db)
-	if len(got) != 1 || got[0].alias != (sql.NullString{String: "current-seat", Valid: true}) {
-		t.Fatalf("imported identity = %#v; want current Seat to win over legacy alias", got)
+	if count := countStoredRequests(t, store.db); count != 0 {
+		t.Fatalf("rows after refused v2 file = %d; want none", count)
 	}
 }
 
 // TestImportLedgerFileChoosesDecoderByFileName pins that the file's own name
-// decides which validation rules apply to the lenient union decode.
+// decides whether v1's lenient historical decoder or v2's strict decoder applies.
 func TestImportLedgerFileChoosesDecoderByFileName(t *testing.T) {
 	t.Parallel()
 
@@ -740,9 +729,9 @@ func TestImportLedgerFileChoosesDecoderByFileName(t *testing.T) {
 
 				return v1Line
 			},
-			// The union decoder retains alias, but v2 validation still refuses the
-			// missing credential attribution before considering routing fields.
-			wantContains: "invalid credential_class",
+			// The strict v2 decoder rejects the v1-only alias before any values are
+			// projected into accounting.
+			wantContains: `unknown field "alias"`,
 		},
 		{
 			name:     "v2 contents under a v1 name",
@@ -803,8 +792,59 @@ func TestImportLedgerFileChoosesDecoderByFileName(t *testing.T) {
 	})
 }
 
+func TestImportLedgerFileRequiresExactDatedName(t *testing.T) {
+	t.Parallel()
+
+	const v1 = `{"timestamp":"2026-08-20T12:00:00Z","host":"h","upstream":"u",` +
+		`"model":"m","request_model":"m","auth_mode":"inject","status":200,` +
+		`"input_tokens":0,"output_tokens":0,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`
+	model := "m"
+	v2 := v2Line(t, ledger.Record{
+		Timestamp:       time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC),
+		Host:            "h",
+		Context:         "personal",
+		Selection:       &ledger.Selection{Kind: ledger.SelectionDefault},
+		Seat:            "anthropic",
+		Upstream:        "https://api.anthropic.com",
+		Model:           &model,
+		RequestModel:    &model,
+		AuthMode:        "forward",
+		CredentialClass: billing.CredentialOAuth,
+		ConfigSource:    "caller",
+		Status:          200,
+		BlockShape:      []string{},
+	})
+
+	for _, test := range []struct {
+		name, fileName, line string
+		wantError            bool
+	}{
+		{name: "v2 backup suffix", fileName: "patchbay-v2-backup.txt", line: v2, wantError: true},
+		{name: "garbage after v1 prefix", fileName: "patchbay-garbage", line: v1, wantError: true},
+		{name: "valid v1 date", fileName: "patchbay-2026-08-20.jsonl", line: v1},
+		{name: "valid v2 date", fileName: "patchbay-v2-2026-08-20.jsonl", line: v2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+			path := writeLedger(t, t.TempDir(), test.fileName, test.line+"\n")
+			result, err := store.ImportLedgerFile(context.Background(), path, filepath.Base(path), 0)
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "names no known ledger schema") {
+					t.Fatalf("ImportLedgerFile() = %#v, %v; want unknown-schema refusal", result, err)
+				}
+				return
+			}
+			if err != nil || result != (ImportResult{Imported: 1}) {
+				t.Fatalf("ImportLedgerFile() = %#v, %v; want one imported row", result, err)
+			}
+		})
+	}
+}
+
 // TestImportLedgerFileRejectsInvalidV2Records pins that a v2 file is read under
-// the live ledger's own rules, not a looser import-only copy of them.
+// the ledger package's exact strict decoder, including wire-key shape rules.
 func TestImportLedgerFileRejectsInvalidV2Records(t *testing.T) {
 	t.Parallel()
 
@@ -838,7 +878,44 @@ func TestImportLedgerFileRejectsInvalidV2Records(t *testing.T) {
 				encoded := v2Encoded(t, seated())
 				return strings.Replace(encoded, `"host":"h"`, `"host":"h","host":"other"`, 1)
 			},
-			wantContains: "parse JSON",
+			wantContains: "duplicate member",
+		},
+		{
+			name: "selected record missing model keys",
+			line: func(t *testing.T) string {
+				t.Helper()
+
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(v2Encoded(t, seated())), &fields); err != nil {
+					t.Fatal(err)
+				}
+				delete(fields, "model")
+				delete(fields, "request_model")
+				encoded, err := json.Marshal(fields)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(encoded)
+			},
+			wantContains: "must carry both model and request_model",
+		},
+		{
+			name: "pre-selection record with null request model",
+			line: func(t *testing.T) string {
+				t.Helper()
+
+				record := ledger.Record{
+					Timestamp:       base,
+					Host:            "h",
+					Context:         "missing",
+					CredentialClass: billing.CredentialOAuth,
+					Status:          404,
+					BlockShape:      []string{},
+				}
+				encoded := v2Encoded(t, record)
+				return strings.Replace(encoded, `"host":"h"`, `"host":"h","request_model":null`, 1)
+			},
+			wantContains: "must omit an absent request_model rather than null it",
 		},
 		{
 			name: "seat no registry could have admitted",
