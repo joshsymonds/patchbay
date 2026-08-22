@@ -69,8 +69,8 @@ func TestOpenCreatesSecureMigratedDatabase(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read migration version: %v", err)
 	}
-	if version != upstreamTargetDispatchEvidenceMigrationVersion {
-		t.Fatalf("migration version = %d; want %d", version, upstreamTargetDispatchEvidenceMigrationVersion)
+	if version != summaryQueryIndexesMigrationVersion {
+		t.Fatalf("migration version = %d; want %d", version, summaryQueryIndexesMigrationVersion)
 	}
 
 	var table string
@@ -92,20 +92,24 @@ func TestPrepareDatabasePathPrecreatesSecureDatabase(t *testing.T) {
 	assertMode(t, path, databaseMode)
 }
 
-func TestPrepareDatabasePathCorrectsRestrictiveUmask(t *testing.T) {
+func TestPrepareDatabasePathFailsClosedOnPathologicalUmask(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "state", "usage.sqlite")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestPrepareDatabasePathCorrectsRestrictiveUmaskHelper$")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPrepareDatabasePathFailsClosedOnPathologicalUmaskHelper$")
 	cmd.Env = append(os.Environ(), "PATCHBAY_USAGE_RESTRICTIVE_UMASK_PATH="+path)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("prepareDatabasePath under restrictive umask: %v\n%s", err, output)
+		t.Fatalf("prepareDatabasePath pathological-umask helper: %v\n%s", err, output)
 	}
-
-	assertMode(t, path, databaseMode)
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("restore pathological-umask fixture mode: %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database created under pathological umask: %v", err)
+	}
 }
 
-func TestPrepareDatabasePathCorrectsRestrictiveUmaskHelper(t *testing.T) {
+func TestPrepareDatabasePathFailsClosedOnPathologicalUmaskHelper(t *testing.T) {
 	path := os.Getenv("PATCHBAY_USAGE_RESTRICTIVE_UMASK_PATH")
 	if path == "" {
 		return
@@ -114,10 +118,10 @@ func TestPrepareDatabasePathCorrectsRestrictiveUmaskHelper(t *testing.T) {
 	previousUmask := syscall.Umask(0o777)
 	defer syscall.Umask(previousUmask)
 
-	if err := prepareDatabasePath(path); err != nil {
-		t.Fatalf("prepareDatabasePath(%q): %v", path, err)
+	err := prepareDatabasePath(path)
+	if err == nil || !strings.Contains(err.Error(), "umask") {
+		t.Fatalf("prepareDatabasePath(%q) error = %v; want pathological-umask refusal", path, err)
 	}
-	assertMode(t, path, databaseMode)
 }
 
 func TestSecureCreatedDatabaseReportsChmodAndCloseFailures(t *testing.T) {
@@ -201,7 +205,35 @@ func TestOpenRejectsDatabaseSymlink(t *testing.T) {
 	assertMode(t, target, 0o644)
 }
 
-func TestOpenCorrectsPermissiveModes(t *testing.T) {
+func TestCreatedDatabaseParentRejectsSwappedWrongModeDirectoryWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "swapped")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := syscall.Open(
+		path,
+		syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := syscall.Close(fd); closeErr != nil {
+			t.Errorf("close swapped directory descriptor: %v", closeErr)
+		}
+	}()
+
+	err = verifyCreatedDatabaseParentDescriptor(path, fd, os.Geteuid())
+	if err == nil || !strings.Contains(err.Error(), "umask") {
+		t.Fatalf("verifyCreatedDatabaseParentDescriptor() error = %v; want mode/umask refusal", err)
+	}
+	assertMode(t, path, 0o755)
+}
+
+func TestOpenLeavesPreexistingParentModeUntouched(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -215,8 +247,69 @@ func TestOpenCorrectsPermissiveModes(t *testing.T) {
 	}
 
 	_ = openStore(t, path)
-	assertMode(t, parent, 0o700)
+	assertMode(t, parent, 0o755)
 	assertMode(t, path, 0o600)
+}
+
+func TestOpenRejectsParentPathSymlinkWithoutChangingTarget(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "state")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(link, "usage.sqlite")
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("Open(%q) error = %v; want parent symbolic-link rejection", path, err)
+	}
+	assertMode(t, target, 0o755)
+	if _, err := os.Lstat(filepath.Join(target, "usage.sqlite")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database appeared through parent symlink: %v", err)
+	}
+}
+
+func TestOpenDatabaseRechecksPreparedFileIdentity(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.sqlite")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("create original database: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close original database: %v", err)
+	}
+	identity, err := prepareDatabasePathIdentity(path)
+	if err != nil {
+		t.Fatalf("prepare original database: %v", err)
+	}
+
+	replacement := filepath.Join(dir, "replacement.sqlite")
+	replacementStore, err := Open(replacement)
+	if err != nil {
+		t.Fatalf("create replacement database: %v", err)
+	}
+	if err := replacementStore.Close(); err != nil {
+		t.Fatalf("close replacement database: %v", err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatalf("replace prepared database: %v", err)
+	}
+
+	db, err := openPreparedDatabase(path, identity)
+	if db != nil {
+		_ = db.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "changed while opening") {
+		t.Fatalf("openPreparedDatabase() error = %v; want identity-change refusal", err)
+	}
 }
 
 func TestOpenIsIdempotent(t *testing.T) {
@@ -244,13 +337,13 @@ func TestOpenIsIdempotent(t *testing.T) {
 		Scan(&count, &version); err != nil {
 		t.Fatal(err)
 	}
-	if count != upstreamTargetDispatchEvidenceMigrationVersion ||
-		version != upstreamTargetDispatchEvidenceMigrationVersion {
+	if count != summaryQueryIndexesMigrationVersion ||
+		version != summaryQueryIndexesMigrationVersion {
 		t.Fatalf("migration rows = %d, max version = %d; want %d, %d",
 			count,
 			version,
-			upstreamTargetDispatchEvidenceMigrationVersion,
-			upstreamTargetDispatchEvidenceMigrationVersion,
+			summaryQueryIndexesMigrationVersion,
+			summaryQueryIndexesMigrationVersion,
 		)
 	}
 }
@@ -441,6 +534,48 @@ func TestUpstreamTargetDispatchEvidenceMigrationPreservesVersionFourRows(t *test
 		`UPDATE accounting_requests SET upstream_target = 'arn:example' WHERE id = 1`,
 	); err == nil {
 		t.Fatal("target without upstream contact update returned nil error")
+	}
+}
+
+func TestSummaryIndexesMigrationPreservesVersionFiveRows(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	db := inspectDB(t, path)
+	if err := applyMigrations(db, declaredMigrations()[:upstreamTargetDispatchEvidenceMigrationVersion]); err != nil {
+		t.Fatalf("apply migrations through version 5: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO accounting_requests (
+		started_at, request_kind, lifecycle_state, upstream_contacted, route_host, route_context,
+		route_upstream, request_model, resolved_model, auth_mode, credential_class, billing_policy,
+		cost_status
+	) VALUES (123, 'messages', 'pending', 0, 'gnomon', 'personal',
+		'https://api.anthropic.com', 'claude-sonnet-5', 'claude-sonnet-5', 'forward', 'oauth',
+		'credential_derived', 'pending')`); err != nil {
+		t.Fatalf("insert version-5 row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version-5 database: %v", err)
+	}
+
+	store := openStore(t, path)
+	var startedAt int64
+	if err := store.db.QueryRow(
+		`SELECT started_at FROM accounting_requests WHERE id = 1`,
+	).Scan(&startedAt); err != nil {
+		t.Fatalf("read upgraded row: %v", err)
+	}
+	if startedAt != 123 {
+		t.Fatalf("upgraded row started_at = %d; want 123", startedAt)
+	}
+	for _, name := range []string{summaryWindowIndexName, summaryContextWindowIndexName} {
+		var found string
+		if err := store.db.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`,
+			name,
+		).Scan(&found); err != nil {
+			t.Fatalf("read summary index %q: %v", name, err)
+		}
 	}
 }
 
@@ -689,7 +824,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	}
 	defer db.Close()
 
-	failing := migration{version: 6, name: "fail", statements: []string{
+	failing := migration{version: 7, name: "fail", statements: []string{
 		`CREATE TABLE must_not_survive (id INTEGER)`,
 		`THIS IS NOT SQL`,
 	}}
@@ -706,7 +841,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	if count != 0 {
 		t.Fatal("failed migration published partial schema")
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 6`).
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 7`).
 		Scan(&count); err != nil {
 		t.Fatal(err)
 	}

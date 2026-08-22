@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -9,8 +10,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1041,7 +1040,7 @@ func TestImportLedgerFileRejectsInvalidV2Records(t *testing.T) {
 
 func TestImportLedgerFileYieldsToConcurrentLiveWriters(t *testing.T) {
 	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
-	ledger := writeLedger(
+	ledgerPath := writeLedger(
 		t,
 		t.TempDir(),
 		"patchbay-2026-08-20.jsonl",
@@ -1050,58 +1049,121 @@ func TestImportLedgerFileYieldsToConcurrentLiveWriters(t *testing.T) {
 			importChunkLines*2+1,
 		),
 	)
-	stop := make(chan struct{})
-	errs := make(chan error, 1)
-	var completed atomic.Int64
-	var once sync.Once
-	started := make(chan struct{})
-	var writers sync.WaitGroup
-	writers.Add(1)
-	go func() {
-		defer writers.Done()
-		for index := 0; ; index++ {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			request := validPendingRequest()
-			request.StartedAt = request.StartedAt.Add(time.Duration(index))
-			id, err := store.InsertPending(t.Context(), request)
-			if err != nil {
-				errs <- err
-				return
-			}
-			finalized := validFinalizedRequest()
-			finalized.CompletedAt = finalized.CompletedAt.Add(time.Duration(index))
-			finalized.ResponseID = fmt.Sprintf("msg-concurrent-%d", index)
-			if err := store.Finalize(t.Context(), id, finalized); err != nil {
-				errs <- err
-				return
-			}
-			completed.Add(1)
-			once.Do(func() { close(started) })
+	betweenChunks := make(chan struct{})
+	continueImport := make(chan struct{})
+	ctx := context.WithValue(t.Context(), importAfterChunkHookKey{}, func(committed int) {
+		if committed == 1 {
+			close(betweenChunks)
+			<-continueImport
 		}
+	})
+	type importOutcome struct {
+		result ImportResult
+		err    error
+	}
+	importDone := make(chan importOutcome, 1)
+	go func() {
+		result, err := store.ImportLedgerFile(ctx, ledgerPath, filepath.Base(ledgerPath), 0)
+		importDone <- importOutcome{result: result, err: err}
+	}()
+
+	select {
+	case <-betweenChunks:
+	case <-time.After(5 * time.Second):
+		t.Fatal("import did not commit its first chunk")
+	}
+	writerDone := make(chan error, 1)
+	go func() {
+		_, err := store.InsertPending(t.Context(), validPendingRequest())
+		writerDone <- err
 	}()
 	select {
-	case <-started:
-	case err := <-errs:
-		t.Fatalf("initial live writer failure: %v", err)
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("live writer between import chunks: %v", err)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("live writer did not start")
+		close(continueImport)
+		<-importDone
+		t.Fatal("live writer did not complete between import chunk transactions")
 	}
-	if _, err := store.ImportLedgerFile(t.Context(), ledger, filepath.Base(ledger), 0); err != nil {
-		t.Fatalf("ImportLedgerFile() error: %v", err)
+	close(continueImport)
+
+	outcome := <-importDone
+	if outcome.err != nil {
+		t.Fatalf("ImportLedgerFile() error: %v", outcome.err)
 	}
-	close(stop)
-	writers.Wait()
-	select {
-	case err := <-errs:
-		t.Fatalf("concurrent live writer failure: %v", err)
-	default:
+	if outcome.result.Imported != importChunkLines*2+1 {
+		t.Fatalf("imported rows = %d; want %d", outcome.result.Imported, importChunkLines*2+1)
 	}
-	if completed.Load() == 0 {
-		t.Fatal("concurrent live writer completed no requests")
+}
+
+func TestPrepareImportBatchBoundsCountAndBytesBeforeDecode(t *testing.T) {
+	line := []byte(
+		`{"timestamp":"2026-08-20T12:00:00Z","host":"host","upstream":"upstream",` +
+			`"model":"model","request_model":"model","auth_mode":"inject","status":200,` +
+			`"input_tokens":0,"output_tokens":1,"duration_ms":0,"upstream_ms":0,"block_shape":[]}`,
+	)
+	lineBytes := len(line) + 1
+	decodes := 0
+	plan := importPlan{
+		path:   "ledger.jsonl",
+		source: "ledger.jsonl",
+		decode: func(contents []byte) (importedRecord, error) {
+			decodes++
+			return decodeLedgerV1Line(contents)
+		},
+	}
+
+	countScanner := bufio.NewScanner(strings.NewReader(strings.Repeat(string(line)+"\n", 3)))
+	countScanner.Buffer(make([]byte, initialLedgerScanBuffer), maxLedgerLineBytes)
+	countReader := importBatchReader{scanner: countScanner}
+	countBatch, err := countReader.prepareBatch(plan, 2, lineBytes*3)
+	if err != nil {
+		t.Fatalf("prepare count-bounded batch: %v", err)
+	}
+	if len(countBatch.lines) != 2 || countBatch.sourceBytes != lineBytes*2 || countBatch.finished {
+		t.Fatalf("count-bounded batch = %d lines, %d bytes, finished=%t; want 2, %d, false",
+			len(countBatch.lines), countBatch.sourceBytes, countBatch.finished, lineBytes*2)
+	}
+	if decodes != 2 {
+		t.Fatalf("count-bounded decoder calls = %d; want 2 admitted lines", decodes)
+	}
+
+	decodes = 0
+	byteScanner := bufio.NewScanner(strings.NewReader(strings.Repeat(string(line)+"\n", 3)))
+	byteScanner.Buffer(make([]byte, initialLedgerScanBuffer), maxLedgerLineBytes)
+	byteReader := importBatchReader{scanner: byteScanner}
+	byteBatch, err := byteReader.prepareBatch(plan, 3, lineBytes*2-1)
+	if err != nil {
+		t.Fatalf("prepare byte-bounded batch: %v", err)
+	}
+	if len(byteBatch.lines) != 1 || byteBatch.sourceBytes != lineBytes || byteBatch.finished {
+		t.Fatalf("byte-bounded batch = %d lines, %d bytes, finished=%t; want 1, %d, false",
+			len(byteBatch.lines), byteBatch.sourceBytes, byteBatch.finished, lineBytes)
+	}
+	if decodes != 1 {
+		t.Fatalf("byte-bounded decoder calls = %d; want overflow line carried raw", decodes)
+	}
+	secondBatch, err := byteReader.prepareBatch(plan, 3, lineBytes*2-1)
+	if err != nil {
+		t.Fatalf("prepare byte-bounded carry batch: %v", err)
+	}
+	if len(secondBatch.lines) != 1 || secondBatch.lines[0].line != 2 || decodes != 2 {
+		t.Fatalf("carry batch = %#v with %d decoder calls; want only source line 2 decoded next", secondBatch, decodes)
+	}
+
+	decodes = 0
+	oversizedScanner := bufio.NewScanner(strings.NewReader(string(line) + "\n"))
+	oversizedScanner.Buffer(make([]byte, initialLedgerScanBuffer), maxLedgerLineBytes)
+	oversizedReader := importBatchReader{scanner: oversizedScanner}
+	oversizedBatch, err := oversizedReader.prepareBatch(plan, 3, lineBytes-1)
+	if err != nil {
+		t.Fatalf("prepare oversized single-line batch: %v", err)
+	}
+	if len(oversizedBatch.lines) != 1 || oversizedBatch.sourceBytes != lineBytes || decodes != 1 {
+		t.Fatalf("oversized batch = %#v with %d decoder calls; want one admitted line of %d bytes",
+			oversizedBatch, decodes, lineBytes)
 	}
 }
 

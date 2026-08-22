@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/joshsymonds/patchbay/internal/usage"
 )
 
 func envMap(values map[string]string) lookupEnvFunc {
@@ -287,9 +289,19 @@ func TestLoadRateCardsFileParsesExactJSONRates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadRateCardsFile() returned error: %v", err)
 	}
-	if len(cards) != 1 || cards[0].InputNanoUSDPerMillion != 3_000_000_000 ||
-		cards[0].EffectiveFrom.Format(time.RFC3339) != "2026-05-01T12:00:00Z" {
-		t.Fatalf("parsed cards = %#v; want exact rate and timestamp", cards)
+	want := []usage.RateCard{{
+		Model:                            "openrouter/model",
+		EffectiveFrom:                    time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC),
+		InputNanoUSDPerMillion:           3_000_000_000,
+		OutputNanoUSDPerMillion:          15_000_000_000,
+		CacheReadNanoUSDPerMillion:       300_000_000,
+		CacheCreationNanoUSDPerMillion:   3_750_000_000,
+		CacheCreation5mNanoUSDPerMillion: 3_750_000_000,
+		CacheCreation1hNanoUSDPerMillion: 6_000_000_000,
+		Source:                           "provider price sheet",
+	}}
+	if !reflect.DeepEqual(cards, want) {
+		t.Fatalf("parsed cards = %#v; want %#v", cards, want)
 	}
 }
 

@@ -284,9 +284,15 @@ credential source, and any validated subagent observation. Pre-selection failure
 omit selection-dependent fields. `capture_bodies: true` stores rewritten request
 and captured response bodies.
 
-Only v2 files are scanned; there is no legacy decoder. Ledger writes happen after
-the client response. A capture or append failure drops the record and logs a
-warning without changing the response. See [docs/ledger.md](docs/ledger.md).
+Only v2 files are scanned; there is no legacy decoder. After relaying the client
+response, Patchbay materializes the finalized accounting snapshot and ledger
+record and submits that compact work to a fixed-capacity completion queue. A
+bounded worker set durably finalizes accounting before appending the ledger copy;
+a full queue applies backpressure after response relay rather than dropping
+accounting. A capture or append failure drops the ledger record and logs a
+warning without changing the response. Shutdown drains this queue only until its
+bounded deadline, logs unfinished work loudly, and leaves any requests that did
+not finalize as crash-equivalent pending rows. See [docs/ledger.md](docs/ledger.md).
 
 ## Accounting
 
@@ -297,7 +303,15 @@ consistent even while the daemon is writing. `patchbay usage export <dest>`
 writes the same point-in-time data as deterministic JSONL: a version header,
 then `rate_cards` rows and `accounting_requests` rows in ID order. Both commands
 read the database without migrating or changing it, refuse an existing
-destination, and create a 0600 destination file.
+destination, and create a 0600 destination file. Work in progress stays inside
+an adjacent mode-0700 staging directory on the destination filesystem; Patchbay
+validates and fsyncs the artifact, secures it to 0600, then publishes it with a
+no-replace link and fsyncs the destination directory. An abrupt process or host
+failure can leave that private staging directory behind. Each run holds an
+exclusive lock on a lockfile inside its staging directory for the full operation.
+A later tooling run considers only matching directories at least one hour old and
+removes one only after acquiring its lock nonblocking; a held lock proves the
+staging directory is live, while younger residue is retained until a later run.
 
 The live `PATCHBAY_USAGE_DB` must remain on a local filesystem. Snapshot and
 export destinations can be anywhere. To restore a snapshot, stop the daemon,
@@ -314,7 +328,10 @@ keeps its ledger basename and one-based line number as `import_source` and
 makes a rerun safe and lets a resumed import skip only records already stored.
 Idempotence assumes ledger files are immutable: changing an imported line, or
 importing a different file with the same basename, retains the originally
-imported accounting row for that basename and line number.
+imported accounting row for that basename and line number. Patchbay reads,
+decodes, validates, and derives each chunk before taking the write permit; a
+chunk is bounded to 500 lines and 32 MiB of source data, then commits atomically
+in a short transaction. Live request writes can complete between chunks.
 
 Before the first file, Patchbay fixes one overlap boundary at the earliest live
 SQLite `started_at`. If the live table is empty, the boundary is the instant the

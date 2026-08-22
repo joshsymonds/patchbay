@@ -82,8 +82,8 @@ func TestExportIsDeterministicAndComplete(t *testing.T) {
 	if err := json.Unmarshal(lines[0], &header); err != nil {
 		t.Fatalf("decode header: %v", err)
 	}
-	if header.PatchbayUsageExport != 1 || header.SchemaVersion != upstreamTargetDispatchEvidenceMigrationVersion {
-		t.Fatalf("header = %+v; want export 1 and schema %d", header, upstreamTargetDispatchEvidenceMigrationVersion)
+	if header.PatchbayUsageExport != 1 || header.SchemaVersion != summaryQueryIndexesMigrationVersion {
+		t.Fatalf("header = %+v; want export 1 and schema %d", header, summaryQueryIndexesMigrationVersion)
 	}
 
 	var rateCardRow map[string]any
@@ -164,10 +164,7 @@ func TestExportRefusesExistingDestinationAndLeavesNoPartial(t *testing.T) {
 	if exportErr == nil || !strings.Contains(exportErr.Error(), "does not exist") {
 		t.Fatalf("Export(missing source) error = %v; want source refusal", exportErr)
 	}
-	partials, err := filepath.Glob(failedAfterTemp + ".partial-*")
-	if err != nil {
-		t.Fatal(err)
-	}
+	partials := toolingStagingMatches(t, failedAfterTemp)
 	if len(partials) != 0 {
 		t.Fatalf("partial exports = %v; want none", partials)
 	}
@@ -203,10 +200,7 @@ func TestExportRefusesExistingDestinationAndLeavesNoPartial(t *testing.T) {
 	if exportErr == nil || !strings.Contains(exportErr.Error(), "destination directory") {
 		t.Fatalf("Export(blocked destination) error = %v; want destination failure", exportErr)
 	}
-	partials, err = filepath.Glob(filepath.Join(filepath.Dir(failed), filepath.Base(failed)+".partial-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	partials = toolingStagingMatches(t, failed)
 	if len(partials) != 0 {
 		t.Fatalf("partial exports = %v; want none", partials)
 	}
@@ -240,10 +234,7 @@ func TestExportFailureAfterWritingPartialLeavesNoOutput(t *testing.T) {
 	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
 		t.Fatalf("failed export destination stat error = %v; want absent destination", statErr)
 	}
-	partials, globErr := filepath.Glob(dest + ".partial-*")
-	if globErr != nil {
-		t.Fatal(globErr)
-	}
+	partials := toolingStagingMatches(t, dest)
 	if len(partials) != 0 {
 		t.Fatalf("partial exports = %v; want none", partials)
 	}

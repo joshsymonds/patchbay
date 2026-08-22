@@ -24,7 +24,10 @@ const (
 	maxLedgerLineBytes        = 16 * 1024 * 1024
 	nanosecondsPerMillisecond = int64(time.Millisecond)
 	importChunkLines          = 500
-	importCleanupTimeout      = time.Second
+	// importChunkBytes bounds pre-transaction preparation to two maximum-sized
+	// ledger lines, preventing a small line count from becoming an unbounded batch.
+	importChunkBytes     = 32 * 1024 * 1024
+	importCleanupTimeout = time.Second
 )
 
 // ImportResult reports one immutable ledger file's accounting outcome.
@@ -59,7 +62,8 @@ func (store *Store) ImportBoundary(ctx context.Context) (int64, error) {
 	return boundary.Int64, nil
 }
 
-// ImportLedgerFile imports one v1 or v2 ledger file in a single transaction.
+// ImportLedgerFile imports one v1 or v2 ledger file in atomic chunks. Each chunk
+// is decoded, validated, and derived before its short write transaction begins.
 // The caller owns file ordering and discovers the boundary once for the whole run.
 func (store *Store) ImportLedgerFile(
 	ctx context.Context,
@@ -161,6 +165,33 @@ func isDatedLedgerName(name, prefix string) bool {
 	return err == nil
 }
 
+type importAfterChunkHookKey struct{}
+
+type preparedImportLine struct {
+	line            int
+	skippedBoundary bool
+	row             importedLedgerRow
+}
+
+type importBatch struct {
+	lines       []preparedImportLine
+	sourceBytes int
+	finished    bool
+}
+
+type rawImportLine struct {
+	line        int
+	contents    []byte
+	sourceBytes int
+}
+
+type importBatchReader struct {
+	scanner   *bufio.Scanner
+	line      int
+	pending   *rawImportLine
+	exhausted bool
+}
+
 func (store *Store) importLedgerChunks(
 	ctx context.Context,
 	file *os.File,
@@ -168,50 +199,138 @@ func (store *Store) importLedgerChunks(
 ) (ImportResult, error) {
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, initialLedgerScanBuffer), maxLedgerLineBytes)
+	reader := importBatchReader{scanner: scanner}
 	var total ImportResult
-	line := 0
+	committed := 0
 	for {
-		chunk, finished, err := store.importLedgerChunk(ctx, scanner, plan, &line)
-		if err != nil {
-			return ImportResult{}, err
+		batch, prepareErr := reader.prepareBatch(plan, importChunkLines, importChunkBytes)
+		if prepareErr != nil {
+			return ImportResult{}, prepareErr
+		}
+		if len(batch.lines) == 0 && batch.finished {
+			return total, nil
+		}
+		chunk, writeErr := store.importLedgerBatch(ctx, plan, batch)
+		if writeErr != nil {
+			return ImportResult{}, writeErr
 		}
 		total.Imported += chunk.Imported
 		total.SkippedBoundary += chunk.SkippedBoundary
 		total.SkippedExisting += chunk.SkippedExisting
-		if finished {
+		committed++
+		if hook, ok := ctx.Value(importAfterChunkHookKey{}).(func(int)); ok {
+			hook(committed)
+		}
+		if batch.finished {
 			return total, nil
 		}
 	}
 }
 
-func (store *Store) importLedgerChunk(
-	ctx context.Context,
-	scanner *bufio.Scanner,
+func (reader *importBatchReader) prepareBatch(
 	plan importPlan,
-	line *int,
-) (ImportResult, bool, error) {
+	maxLines int,
+	maxBytes int,
+) (importBatch, error) {
+	batch := importBatch{lines: make([]preparedImportLine, 0, maxLines)}
+	for len(batch.lines) < maxLines {
+		raw, finished, err := reader.nextRawLine()
+		if err != nil {
+			return importBatch{}, err
+		}
+		if finished {
+			batch.finished = true
+			return batch, nil
+		}
+		if len(batch.lines) > 0 && batch.sourceBytes+raw.sourceBytes > maxBytes {
+			reader.pending = &raw
+			return batch, nil
+		}
+		prepared, prepareErr := prepareImportLedgerLine(raw.contents, plan, raw.line)
+		if prepareErr != nil {
+			return importBatch{}, prepareErr
+		}
+		batch.lines = append(batch.lines, prepared)
+		batch.sourceBytes += raw.sourceBytes
+		if raw.sourceBytes > maxBytes {
+			return batch, nil
+		}
+	}
+	return batch, nil
+}
+
+func (reader *importBatchReader) nextRawLine() (rawImportLine, bool, error) {
+	if reader.pending != nil {
+		raw := *reader.pending
+		reader.pending = nil
+		return raw, false, nil
+	}
+	if reader.exhausted {
+		return rawImportLine{}, true, nil
+	}
+	if !reader.scanner.Scan() {
+		reader.exhausted = true
+		if err := reader.scanner.Err(); err != nil {
+			return rawImportLine{}, false, fmt.Errorf("scan line %d: %w", reader.line+1, err)
+		}
+		return rawImportLine{}, true, nil
+	}
+	reader.line++
+	contents := reader.scanner.Bytes()
+	return rawImportLine{
+		line:        reader.line,
+		contents:    contents,
+		sourceBytes: len(contents) + 1,
+	}, false, nil
+}
+
+func prepareImportLedgerLine(
+	contents []byte,
+	plan importPlan,
+	line int,
+) (preparedImportLine, error) {
+	record, err := plan.decode(contents)
+	if err != nil {
+		return preparedImportLine{}, importLineError(plan.path, line, err)
+	}
+	if plan.boundary > 0 && record.timestamp.UnixNano() >= plan.boundary {
+		return preparedImportLine{line: line, skippedBoundary: true}, nil
+	}
+	row, err := deriveImportedLedgerRow(record, plan.source, line)
+	if err != nil {
+		return preparedImportLine{}, importLineError(plan.path, line, err)
+	}
+	return preparedImportLine{line: line, row: row}, nil
+}
+
+func (store *Store) importLedgerBatch(
+	ctx context.Context,
+	plan importPlan,
+	batch importBatch,
+) (ImportResult, error) {
 	var chunk ImportResult
-	finished := false
 	err := store.withImportTransaction(ctx, plan.path, func(conn *sql.Conn) error {
-		for range importChunkLines {
-			if !scanner.Scan() {
-				if err := scanner.Err(); err != nil {
-					return fmt.Errorf("scan line %d: %w", *line+1, err)
-				}
-				finished = true
-				return nil
+		for _, prepared := range batch.lines {
+			if prepared.skippedBoundary {
+				chunk.SkippedBoundary++
+				continue
 			}
-			*line++
-			if err := importLedgerLine(ctx, conn, scanner.Bytes(), plan, *line, &chunk); err != nil {
-				return err
+			inserted, insertErr := insertImportedLedgerRow(ctx, conn, prepared.row)
+			if insertErr != nil {
+				return importLineError(plan.path, prepared.line, insertErr)
+			}
+			if inserted {
+				chunk.Imported++
+			} else {
+				chunk.SkippedExisting++
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		return ImportResult{}, false, err
+		return ImportResult{}, err
 	}
-	return chunk, finished, nil
+	return chunk, nil
 }
 
 func (store *Store) withImportTransaction(
@@ -259,38 +378,6 @@ func (store *Store) withImportTransaction(
 func rollbackImport(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
 		return fmt.Errorf("execute rollback: %w", err)
-	}
-	return nil
-}
-
-func importLedgerLine(
-	ctx context.Context,
-	conn *sql.Conn,
-	contents []byte,
-	plan importPlan,
-	line int,
-	result *ImportResult,
-) error {
-	record, err := plan.decode(contents)
-	if err != nil {
-		return importLineError(plan.path, line, err)
-	}
-	if plan.boundary > 0 && record.timestamp.UnixNano() >= plan.boundary {
-		result.SkippedBoundary++
-		return nil
-	}
-	row, err := deriveImportedLedgerRow(record, plan.source, line)
-	if err != nil {
-		return importLineError(plan.path, line, err)
-	}
-	inserted, err := insertImportedLedgerRow(ctx, conn, row)
-	if err != nil {
-		return importLineError(plan.path, line, err)
-	}
-	if inserted {
-		result.Imported++
-	} else {
-		result.SkippedExisting++
 	}
 	return nil
 }

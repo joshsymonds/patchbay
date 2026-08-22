@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,7 +12,20 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
+
+func toolingStagingMatches(t *testing.T, dest string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(
+		filepath.Join(filepath.Dir(dest), toolingStagingNamePrefix(dest)+"*"),
+	)
+	if err != nil {
+		t.Fatalf("glob tooling staging directories: %v", err)
+	}
+	return matches
+}
 
 func TestSnapshotCopiesConsistentDatabase(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "usage.sqlite")
@@ -77,6 +91,120 @@ func TestSnapshotCopiesConsistentDatabase(t *testing.T) {
 	}
 	if err := restoredStore.Close(); err != nil {
 		t.Fatalf("close restored snapshot: %v", err)
+	}
+}
+
+func TestSnapshotStagesPrivatelyBeforeAtomicPublish(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "usage.sqlite")
+	store := openStore(t, source)
+	if _, err := store.InsertPending(t.Context(), validPendingRequest()); err != nil {
+		t.Fatalf("seed request: %v", err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "usage.snapshot.sqlite")
+	staged := make(chan string, 1)
+	release := make(chan struct{})
+	ctx := context.WithValue(t.Context(), snapshotBeforePublishHookKey{}, func(temp string) {
+		staged <- temp
+		<-release
+	})
+	result := make(chan error, 1)
+	go func() { result <- Snapshot(ctx, source, dest) }()
+
+	var temp string
+	select {
+	case temp = <-staged:
+	case <-time.After(5 * time.Second):
+		t.Fatal("snapshot did not reach its staged artifact")
+	}
+	if _, err := os.Lstat(dest); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("destination exists before publish: %v", err)
+	}
+	stageDir := filepath.Dir(temp)
+	assertMode(t, stageDir, 0o700)
+	info, err := os.Stat(temp)
+	if err != nil {
+		t.Fatalf("stat staged snapshot: %v", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		t.Fatalf("staged artifact = mode %v size %d; want a non-empty regular file", info.Mode(), info.Size())
+	}
+
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	assertMode(t, dest, 0o600)
+	if _, err := os.Stat(stageDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging directory remains after publish: %v", err)
+	}
+}
+
+func TestPrepareToolingDestinationScavengesOnlyOldUnlockedStaging(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "usage.snapshot.sqlite")
+	prefix := toolingStagingNamePrefix(dest)
+	oldUnlocked := filepath.Join(dir, prefix+"old-unlocked")
+	oldLocked := filepath.Join(dir, prefix+"old-locked")
+	fresh := filepath.Join(dir, prefix+"fresh")
+	for _, path := range []string{oldUnlocked, oldLocked, fresh} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "artifact"), []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, toolingStagingLockName), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lockedFile, err := os.OpenFile(filepath.Join(oldLocked, toolingStagingLockName), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lockedFile.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if unlockErr := unix.Flock(int(lockedFile.Fd()), unix.LOCK_UN); unlockErr != nil {
+			t.Errorf("unlock live staging fixture: %v", unlockErr)
+		}
+		if closeErr := lockedFile.Close(); closeErr != nil {
+			t.Errorf("close live staging fixture: %v", closeErr)
+		}
+	}()
+
+	now := time.Now()
+	oldTime := now.Add(-toolingStagingOrphanAge - time.Minute)
+	for _, path := range []string{oldUnlocked, oldLocked} {
+		if err := os.Chtimes(path, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(fresh, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := prepareToolingDestination(dest)
+	if err != nil {
+		t.Fatalf("prepareToolingDestination() error: %v", err)
+	}
+	defer func() {
+		if cleanupErr := removeToolingStaging(prepared); cleanupErr != nil {
+			t.Errorf("clean prepared staging: %v", cleanupErr)
+		}
+	}()
+	if _, err := os.Stat(oldUnlocked); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old unlocked staging directory remains: %v", err)
+	}
+	if _, err := os.Stat(oldLocked); err != nil {
+		t.Fatalf("old locked staging directory was scavenged: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh staging directory was scavenged: %v", err)
+	}
+	if filepath.Dir(prepared.temp) == fresh {
+		t.Fatal("prepareToolingDestination() reused the possible concurrent staging directory")
 	}
 }
 
@@ -221,16 +349,14 @@ func TestSnapshotCanceledAfterPartialLeavesNoOutput(t *testing.T) {
 			case snapshotErr = <-result:
 				finished = true
 			case <-ticker.C:
-				partials, globErr := filepath.Glob(dest + ".partial-*")
-				if globErr != nil {
-					t.Fatal(globErr)
-				}
+				partials := toolingStagingMatches(t, dest)
 				if len(partials) == 1 {
-					info, statErr := os.Stat(partials[0])
-					if statErr != nil {
+					artifact := filepath.Join(partials[0], filepath.Base(dest))
+					info, statErr := os.Stat(artifact)
+					if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 						t.Fatal(statErr)
 					}
-					if info.Size() > 0 {
+					if statErr == nil && info.Size() > 0 {
 						cancel()
 						partialObserved = true
 						snapshotErr = <-result
@@ -257,10 +383,7 @@ func TestSnapshotCanceledAfterPartialLeavesNoOutput(t *testing.T) {
 		if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
 			t.Fatalf("canceled snapshot destination stat error = %v; want absent destination", statErr)
 		}
-		partials, globErr := filepath.Glob(dest + ".partial-*")
-		if globErr != nil {
-			t.Fatal(globErr)
-		}
+		partials := toolingStagingMatches(t, dest)
 		if len(partials) != 0 {
 			t.Fatalf("partial snapshots = %v; want none", partials)
 		}
@@ -275,10 +398,7 @@ func TestSnapshotRefusesUnsafeSourcesAndDestinations(t *testing.T) {
 	if err := Snapshot(t.Context(), missing, dest); err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("Snapshot(missing) error = %v; want missing-source refusal", err)
 	}
-	partials, err := filepath.Glob(dest + ".partial-*")
-	if err != nil {
-		t.Fatal(err)
-	}
+	partials := toolingStagingMatches(t, dest)
 	if len(partials) != 0 {
 		t.Fatalf("partial snapshots = %v; want none", partials)
 	}

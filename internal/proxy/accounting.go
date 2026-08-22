@@ -112,10 +112,13 @@ func (e *exchange) finalizedRequest(capt *capture) usagepkg.FinalizedRequest {
 	}
 }
 
-func (p *Proxy) finalizeAccounting(ctx context.Context, exch *exchange, capt *capture) {
-	finalized := exch.finalizedRequest(capt)
-	if err := p.accountant.Finalize(context.WithoutCancel(ctx), exch.accountingID, finalized); err != nil {
-		p.logger.ErrorContext(context.WithoutCancel(ctx), "usage accounting finalization failed",
-			slog.Int64("request_id", exch.accountingID), slog.Any("error", err))
+func (p *Proxy) finalizeAccounting(
+	ctx context.Context,
+	accountingID int64,
+	finalized usagepkg.FinalizedRequest,
+) {
+	if err := p.accountant.Finalize(ctx, accountingID, finalized); err != nil {
+		p.logger.ErrorContext(ctx, "usage accounting finalization failed",
+			slog.Int64("request_id", accountingID), slog.Any("error", err))
 	}
 }

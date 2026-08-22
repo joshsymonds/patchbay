@@ -295,6 +295,63 @@ func TestSummarizeUsageReadsOneSnapshotAcrossFinalization(t *testing.T) {
 	}
 }
 
+func TestSummaryQueryPlansUseWindowIndexes(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, filepath.Join(t.TempDir(), "usage.sqlite"))
+	start := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC).UnixNano()
+	end := start + int64(time.Hour)
+	for _, test := range []struct {
+		name      string
+		query     string
+		args      []any
+		wantIndex string
+	}{
+		{name: "request counts", query: requestCountsSummaryQuery, args: []any{start, end}, wantIndex: summaryWindowIndexName},
+		{name: "messages", query: messagesSummaryQuery, args: []any{start, end}, wantIndex: summaryWindowIndexName},
+		{name: "billing class", query: billingClassSummaryQuery, args: []any{start, end}, wantIndex: summaryWindowIndexName},
+		{name: "cost basis", query: costBasisSummaryQuery, args: []any{start, end}, wantIndex: summaryWindowIndexName},
+		{name: "context request counts", query: requestCountsByContextSummaryQuery, args: []any{"work", start, end}, wantIndex: summaryContextWindowIndexName},
+		{name: "context messages", query: messagesByContextSummaryQuery, args: []any{"work", start, end}, wantIndex: summaryContextWindowIndexName},
+		{name: "context billing class", query: billingClassByContextSummaryQuery, args: []any{"work", start, end}, wantIndex: summaryContextWindowIndexName},
+		{name: "context cost basis", query: costBasisByContextSummaryQuery, args: []any{"work", start, end}, wantIndex: summaryContextWindowIndexName},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			plan := explainSummaryQueryPlan(t, store.db, test.query, test.args...)
+			if !strings.Contains(plan, test.wantIndex) {
+				t.Fatalf("query plan = %q; want index %q", plan, test.wantIndex)
+			}
+			if strings.Contains(plan, "SCAN accounting_requests") {
+				t.Fatalf("query plan = %q; want a bounded index search", plan)
+			}
+		})
+	}
+}
+
+func explainSummaryQueryPlan(t *testing.T, db *sql.DB, query string, args ...any) string {
+	t.Helper()
+
+	rows, err := db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("explain summary query: %v", err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan summary query plan: %v", err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read summary query plan: %v", err)
+	}
+	return strings.Join(details, "; ")
+}
+
 func TestSummarizeUsageRejectsInvalidFilters(t *testing.T) {
 	t.Parallel()
 

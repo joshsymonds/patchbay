@@ -16,6 +16,13 @@ const importedLedgerProvenanceMigrationVersion = 4
 
 const upstreamTargetDispatchEvidenceMigrationVersion = 5
 
+const summaryQueryIndexesMigrationVersion = 6
+
+const (
+	summaryWindowIndexName        = "accounting_requests_summary_window"
+	summaryContextWindowIndexName = "accounting_requests_summary_context_window"
+)
+
 type migration struct {
 	version    int
 	name       string
@@ -107,6 +114,7 @@ func declaredMigrations() []migration {
 		rateCardsAndFinalCostMigration(),
 		importedLedgerProvenanceMigration(),
 		upstreamTargetDispatchEvidenceMigration(),
+		summaryQueryIndexesMigration(),
 	}
 }
 
@@ -164,6 +172,19 @@ func upstreamTargetDispatchEvidenceMigration() migration {
 			`ALTER TABLE accounting_requests ADD COLUMN upstream_target TEXT CHECK (
 				upstream_target IS NULL OR (length(upstream_target) > 0 AND upstream_contacted = 1)
 			)`,
+		},
+	}
+}
+
+func summaryQueryIndexesMigration() migration {
+	return migration{
+		version: summaryQueryIndexesMigrationVersion,
+		name:    "summary_query_indexes",
+		statements: []string{
+			`CREATE INDEX ` + summaryWindowIndexName + `
+			ON accounting_requests(started_at, request_kind)`,
+			`CREATE INDEX ` + summaryContextWindowIndexName + `
+			ON accounting_requests(route_context, started_at, request_kind)`,
 		},
 	}
 }

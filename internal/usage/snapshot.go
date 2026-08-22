@@ -8,12 +8,32 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type sourceIdentity struct {
 	device string
 	inode  string
+}
+
+type snapshotBeforePublishHookKey struct{}
+
+const (
+	toolingStagingPrefix   = ".patchbay-usage-"
+	toolingStagingLockName = ".patchbay.lock"
+	// A one-hour minimum avoids treating an active snapshot or export as crash
+	// residue during ordinary concurrent and long-running tooling operations.
+	toolingStagingOrphanAge = time.Hour
+)
+
+type toolingDestination struct {
+	temp    string
+	staging string
+	lock    *os.File
 }
 
 // Snapshot copies source into dest through SQLite so the copy is consistent with
@@ -22,16 +42,17 @@ func Snapshot(ctx context.Context, source, dest string) (result error) {
 	if contextErr := validateToolingContext(ctx); contextErr != nil {
 		return contextErr
 	}
-	temp, prepareErr := prepareToolingDestination(dest)
+	prepared, prepareErr := prepareToolingDestination(dest)
 	if prepareErr != nil {
 		return prepareErr
 	}
 	defer func() {
-		if temp == "" {
-			return
-		}
-		if removeErr := os.Remove(temp); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			result = errors.Join(result, fmt.Errorf("remove partial usage snapshot %q: %w", temp, removeErr))
+		temp := prepared.temp
+		if removeErr := removeToolingStaging(prepared); removeErr != nil {
+			result = errors.Join(
+				result,
+				fmt.Errorf("remove partial usage snapshot %q: %w", temp, removeErr),
+			)
 		}
 	}()
 
@@ -49,25 +70,24 @@ func Snapshot(ctx context.Context, source, dest string) (result error) {
 		}
 	}()
 
-	if _, vacuumErr := db.ExecContext(ctx, `VACUUM INTO ?`, temp); vacuumErr != nil {
+	if _, vacuumErr := db.ExecContext(ctx, `VACUUM INTO ?`, prepared.temp); vacuumErr != nil {
 		return fmt.Errorf("snapshot usage database %q: %w", source, vacuumErr)
 	}
 	if closeErr := db.Close(); closeErr != nil {
 		return fmt.Errorf("close usage database %q: %w", source, closeErr)
 	}
 	closed = true
-	artifact, artifactErr := openToolingDatabase(ctx, temp)
+	if hook, ok := ctx.Value(snapshotBeforePublishHookKey{}).(func(string)); ok {
+		hook(prepared.temp)
+	}
+	artifact, artifactErr := openToolingDatabase(ctx, prepared.temp)
 	if artifactErr != nil {
-		return fmt.Errorf("validate usage snapshot %q: %w", temp, artifactErr)
+		return fmt.Errorf("validate usage snapshot %q: %w", prepared.temp, artifactErr)
 	}
 	if closeErr := artifact.Close(); closeErr != nil {
-		return fmt.Errorf("close usage snapshot %q after validation: %w", temp, closeErr)
+		return fmt.Errorf("close usage snapshot %q after validation: %w", prepared.temp, closeErr)
 	}
-	if publishErr := finalizeToolingDestination(temp, dest); publishErr != nil {
-		return publishErr
-	}
-	temp = ""
-	return nil
+	return finalizeToolingDestination(prepared, dest)
 }
 
 func validateToolingContext(ctx context.Context) error {
@@ -236,48 +256,199 @@ func latestSchemaVersion() int {
 	return migrations[len(migrations)-1].version
 }
 
-func prepareToolingDestination(dest string) (string, error) {
+func prepareToolingDestination(dest string) (*toolingDestination, error) {
 	if dest == "" {
-		return "", errors.New("usage tooling destination is blank")
+		return nil, errors.New("usage tooling destination is blank")
 	}
 	dest = filepath.Clean(dest)
 	dir := filepath.Dir(dest)
 	info, statErr := os.Stat(dir)
 	if statErr != nil {
 		if errors.Is(statErr, os.ErrNotExist) {
-			return "", fmt.Errorf("destination directory %q does not exist", dir)
+			return nil, fmt.Errorf("destination directory %q does not exist", dir)
 		}
-		return "", fmt.Errorf("inspect destination directory %q: %w", dir, statErr)
+		return nil, fmt.Errorf("inspect destination directory %q: %w", dir, statErr)
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("destination directory %q is not a directory", dir)
+		return nil, fmt.Errorf("destination directory %q is not a directory", dir)
 	}
 	if _, destinationErr := os.Lstat(dest); destinationErr == nil {
-		return "", fmt.Errorf("usage tooling destination %q already exists", dest)
+		return nil, fmt.Errorf("usage tooling destination %q already exists", dest)
 	} else if !errors.Is(destinationErr, os.ErrNotExist) {
-		return "", fmt.Errorf("inspect usage tooling destination %q: %w", dest, destinationErr)
+		return nil, fmt.Errorf("inspect usage tooling destination %q: %w", dest, destinationErr)
 	}
-	file, createErr := os.CreateTemp(dir, filepath.Base(dest)+".partial-*")
+	prefix := toolingStagingNamePrefix(dest)
+	if scavengeErr := scavengeToolingStaging(dir, prefix, time.Now()); scavengeErr != nil {
+		return nil, scavengeErr
+	}
+	staging, createErr := os.MkdirTemp(dir, prefix+"*")
 	if createErr != nil {
-		return "", fmt.Errorf("create temporary usage output in %q: %w", dir, createErr)
+		return nil, fmt.Errorf("create temporary usage output directory in %q: %w", dir, createErr)
 	}
-	temp := file.Name()
-	if closeErr := file.Close(); closeErr != nil {
-		if removeErr := os.Remove(temp); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return "", errors.Join(
-				fmt.Errorf("close temporary usage output %q: %w", temp, closeErr),
-				fmt.Errorf("remove temporary usage output %q: %w", temp, removeErr),
+	if chmodErr := os.Chmod(staging, parentMode); chmodErr != nil {
+		if removeErr := os.Remove(staging); removeErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("secure temporary usage output directory %q: %w", staging, chmodErr),
+				fmt.Errorf("remove temporary usage output directory %q: %w", staging, removeErr),
 			)
 		}
-		return "", fmt.Errorf("close temporary usage output %q: %w", temp, closeErr)
+		return nil, fmt.Errorf("secure temporary usage output directory %q: %w", staging, chmodErr)
 	}
-	if removeErr := os.Remove(temp); removeErr != nil {
-		return "", fmt.Errorf("prepare temporary usage output %q: %w", temp, removeErr)
+	lock, lockErr := createToolingStagingLock(staging)
+	if lockErr != nil {
+		if removeErr := os.RemoveAll(staging); removeErr != nil {
+			return nil, errors.Join(lockErr, fmt.Errorf("remove unlocked usage staging %q: %w", staging, removeErr))
+		}
+		return nil, lockErr
 	}
-	return temp, nil
+	return &toolingDestination{
+		temp:    filepath.Join(staging, filepath.Base(dest)),
+		staging: staging,
+		lock:    lock,
+	}, nil
 }
 
-func finalizeToolingDestination(temp, dest string) error {
+func createToolingStagingLock(staging string) (*os.File, error) {
+	path := filepath.Join(staging, toolingStagingLockName)
+	flags := syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
+	lock, openErr := openToolingFile(path, flags)
+	if openErr != nil {
+		return nil, fmt.Errorf("create usage staging lock %q: %w", path, openErr)
+	}
+	if lockErr := unix.Flock(int(lock.Fd()), unix.LOCK_EX); lockErr != nil {
+		if closeErr := lock.Close(); closeErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("lock usage staging %q: %w", staging, lockErr),
+				fmt.Errorf("close usage staging lock %q: %w", path, closeErr),
+			)
+		}
+		return nil, fmt.Errorf("lock usage staging %q: %w", staging, lockErr)
+	}
+	return lock, nil
+}
+
+func toolingStagingNamePrefix(dest string) string {
+	return toolingStagingPrefix + filepath.Base(dest) + ".partial-"
+}
+
+func scavengeToolingStaging(dir, prefix string, now time.Time) error {
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		return fmt.Errorf("scan destination directory %q for partial usage outputs: %w", dir, readErr)
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			if errors.Is(infoErr, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("inspect partial usage output %q: %w", path, infoErr)
+		}
+		if !info.IsDir() || now.Sub(info.ModTime()) < toolingStagingOrphanAge {
+			continue
+		}
+		if removeErr := removeUnlockedToolingStaging(path); removeErr != nil {
+			return removeErr
+		}
+	}
+	return nil
+}
+
+func removeUnlockedToolingStaging(staging string) error {
+	lockPath := filepath.Join(staging, toolingStagingLockName)
+	flags := syscall.O_RDWR | syscall.O_CREAT | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
+	lock, openErr := openToolingFile(lockPath, flags)
+	if openErr != nil {
+		if errors.Is(openErr, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("open stale usage staging lock %q: %w", lockPath, openErr)
+	}
+	lockErr := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if lockErr != nil {
+		closeErr := lock.Close()
+		if errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN) {
+			if closeErr != nil {
+				return fmt.Errorf("close live usage staging lock %q: %w", lockPath, closeErr)
+			}
+			return nil
+		}
+		return errors.Join(
+			fmt.Errorf("lock stale usage staging %q: %w", staging, lockErr),
+			wrapToolingLockCloseError(lockPath, closeErr),
+		)
+	}
+	removeErr := os.RemoveAll(staging)
+	releaseErr := releaseToolingStagingLock(staging, lock)
+	return errors.Join(
+		wrapToolingStagingRemoveError(staging, removeErr),
+		releaseErr,
+	)
+}
+
+func removeToolingStaging(prepared *toolingDestination) error {
+	if prepared == nil {
+		return nil
+	}
+	staging := prepared.staging
+	lock := prepared.lock
+	prepared.temp = ""
+	prepared.staging = ""
+	prepared.lock = nil
+
+	var removeErr error
+	if staging != "" {
+		removeErr = os.RemoveAll(staging)
+	}
+	return errors.Join(
+		wrapToolingStagingRemoveError(staging, removeErr),
+		releaseToolingStagingLock(staging, lock),
+	)
+}
+
+func wrapToolingStagingRemoveError(staging string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("remove temporary usage output directory %q: %w", staging, err)
+}
+
+func releaseToolingStagingLock(staging string, lock *os.File) error {
+	if lock == nil {
+		return nil
+	}
+	lockPath := lock.Name()
+	unlockErr := unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	closeErr := lock.Close()
+	return errors.Join(
+		wrapToolingLockUnlockError(staging, unlockErr),
+		wrapToolingLockCloseError(lockPath, closeErr),
+	)
+}
+
+func wrapToolingLockUnlockError(staging string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("unlock usage staging %q: %w", staging, err)
+}
+
+func wrapToolingLockCloseError(path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("close usage staging lock %q: %w", path, err)
+}
+
+func finalizeToolingDestination(prepared *toolingDestination, dest string) error {
+	if prepared == nil || prepared.temp == "" {
+		return errors.New("usage tooling destination is not prepared")
+	}
+	temp := prepared.temp
 	if chmodErr := os.Chmod(temp, databaseMode); chmodErr != nil {
 		return fmt.Errorf("secure temporary usage output %q: %w", temp, chmodErr)
 	}
@@ -287,8 +458,8 @@ func finalizeToolingDestination(temp, dest string) error {
 	if linkErr := os.Link(temp, dest); linkErr != nil {
 		return fmt.Errorf("publish usage output %q without replacement: %w", dest, linkErr)
 	}
-	if removeErr := os.Remove(temp); removeErr != nil {
-		return fmt.Errorf("remove published temporary usage output %q: %w", temp, removeErr)
+	if removeErr := removeToolingStaging(prepared); removeErr != nil {
+		return removeErr
 	}
 	return syncToolingDirectory(filepath.Dir(dest))
 }

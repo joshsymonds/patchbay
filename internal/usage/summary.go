@@ -55,10 +55,15 @@ type CostSummary struct {
 
 const requestCountsSummaryQuery = `SELECT request_kind, COUNT(*)
 	FROM accounting_requests
-	WHERE started_at >= ? AND started_at < ? AND (? = '' OR route_context = ?)
+	WHERE started_at >= ? AND started_at < ?
 	GROUP BY request_kind`
 
-const messagesSummaryQuery = `SELECT
+const requestCountsByContextSummaryQuery = `SELECT request_kind, COUNT(*)
+	FROM accounting_requests
+	WHERE route_context = ? AND started_at >= ? AND started_at < ?
+	GROUP BY request_kind`
+
+const messagesSummarySelect = `SELECT
 	COALESCE(SUM(CASE WHEN lifecycle_state = 'finalized' THEN 1 ELSE 0 END), 0),
 	COALESCE(SUM(CASE WHEN lifecycle_state = 'pending' THEN 1 ELSE 0 END), 0),
 	COALESCE(SUM(CASE WHEN lifecycle_state = 'finalized'
@@ -74,11 +79,15 @@ const messagesSummaryQuery = `SELECT
 		THEN COALESCE(cache_creation_5m_input_tokens, 0) + COALESCE(cache_creation_1h_input_tokens, 0)
 		ELSE COALESCE(cache_creation_input_tokens, 0) END
 		ELSE 0 END), 0)
-	FROM accounting_requests
-	WHERE request_kind = 'messages'
-		AND started_at >= ? AND started_at < ? AND (? = '' OR route_context = ?)`
+	FROM accounting_requests`
 
-const billingClassSummaryQuery = `SELECT
+const messagesSummaryQuery = messagesSummarySelect + `
+	WHERE request_kind = 'messages' AND started_at >= ? AND started_at < ?`
+
+const messagesByContextSummaryQuery = messagesSummarySelect + `
+	WHERE route_context = ? AND request_kind = 'messages' AND started_at >= ? AND started_at < ?`
+
+const billingClassSummarySelect = `SELECT
 	COALESCE(billing_class, 'unknown'),
 	COUNT(*),
 	COALESCE(SUM(CASE WHEN lifecycle_state = 'finalized'
@@ -86,12 +95,17 @@ const billingClassSummaryQuery = `SELECT
 		THEN COALESCE(final_cost_nano_usd, 0) ELSE 0 END), 0),
 	COALESCE(SUM(CASE WHEN lifecycle_state = 'finalized'
 		AND (cost_basis = 'unknown' OR cost_basis IS NULL) THEN 1 ELSE 0 END), 0)
-	FROM accounting_requests
-	WHERE request_kind = 'messages'
-		AND started_at >= ? AND started_at < ? AND (? = '' OR route_context = ?)
+	FROM accounting_requests`
+
+const billingClassSummaryQuery = billingClassSummarySelect + `
+	WHERE request_kind = 'messages' AND started_at >= ? AND started_at < ?
 	GROUP BY COALESCE(billing_class, 'unknown')`
 
-const costBasisSummaryQuery = `SELECT
+const billingClassByContextSummaryQuery = billingClassSummarySelect + `
+	WHERE route_context = ? AND request_kind = 'messages' AND started_at >= ? AND started_at < ?
+	GROUP BY COALESCE(billing_class, 'unknown')`
+
+const costBasisSummarySelect = `SELECT
 	COALESCE(cost_basis, 'unknown'),
 	COUNT(*),
 	COALESCE(SUM(CASE WHEN lifecycle_state = 'finalized'
@@ -99,14 +113,26 @@ const costBasisSummaryQuery = `SELECT
 		THEN COALESCE(final_cost_nano_usd, 0) ELSE 0 END), 0),
 	COALESCE(SUM(CASE WHEN lifecycle_state = 'finalized'
 		AND (cost_basis = 'unknown' OR cost_basis IS NULL) THEN 1 ELSE 0 END), 0)
-	FROM accounting_requests
-	WHERE request_kind = 'messages'
-		AND started_at >= ? AND started_at < ? AND (? = '' OR route_context = ?)
+	FROM accounting_requests`
+
+const costBasisSummaryQuery = costBasisSummarySelect + `
+	WHERE request_kind = 'messages' AND started_at >= ? AND started_at < ?
+	GROUP BY COALESCE(cost_basis, 'unknown')`
+
+const costBasisByContextSummaryQuery = costBasisSummarySelect + `
+	WHERE route_context = ? AND request_kind = 'messages' AND started_at >= ? AND started_at < ?
 	GROUP BY COALESCE(cost_basis, 'unknown')`
 
 type summaryQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type summaryStatements struct {
+	requestCounts string
+	messages      string
+	billingClass  string
+	costBasis     string
 }
 
 type summaryAfterMessagesHookKey struct{}
@@ -140,12 +166,18 @@ func (store *Store) SummarizeUsage(
 		ByBillingClass: make(map[string]CostSummary),
 		ByCostBasis:    make(map[string]CostSummary),
 	}}
-	args := summaryArguments(filter)
+	statements, args := summaryQuerySelection(filter)
 
-	if summaryErr := summarizeRequestCounts(ctx, tx, args, &summary.Requests); summaryErr != nil {
+	if summaryErr := summarizeRequestCounts(
+		ctx,
+		tx,
+		statements.requestCounts,
+		args,
+		&summary.Requests,
+	); summaryErr != nil {
 		return Summary{}, summaryErr
 	}
-	if summaryErr := summarizeMessages(ctx, tx, args, &summary.Messages); summaryErr != nil {
+	if summaryErr := summarizeMessages(ctx, tx, statements.messages, args, &summary.Messages); summaryErr != nil {
 		return Summary{}, summaryErr
 	}
 	if hook, ok := ctx.Value(summaryAfterMessagesHookKey{}).(func()); ok {
@@ -154,7 +186,7 @@ func (store *Store) SummarizeUsage(
 	if summaryErr := summarizeCostGroups(
 		ctx,
 		tx,
-		billingClassSummaryQuery,
+		statements.billingClass,
 		args,
 		summary.Messages.ByBillingClass,
 	); summaryErr != nil {
@@ -163,7 +195,7 @@ func (store *Store) SummarizeUsage(
 	if summaryErr := summarizeCostGroups(
 		ctx,
 		tx,
-		costBasisSummaryQuery,
+		statements.costBasis,
 		args,
 		summary.Messages.ByCostBasis,
 	); summaryErr != nil {
@@ -208,17 +240,31 @@ func validateSummaryTime(name string, value time.Time) error {
 	return nil
 }
 
-func summaryArguments(filter SummaryFilter) []any {
-	return []any{filter.Since.UnixNano(), filter.Until.UnixNano(), filter.Context, filter.Context}
+func summaryQuerySelection(filter SummaryFilter) (summaryStatements, []any) {
+	if filter.Context == "" {
+		return summaryStatements{
+			requestCounts: requestCountsSummaryQuery,
+			messages:      messagesSummaryQuery,
+			billingClass:  billingClassSummaryQuery,
+			costBasis:     costBasisSummaryQuery,
+		}, []any{filter.Since.UnixNano(), filter.Until.UnixNano()}
+	}
+	return summaryStatements{
+		requestCounts: requestCountsByContextSummaryQuery,
+		messages:      messagesByContextSummaryQuery,
+		billingClass:  billingClassByContextSummaryQuery,
+		costBasis:     costBasisByContextSummaryQuery,
+	}, []any{filter.Context, filter.Since.UnixNano(), filter.Until.UnixNano()}
 }
 
 func summarizeRequestCounts(
 	ctx context.Context,
 	queryer summaryQueryer,
+	query string,
 	args []any,
 	counts *RequestCounts,
 ) (result error) {
-	rows, queryErr := queryer.QueryContext(ctx, requestCountsSummaryQuery, args...)
+	rows, queryErr := queryer.QueryContext(ctx, query, args...)
 	if queryErr != nil {
 		return fmt.Errorf("summarize usage request counts: %w", queryErr)
 	}
@@ -255,10 +301,11 @@ func summarizeRequestCounts(
 func summarizeMessages(
 	ctx context.Context,
 	queryer summaryQueryer,
+	query string,
 	args []any,
 	messages *MessageSummary,
 ) error {
-	queryErr := queryer.QueryRowContext(ctx, messagesSummaryQuery, args...).Scan(
+	queryErr := queryer.QueryRowContext(ctx, query, args...).Scan(
 		&messages.Finalized,
 		&messages.Pending,
 		&messages.KnownCostNanoUSD,

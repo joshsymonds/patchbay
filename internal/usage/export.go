@@ -16,15 +16,13 @@ func Export(ctx context.Context, source, dest string) (result error) {
 	if contextErr := validateToolingContext(ctx); contextErr != nil {
 		return contextErr
 	}
-	temp, prepareErr := prepareToolingDestination(dest)
+	prepared, prepareErr := prepareToolingDestination(dest)
 	if prepareErr != nil {
 		return prepareErr
 	}
 	defer func() {
-		if temp == "" {
-			return
-		}
-		if removeErr := os.Remove(temp); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		temp := prepared.temp
+		if removeErr := removeToolingStaging(prepared); removeErr != nil {
 			result = errors.Join(result, fmt.Errorf("remove partial usage export %q: %w", temp, removeErr))
 		}
 	}()
@@ -43,18 +41,14 @@ func Export(ctx context.Context, source, dest string) (result error) {
 		}
 	}()
 
-	if writeErr := writeUsageExportFile(ctx, db, temp); writeErr != nil {
+	if writeErr := writeUsageExportFile(ctx, db, prepared.temp); writeErr != nil {
 		return writeErr
 	}
 	if closeErr := db.Close(); closeErr != nil {
 		return fmt.Errorf("close usage database %q: %w", source, closeErr)
 	}
 	closed = true
-	if publishErr := finalizeToolingDestination(temp, dest); publishErr != nil {
-		return publishErr
-	}
-	temp = ""
-	return nil
+	return finalizeToolingDestination(prepared, dest)
 }
 
 func writeUsageExportFile(ctx context.Context, db *sql.DB, temp string) error {

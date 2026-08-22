@@ -27,11 +27,17 @@ import (
 	"github.com/joshsymonds/patchbay/internal/awssig"
 	"github.com/joshsymonds/patchbay/internal/ledger"
 	"github.com/joshsymonds/patchbay/internal/registry"
+	usagepkg "github.com/joshsymonds/patchbay/internal/usage"
 )
 
 // streamChunkBytes is the read size of the response copy loop. Every chunk is
 // written and flushed as it arrives, so this bounds latency, not throughput.
 const streamChunkBytes = 32768
+
+const (
+	completionQueueCapacity = 32
+	completionWorkerCount   = 2
+)
 
 // The Messages endpoints an inject seat is allowed to relay. An inject seat
 // pays with a foreign key, so it exists to answer Messages turns and nothing
@@ -113,6 +119,13 @@ type Config struct {
 	Host string
 }
 
+type requestCompletion struct {
+	accountingID int64
+	finalized    usagepkg.FinalizedRequest
+	record       ledger.Record
+	appendLedger bool
+}
+
 // Proxy is the resolve, tee and forward pipeline. It is safe for concurrent
 // use: every request carries its own state, and the only shared values are the
 // registry and the client, which are themselves concurrent.
@@ -128,12 +141,16 @@ type Proxy struct {
 	// one cache per profile shared by every request that rides one.
 	credentials *awssig.CredentialSource
 
-	// pending counts the record goroutines still in flight, so a host process
-	// can wait for them instead of closing the ledger out from under one.
+	completionQueue   chan requestCompletion
+	completionMu      sync.Mutex
+	completionWorkers int
+
+	// pending counts completions submitted or blocked on the bounded queue, so a
+	// host process can wait before closing accounting and ledger storage.
 	pending sync.WaitGroup
 
-	// inFlight is the current number of record goroutines. It is only diagnostic:
-	// Drain still relies on pending for the wait itself.
+	// inFlight is the current number of unfinished completions. It is only
+	// diagnostic: Drain still relies on pending for the wait itself.
 	inFlight atomic.Int64
 }
 
@@ -154,13 +171,14 @@ func New(cfg Config) (*Proxy, error) {
 	}
 
 	return &Proxy{
-		registry:    cfg.Registry,
-		recorder:    cfg.Recorder,
-		accountant:  cfg.Accountant,
-		client:      client,
-		host:        cfg.Host,
-		logger:      logger,
-		credentials: awssig.NewCredentialSource(),
+		registry:        cfg.Registry,
+		recorder:        cfg.Recorder,
+		accountant:      cfg.Accountant,
+		client:          client,
+		host:            cfg.Host,
+		logger:          logger,
+		credentials:     awssig.NewCredentialSource(),
+		completionQueue: make(chan requestCompletion, completionQueueCapacity),
 	}, nil
 }
 
@@ -367,8 +385,8 @@ func (p *Proxy) contextResolution(
 	return res, nil
 }
 
-// Drain waits for the record goroutines still in flight, or until ctx expires,
-// whichever comes first.
+// Drain waits for submitted completion work, including full-queue submitters,
+// or until ctx expires, whichever comes first.
 //
 // A record is written off the request path, so the last request can be answered
 // and the process torn down while its record is still being appended — and
@@ -492,40 +510,73 @@ func (p *Proxy) writeChunk(
 	return true
 }
 
-// record closes the finished exchange out without making the client wait for
-// it: exactly one accounting finalization, then a best-effort ledger append. A
-// recorder that fails, or blocks, costs the record and nothing else.
+// record materializes the finished exchange immediately, then submits only the
+// finalized accounting snapshot and ledger record to a bounded completion queue.
+// A full queue applies backpressure after the response relay rather than dropping
+// durable accounting work or retaining the response capture in an unbounded set
+// of goroutines.
 func (p *Proxy) record(ctx context.Context, exch *exchange, capt *capture) {
 	if p.recorder == nil && exch.accountingID == 0 {
 		return
 	}
-
-	p.pending.Add(1)
-	p.inFlight.Add(1)
-
-	go p.appendRecord(ctx, exch, capt)
-}
-
-// appendRecord finalizes accounting and appends one record, off the request
-// path. Finalization runs first and exactly once: the accounting row is the
-// durable answer, and the ledger line is the audit copy that may be lost.
-func (p *Proxy) appendRecord(ctx context.Context, exch *exchange, capt *capture) {
-	defer func() {
-		p.inFlight.Add(-1)
-		p.pending.Done()
-	}()
-
 	if capt != nil && capt.dropped {
 		p.logger.WarnContext(ctx, "response capture dropped at the size ceiling",
 			slog.Int("limit_bytes", captureLimitBytes))
 	}
-
-	if exch.accountingID != 0 {
-		p.finalizeAccounting(ctx, exch, capt)
+	completion := requestCompletion{
+		accountingID: exch.accountingID,
+		finalized:    exch.finalizedRequest(capt),
+		record:       exch.record(p.host, capt),
+		appendLedger: p.recorder != nil,
 	}
 
-	if p.recorder != nil {
-		if err := p.recorder.Append(exch.record(p.host, capt)); err != nil {
+	p.pending.Add(1)
+	p.inFlight.Add(1)
+	p.completionQueue <- completion
+	p.startCompletionWorker(completionPersistenceContext(ctx))
+}
+
+// completionPersistenceContext deliberately breaks request ownership: queued
+// persistence must survive cancellation and carry no request-scoped values.
+func completionPersistenceContext(context.Context) context.Context {
+	return context.Background()
+}
+
+func (p *Proxy) startCompletionWorker(ctx context.Context) {
+	p.completionMu.Lock()
+	defer p.completionMu.Unlock()
+	if p.completionWorkers >= completionWorkerCount {
+		return
+	}
+	p.completionWorkers++
+	go p.runCompletionWorker(ctx)
+}
+
+func (p *Proxy) runCompletionWorker(ctx context.Context) {
+	for {
+		completion := <-p.completionQueue
+		p.complete(ctx, completion)
+		p.inFlight.Add(-1)
+		p.pending.Done()
+
+		p.completionMu.Lock()
+		if len(p.completionQueue) == 0 {
+			p.completionWorkers--
+			p.completionMu.Unlock()
+			return
+		}
+		p.completionMu.Unlock()
+	}
+}
+
+// complete finalizes accounting before appending the audit copy. Both operations
+// use the Proxy's service-owned context, independent of request cancellation.
+func (p *Proxy) complete(ctx context.Context, completion requestCompletion) {
+	if completion.accountingID != 0 {
+		p.finalizeAccounting(ctx, completion.accountingID, completion.finalized)
+	}
+	if completion.appendLedger {
+		if err := p.recorder.Append(completion.record); err != nil {
 			p.logger.WarnContext(ctx, "ledger record dropped", slog.Any("error", err))
 		}
 	}
