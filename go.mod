@@ -3,6 +3,7 @@ module github.com/joshsymonds/patchbay
 go 1.26
 
 require (
+	github.com/ebitengine/purego v0.10.2
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.57.0
 )

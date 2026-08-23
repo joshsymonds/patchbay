@@ -24,8 +24,12 @@
             version = "dev";
 
             src = ./.;
-            # Vendor the pure-Go SQLite dependency for sandboxed builds.
-            vendorHash = "sha256-isqeSOokeSJQrrjhDz3fh77WhQ1tI/KOPBAHCcqL3wM=";
+            # Hash of the vendored tree covering every Go module dependency in
+            # go.mod, not just one of them: the sandboxed build has no network, so
+            # the whole dependency set must be fetched and pinned here. Update this
+            # whenever go.mod or go.sum changes, using the hash Nix reports as
+            # `got:` when the build fails on a mismatch.
+            vendorHash = "sha256-i1vtcGhyt0W1a18wvtelEZuvduDm3PzR8NjUZwsv5eE=";
 
             go = pkgs.go_1_26;
             subPackages = [ "cmd/patchbay" ];

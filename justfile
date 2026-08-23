@@ -45,9 +45,12 @@ refresh-env:
     devenv print-dev-env > {{_envfile}}
     @echo "Regenerated {{_envfile}}"
 
-# Run golangci-lint.
+# Run golangci-lint for the host platform, then again for Darwin. Build-tagged
+# files are invisible to a single-GOOS run: the purego ACL bindings behind
+# //go:build darwin escaped the gate entirely until this second pass existed.
 lint: _load-env
     set -a && source {{_envfile}} && set +a && golangci-lint run
+    set -a && source {{_envfile}} && set +a && GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 golangci-lint run
 
 # Run go test.
 test: _load-env

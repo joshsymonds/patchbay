@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,7 +21,9 @@ type sourceIdentity struct {
 	inode  string
 }
 
-type snapshotBeforePublishHookKey struct{}
+type toolingBeforePublishHookKey struct{}
+
+type toolingMigrationCloneHookKey struct{}
 
 const (
 	toolingStagingPrefix   = ".patchbay-usage-"
@@ -28,6 +31,13 @@ const (
 	// A one-hour minimum avoids treating an active snapshot or export as crash
 	// residue during ordinary concurrent and long-running tooling operations.
 	toolingStagingOrphanAge = time.Hour
+	// The disposable database the forward-migration proof runs against, named
+	// beside the artifact inside the same private staging directory.
+	toolingMigrationCloneSuffix = ".migration-clone"
+	// Connection parameters for the two ways tooling opens a database: sources
+	// and generated artifacts are read, and only the disposable clone is written.
+	toolingReadOnlyQuery  = "_busy_timeout=5000&_foreign_keys=1&mode=ro"
+	toolingReadWriteQuery = "_busy_timeout=5000&_foreign_keys=1"
 )
 
 type toolingDestination struct {
@@ -77,17 +87,147 @@ func Snapshot(ctx context.Context, source, dest string) (result error) {
 		return fmt.Errorf("close usage database %q: %w", source, closeErr)
 	}
 	closed = true
-	if hook, ok := ctx.Value(snapshotBeforePublishHookKey{}).(func(string)); ok {
+	if hook, ok := ctx.Value(toolingBeforePublishHookKey{}).(func(string)); ok {
 		hook(prepared.temp)
 	}
-	artifact, artifactErr := openToolingDatabase(ctx, prepared.temp)
+	artifact, artifactErr := openGeneratedToolingDatabase(ctx, prepared.temp)
 	if artifactErr != nil {
 		return fmt.Errorf("validate usage snapshot %q: %w", prepared.temp, artifactErr)
 	}
 	if closeErr := artifact.Close(); closeErr != nil {
 		return fmt.Errorf("close usage snapshot %q after validation: %w", prepared.temp, closeErr)
 	}
+	if migrationErr := validateSnapshotMigrationClone(ctx, prepared.temp); migrationErr != nil {
+		return fmt.Errorf("validate usage snapshot %q forward migration: %w", prepared.temp, migrationErr)
+	}
 	return finalizeToolingDestination(prepared, dest)
+}
+
+// validateSnapshotMigrationClone proves the generated artifact still migrates
+// forward under this build before it is published. Accepting an older schema is
+// deliberate — `patchbay serve` migrates one forward when it opens the database —
+// but accepting it on the strength of its recorded version alone certifies a
+// restore nobody has attempted. A database whose schema_migrations rows are a
+// valid prefix can still contradict the objects actually on disk, and that only
+// surfaces when the pending migrations run.
+//
+// They run against a throwaway byte copy inside the same private staging
+// directory, never against the artifact. The artifact is what gets published, so
+// an older-schema snapshot has to reach its destination exactly as it was read.
+func validateSnapshotMigrationClone(ctx context.Context, artifact string) (result error) {
+	clone := artifact + toolingMigrationCloneSuffix
+	flags := syscall.O_WRONLY | syscall.O_CREAT | syscall.O_EXCL | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+	file, createErr := openToolingFile(clone, flags)
+	if createErr != nil {
+		return fmt.Errorf("create usage migration clone %q: %w", clone, createErr)
+	}
+	defer func() {
+		result = errors.Join(result, removeToolingMigrationClone(clone))
+	}()
+	if fillErr := fillSnapshotMigrationClone(file, artifact, clone); fillErr != nil {
+		return fillErr
+	}
+	return migrateToolingMigrationClone(ctx, clone)
+}
+
+// fillSnapshotMigrationClone secures the exclusively created clone and copies the
+// artifact into it byte for byte. The mode is set through the opened descriptor
+// rather than relied upon from the creation mode, which the process umask can
+// narrow.
+func fillSnapshotMigrationClone(clone *os.File, artifact, clonePath string) (result error) {
+	defer func() {
+		if closeErr := clone.Close(); closeErr != nil {
+			result = errors.Join(
+				result,
+				fmt.Errorf("close usage migration clone %q: %w", clonePath, closeErr),
+			)
+		}
+	}()
+	if chmodErr := clone.Chmod(databaseMode); chmodErr != nil {
+		return fmt.Errorf("secure usage migration clone %q: %w", clonePath, chmodErr)
+	}
+	source, openErr := openToolingFile(artifact, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC)
+	if openErr != nil {
+		return fmt.Errorf("open usage snapshot %q for its migration clone: %w", artifact, openErr)
+	}
+	defer func() {
+		if closeErr := source.Close(); closeErr != nil {
+			result = errors.Join(result, fmt.Errorf("close usage snapshot %q after cloning: %w", artifact, closeErr))
+		}
+	}()
+	if _, copyErr := io.Copy(clone, source); copyErr != nil {
+		return fmt.Errorf("copy usage snapshot %q into migration clone %q: %w", artifact, clonePath, copyErr)
+	}
+	return nil
+}
+
+// migrateToolingMigrationClone opens the clone under destination trust — the
+// same shape check the generated artifact gets, and deliberately not the strict
+// source policy, because an all-squashed destination reports an owner Patchbay
+// never runs as — then applies every pending migration and revalidates the
+// migrated result.
+func migrateToolingMigrationClone(ctx context.Context, clone string) (result error) {
+	identity, inspectErr := inspectGeneratedToolingDatabase(clone)
+	if inspectErr != nil {
+		return inspectErr
+	}
+	absolute, absoluteErr := filepath.Abs(clone)
+	if absoluteErr != nil {
+		return fmt.Errorf("resolve usage migration clone path %q: %w", clone, absoluteErr)
+	}
+	db, openErr := sql.Open("sqlite", toolingDatabaseURI(absolute, toolingReadWriteQuery))
+	if openErr != nil {
+		return fmt.Errorf("open usage migration clone %q: %w", clone, openErr)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			result = errors.Join(result, fmt.Errorf("close usage migration clone %q: %w", clone, closeErr))
+		}
+	}()
+	if pingErr := db.PingContext(ctx); pingErr != nil {
+		return fmt.Errorf("open usage migration clone %q: ping: %w", clone, pingErr)
+	}
+	if recheckErr := recheckToolingSource(clone, identity); recheckErr != nil {
+		return recheckErr
+	}
+	if hook, ok := ctx.Value(toolingMigrationCloneHookKey{}).(func(string)); ok {
+		hook(clone)
+	}
+	if migrateErr := migrate(ctx, db); migrateErr != nil {
+		return fmt.Errorf("migrate usage migration clone %q: %w", clone, migrateErr)
+	}
+	if integrityErr := verifyToolingIntegrity(ctx, db, clone); integrityErr != nil {
+		return integrityErr
+	}
+	if _, schemaErr := validateToolingSchema(ctx, db); schemaErr != nil {
+		return fmt.Errorf("validate migrated usage migration clone %q: %w", clone, schemaErr)
+	}
+	return nil
+}
+
+// toolingDatabaseURI builds the file URI the SQLite driver expects for an
+// absolute local path, with the connection parameters appended as its query.
+func toolingDatabaseURI(absolute, query string) string {
+	return (&url.URL{Scheme: "file", Path: absolute, RawQuery: query}).String()
+}
+
+// removeToolingMigrationClone deletes the disposable clone and every sidecar the
+// migration connection may have left beside it. Migrations write, so a rollback
+// journal exists for the duration of each one, and none of that may survive into
+// the staging directory the publish step is about to finish with.
+func removeToolingMigrationClone(clone string) error {
+	paths := make([]string, 0, len(databaseSidecarSuffixes())+1)
+	paths = append(paths, clone)
+	for _, suffix := range databaseSidecarSuffixes() {
+		paths = append(paths, clone+suffix)
+	}
+	removals := make([]error, 0, len(paths))
+	for _, path := range paths {
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			removals = append(removals, fmt.Errorf("remove usage migration clone %q: %w", path, removeErr))
+		}
+	}
+	return errors.Join(removals...)
 }
 
 func validateToolingContext(ctx context.Context) error {
@@ -100,70 +240,167 @@ func validateToolingContext(ctx context.Context) error {
 	return nil
 }
 
-// openToolingDatabase opens an existing, supported usage database without ever
-// creating, migrating, chmodding, or otherwise modifying the source file.
+// toolingPathValidator proves a path is safe to hand to SQLite and records the
+// identity the post-open recheck compares against. Which validator applies is the
+// trust boundary: external sources get the strict local traversal, while an
+// artifact Patchbay generated on the destination filesystem does not.
+type toolingPathValidator func(string) (sourceIdentity, error)
+
+// openToolingDatabase opens an existing, supported usage database that Patchbay
+// did not create — the live serve database a snapshot or export reads — without
+// ever creating, migrating, chmodding, or otherwise modifying the source file.
+// External sources get the full strict traversal, sidecars included.
 func openToolingDatabase(ctx context.Context, path string) (*sql.DB, error) {
+	db, _, openErr := openVersionedToolingDatabase(ctx, path)
+	return db, openErr
+}
+
+// openVersionedToolingDatabase is openToolingDatabase for the caller that has to
+// act on which schema the source records — export reads the current schema's
+// columns, so an older source has to be brought forward before it can be read
+// that way, and only the validated recorded version says whether it is one.
+func openVersionedToolingDatabase(ctx context.Context, path string) (*sql.DB, int, error) {
+	return openValidatedToolingDatabase(ctx, path, openSecureToolingSource)
+}
+
+// openGeneratedToolingDatabase opens a database Patchbay itself just wrote into
+// its own private staging directory — a snapshot artifact, or the migrated clone
+// an export of an older schema reads — to confirm it is a readable usage database
+// before anything depends on it. It applies destination trust, not source trust:
+// see inspectGeneratedToolingDatabase for why the local ownership policy cannot
+// run against an all-squashed destination.
+func openGeneratedToolingDatabase(ctx context.Context, path string) (*sql.DB, error) {
+	db, _, openErr := openValidatedToolingDatabase(ctx, path, inspectGeneratedToolingDatabase)
+	return db, openErr
+}
+
+func openValidatedToolingDatabase(
+	ctx context.Context,
+	path string,
+	validate toolingPathValidator,
+) (*sql.DB, int, error) {
 	if path == "" {
-		return nil, errors.New("usage database path is blank")
+		return nil, 0, errors.New("usage database path is blank")
 	}
 	path = filepath.Clean(path)
-	identity, identityErr := probeToolingSource(path)
+	identity, identityErr := validate(path)
 	if identityErr != nil {
-		return nil, identityErr
+		return nil, 0, identityErr
 	}
 	absolute, absoluteErr := filepath.Abs(path)
 	if absoluteErr != nil {
-		return nil, fmt.Errorf("resolve usage database path %q: %w", path, absoluteErr)
+		return nil, 0, fmt.Errorf("resolve usage database path %q: %w", path, absoluteErr)
 	}
-	uri := &url.URL{Scheme: "file", Path: absolute, RawQuery: "_busy_timeout=5000&_foreign_keys=1&mode=ro"}
-	db, openErr := sql.Open("sqlite", uri.String())
+	db, openErr := sql.Open("sqlite", toolingDatabaseURI(absolute, toolingReadOnlyQuery))
 	if openErr != nil {
-		return nil, fmt.Errorf("open usage database %q: %w", path, openErr)
+		return nil, 0, fmt.Errorf("open usage database %q: %w", path, openErr)
 	}
 	if pingErr := db.PingContext(ctx); pingErr != nil {
-		return nil, closeAfterError(db, fmt.Errorf("open usage database %q: ping: %w", path, pingErr))
+		return nil, 0, closeAfterError(db, fmt.Errorf("open usage database %q: ping: %w", path, pingErr))
 	}
 	// SQLite opens database files by path and may reopen them internally; its Go
 	// driver offers no fd-passing API. Rechecking detects a source-path swap that
 	// occurred while establishing this connection rather than claiming to prevent it.
 	if recheckErr := recheckToolingSource(path, identity); recheckErr != nil {
-		return nil, closeAfterError(db, recheckErr)
+		return nil, 0, closeAfterError(db, recheckErr)
 	}
-	if _, schemaErr := validateToolingSchema(ctx, db); schemaErr != nil {
-		return nil, closeAfterError(db, schemaErr)
+	if integrityErr := verifyToolingIntegrity(ctx, db, path); integrityErr != nil {
+		return nil, 0, closeAfterError(db, integrityErr)
 	}
-	return db, nil
+	version, schemaErr := validateToolingSchema(ctx, db)
+	if schemaErr != nil {
+		return nil, 0, closeAfterError(db, schemaErr)
+	}
+	return db, version, nil
 }
 
-func probeToolingSource(path string) (sourceIdentity, error) {
-	info, statErr := os.Lstat(path)
-	if statErr != nil {
-		if errors.Is(statErr, os.ErrNotExist) {
-			return sourceIdentity{}, fmt.Errorf("usage database %q does not exist", path)
+// verifyToolingIntegrity proves the exact database this connection opened reads
+// back coherently, before anything downstream treats it as good data. Schema
+// validation reads only schema_migrations and sqlite_master, and `VACUUM INTO`
+// rebuilds secondary indexes from table rows rather than copying them, so a
+// source whose index disagrees with its table satisfies both while remaining a
+// corrupt original — and the snapshot taken from it certifies that corruption as
+// a good backup. The check is read-only: it never repairs what it inspects.
+func verifyToolingIntegrity(ctx context.Context, queryer schemaQueryer, path string) (result error) {
+	rows, queryErr := queryer.QueryContext(ctx, `PRAGMA integrity_check`)
+	if queryErr != nil {
+		return fmt.Errorf("check usage database %q integrity: %w", path, queryErr)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			result = errors.Join(
+				result,
+				fmt.Errorf("close usage database %q integrity results: %w", path, closeErr),
+			)
 		}
-		return sourceIdentity{}, fmt.Errorf("inspect usage database %q: %w", path, statErr)
+	}()
+	reported := make([]string, 0, 1)
+	for rows.Next() {
+		var message string
+		if scanErr := rows.Scan(&message); scanErr != nil {
+			return fmt.Errorf("scan usage database %q integrity result: %w", path, scanErr)
+		}
+		reported = append(reported, message)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return sourceIdentity{}, fmt.Errorf("usage database path %q is a symbolic link", path)
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return fmt.Errorf("iterate usage database %q integrity results: %w", path, rowsErr)
 	}
-	if !info.Mode().IsRegular() {
-		return sourceIdentity{}, fmt.Errorf("usage database path %q is not a regular file", path)
+	return toolingIntegrityResultError(path, reported)
+}
+
+// toolingIntegrityResultError judges what PRAGMA integrity_check reported.
+// SQLite spells success exactly one way — a single row holding the literal
+// "ok" — and reports every fault as one or more other rows. Anything else is a
+// failure rather than a variant of success: no rows at all means the check did
+// not run, and extra rows alongside an "ok" mean it found faults.
+func toolingIntegrityResultError(path string, reported []string) error {
+	if len(reported) == 1 && reported[0] == "ok" {
+		return nil
 	}
-	fd, openErr := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if len(reported) == 0 {
+		return fmt.Errorf("usage database %q failed integrity check: no result rows", path)
+	}
+	return fmt.Errorf("usage database %q failed integrity check: %s", path, strings.Join(reported, "; "))
+}
+
+// inspectGeneratedToolingDatabase records the device and inode of the snapshot
+// Patchbay just wrote inside its own private staging directory, after proving the
+// path is a regular file reached without following a symbolic link.
+//
+// It deliberately performs no ancestor traversal and no local-UID ownership check.
+// The artifact is not an external source: it lives on the destination filesystem,
+// which in deployment is an all-squashed network export where every file and
+// directory reports a mapped owner such as uid 1024 that Patchbay never runs as.
+// Applying openSecureToolingSource there would refuse Patchbay's own output.
+// Destination integrity rests instead on the private staging directory, its
+// exclusive lock, and no-replace publication.
+func inspectGeneratedToolingDatabase(path string) (sourceIdentity, error) {
+	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | syscall.O_CLOEXEC
+	fd, openErr := syscall.Open(path, flags, 0)
 	if openErr != nil {
-		return sourceIdentity{}, fmt.Errorf("probe usage database %q without following links: %w", path, openErr)
+		if errors.Is(openErr, syscall.ENOENT) {
+			return sourceIdentity{}, fmt.Errorf("generated usage database %q does not exist", path)
+		}
+		if errors.Is(openErr, syscall.ELOOP) {
+			return sourceIdentity{}, fmt.Errorf("generated usage database %q is a symbolic link", path)
+		}
+		return sourceIdentity{}, fmt.Errorf(
+			"open generated usage database %q without following links: %w",
+			path,
+			openErr,
+		)
 	}
 	var stat syscall.Stat_t
-	fstatErr := syscall.Fstat(fd, &stat)
-	closeErr := syscall.Close(fd)
-	if fstatErr != nil {
-		return sourceIdentity{}, fmt.Errorf("stat usage database %q probe: %w", path, fstatErr)
-	}
-	if closeErr != nil {
-		return sourceIdentity{}, fmt.Errorf("close usage database %q probe: %w", path, closeErr)
+	if statErr := syscall.Fstat(fd, &stat); statErr != nil {
+		cause := fmt.Errorf("inspect generated usage database %q: %w", path, statErr)
+		return sourceIdentity{}, closeDescriptorAfterError(fd, "generated usage database handle", cause)
 	}
 	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
-		return sourceIdentity{}, fmt.Errorf("usage database path %q is not a regular file", path)
+		cause := fmt.Errorf("generated usage database %q is not a regular file", path)
+		return sourceIdentity{}, closeDescriptorAfterError(fd, "non-regular generated usage database", cause)
+	}
+	if closeErr := syscall.Close(fd); closeErr != nil {
+		return sourceIdentity{}, fmt.Errorf("close generated usage database %q handle: %w", path, closeErr)
 	}
 	return sourceIdentity{
 		device: fmt.Sprintf("%d", stat.Dev),
@@ -235,15 +472,11 @@ func validateToolingSchema(ctx context.Context, queryer schemaQueryer) (version 
 	if index == 0 {
 		return 0, errors.New("not a patchbay usage database: schema_migrations is empty")
 	}
-	const accountingRequestsTableQuery = `SELECT COUNT(*) FROM sqlite_master
-		WHERE type = 'table' AND name = 'accounting_requests'`
-	var accountingRequests int
-	table := queryer.QueryRowContext(ctx, accountingRequestsTableQuery)
-	if tableErr := table.Scan(&accountingRequests); tableErr != nil {
-		return 0, fmt.Errorf("not a patchbay usage database: inspect accounting_requests: %w", tableErr)
-	}
-	if accountingRequests != 1 {
-		return 0, errors.New("not a patchbay usage database: accounting_requests is absent")
+	// The rows parsed above are a claim about which migrations ran, not evidence
+	// that what they built is still there. Hold the database to the objects that
+	// version promised.
+	if objectErr := validateRecordedSchemaObjects(ctx, queryer, version); objectErr != nil {
+		return 0, objectErr
 	}
 	return version, nil
 }

@@ -12,6 +12,13 @@ import (
 )
 
 // Export writes a complete, deterministic JSONL view of source to dest.
+//
+// The rows it writes are the current schema's columns, whatever schema the source
+// records, so a source already at the current version is read directly and an
+// older one is brought forward first. Bringing it forward in place is not an
+// option: the source is a live accounting database and a read command must leave
+// it byte for byte as it found it. It is copied instead, and the copy is what
+// gets migrated and read.
 func Export(ctx context.Context, source, dest string) (result error) {
 	if contextErr := validateToolingContext(ctx); contextErr != nil {
 		return contextErr
@@ -27,7 +34,19 @@ func Export(ctx context.Context, source, dest string) (result error) {
 		}
 	}()
 
-	db, openErr := openToolingDatabase(ctx, source)
+	if writeErr := writeUsageExport(ctx, source, prepared.temp); writeErr != nil {
+		return writeErr
+	}
+	if hook, ok := ctx.Value(toolingBeforePublishHookKey{}).(func(string)); ok {
+		hook(prepared.temp)
+	}
+	return finalizeToolingDestination(prepared, dest)
+}
+
+// writeUsageExport reads source by whichever route its recorded schema calls for
+// and leaves the finished export at temp.
+func writeUsageExport(ctx context.Context, source, temp string) (result error) {
+	db, version, openErr := openVersionedToolingDatabase(ctx, source)
 	if openErr != nil {
 		return openErr
 	}
@@ -41,14 +60,86 @@ func Export(ctx context.Context, source, dest string) (result error) {
 		}
 	}()
 
-	if writeErr := writeUsageExportFile(ctx, db, prepared.temp); writeErr != nil {
-		return writeErr
+	if version == latestSchemaVersion() {
+		if writeErr := writeUsageExportFile(ctx, db, temp); writeErr != nil {
+			return writeErr
+		}
+		if closeErr := db.Close(); closeErr != nil {
+			return fmt.Errorf("close usage database %q: %w", source, closeErr)
+		}
+		closed = true
+		return nil
+	}
+
+	// The clone lives in the private staging directory the export is being built
+	// in, so it is removed with everything else even if this returns early, and it
+	// is removed explicitly here so it never sits beside the finished export.
+	clone := temp + toolingMigrationCloneSuffix
+	defer func() {
+		result = errors.Join(result, removeToolingMigrationClone(clone))
+	}()
+	if cloneErr := cloneToolingSource(ctx, db, source, clone); cloneErr != nil {
+		return cloneErr
 	}
 	if closeErr := db.Close(); closeErr != nil {
 		return fmt.Errorf("close usage database %q: %w", source, closeErr)
 	}
 	closed = true
-	return finalizeToolingDestination(prepared, dest)
+	return writeMigratedUsageExport(ctx, clone, temp)
+}
+
+// cloneToolingSource copies the open source through SQLite, so the copy is
+// consistent with a live WAL writer rather than a torn read of the file, and
+// secures it before anything opens it for writing.
+func cloneToolingSource(ctx context.Context, db *sql.DB, source, clone string) error {
+	if _, vacuumErr := db.ExecContext(ctx, `VACUUM INTO ?`, clone); vacuumErr != nil {
+		return fmt.Errorf("copy usage database %q for migration: %w", source, vacuumErr)
+	}
+	return secureToolingMigrationClone(clone)
+}
+
+// secureToolingMigrationClone narrows the clone SQLite just created to the
+// database mode through its own descriptor, opened without following a link, so
+// the mode lands on that inode rather than on whatever the path resolves to by
+// the time a second call gets there. The creation mode cannot be relied on: the
+// process umask only ever narrows it, and SQLite chooses it.
+func secureToolingMigrationClone(clone string) (result error) {
+	file, openErr := openToolingFile(clone, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC)
+	if openErr != nil {
+		return fmt.Errorf("open usage migration clone %q to secure it: %w", clone, openErr)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			result = errors.Join(
+				result,
+				fmt.Errorf("close usage migration clone %q after securing it: %w", clone, closeErr),
+			)
+		}
+	}()
+	if chmodErr := file.Chmod(databaseMode); chmodErr != nil {
+		return fmt.Errorf("secure usage migration clone %q: %w", clone, chmodErr)
+	}
+	return nil
+}
+
+// writeMigratedUsageExport brings the clone up to the current schema and exports
+// from it. Migration proves the clone reads back coherently and is still a usage
+// database afterwards; the reopen then reads it through the same validated
+// read-only path any other database gets, with the migrating connection closed.
+func writeMigratedUsageExport(ctx context.Context, clone, temp string) (result error) {
+	if migrateErr := migrateToolingMigrationClone(ctx, clone); migrateErr != nil {
+		return fmt.Errorf("migrate usage export source copy: %w", migrateErr)
+	}
+	db, openErr := openGeneratedToolingDatabase(ctx, clone)
+	if openErr != nil {
+		return fmt.Errorf("reopen migrated usage export source copy: %w", openErr)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			result = errors.Join(result, fmt.Errorf("close usage migration clone %q: %w", clone, closeErr))
+		}
+	}()
+	return writeUsageExportFile(ctx, db, temp)
 }
 
 func writeUsageExportFile(ctx context.Context, db *sql.DB, temp string) error {

@@ -57,7 +57,7 @@ func Open(path string) (*Store, error) {
 			fmt.Errorf("open usage database %q: initialize WAL journal mode: %w", path, walErr),
 		)
 	}
-	if migrateErr := migrate(db); migrateErr != nil {
+	if migrateErr := migrate(context.Background(), db); migrateErr != nil {
 		return nil, closeAfterError(db, fmt.Errorf("open usage database %q: migrate: %w", path, migrateErr))
 	}
 
@@ -159,7 +159,7 @@ func prepareDatabasePathIdentity(path string) (identity sourceIdentity, result e
 	if absErr != nil {
 		return sourceIdentity{}, fmt.Errorf("resolve usage database path %q: %w", path, absErr)
 	}
-	parentFD, parentErr := openSecureDatabaseParent(filepath.Dir(absolute))
+	parentFD, parentErr := openSecureDatabaseParent(filepath.Dir(absolute), createMissingComponents)
 	if parentErr != nil {
 		return sourceIdentity{}, parentErr
 	}
@@ -169,14 +169,204 @@ func prepareDatabasePathIdentity(path string) (identity sourceIdentity, result e
 			identity = sourceIdentity{}
 		}
 	}()
-	return openSecureDatabaseFile(parentFD, filepath.Base(absolute), path)
+	name := filepath.Base(absolute)
+	if sidecarErr := verifyDatabaseSidecars(parentFD, name, path); sidecarErr != nil {
+		return sourceIdentity{}, sidecarErr
+	}
+	return openSecureDatabaseFile(parentFD, name, path)
 }
 
-func openSecureDatabaseParent(parent string) (int, error) {
+// databaseSidecarSuffixes returns the companion paths SQLite derives from a
+// database pathname and opens by name: the write-ahead log, its shared-memory
+// index, and the rollback journal.
+func databaseSidecarSuffixes() []string {
+	return []string{"-wal", "-shm", "-journal"}
+}
+
+// verifyDatabaseSidecars applies the leaf policy to every existing sidecar beside
+// name in the already-validated parent, before SQLite receives the database
+// pathname. An accepted immediate parent is never group- or world-writable, so a
+// missing sidecar is safe: no other local UID can create one. An existing sidecar
+// is a different matter — it may predate the parent's current mode. SQLite opens
+// these by path during Ping and hot-journal recovery, so a hostile one is read or
+// replayed before any leaf check can help. Rejection is read-only: a refused plant
+// must be left exactly as it was found.
+//
+// What this establishes is the sidecar's current owner, mode, and ACL, and that no
+// other local UID can open or replace it from here on. It does not establish how
+// the sidecar was reachable in the past. A descriptor another UID opened O_RDWR
+// during an earlier exposure keeps writing this same inode no matter what the
+// current mode says, and no portable stat can see that descriptor or revoke it.
+// That residual is out of scope here by construction, not by oversight: the only
+// remedy is to replace the file with a fresh inode while Patchbay is stopped. See
+// the residual-exposure paragraph in README.md.
+func verifyDatabaseSidecars(parentFD int, name, path string) error {
+	for _, suffix := range databaseSidecarSuffixes() {
+		if err := verifyDatabaseSidecar(parentFD, name+suffix, path+suffix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyDatabaseSidecar(parentFD int, name, path string) error {
+	// O_NONBLOCK keeps a planted FIFO from stalling the open; it is ignored for
+	// the regular files this check accepts.
+	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | syscall.O_CLOEXEC
+	fd, openErr := unix.Openat(parentFD, name, flags, 0)
+	if openErr != nil {
+		if errors.Is(openErr, syscall.ENOENT) {
+			return nil
+		}
+		return databaseSidecarOpenError(path, openErr)
+	}
+	if inspectErr := inspectDatabaseSidecarDescriptor(fd, path); inspectErr != nil {
+		return closeDescriptorAfterError(fd, "usage database sidecar", inspectErr)
+	}
+	if closeErr := syscall.Close(fd); closeErr != nil {
+		return fmt.Errorf("close usage database sidecar %q handle: %w", path, closeErr)
+	}
+	return nil
+}
+
+func inspectDatabaseSidecarDescriptor(fd int, path string) error {
+	var stat syscall.Stat_t
+	if statErr := syscall.Fstat(fd, &stat); statErr != nil {
+		return fmt.Errorf("inspect usage database sidecar %q: %w", path, statErr)
+	}
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return fmt.Errorf("usage database sidecar %q is not a regular file", path)
+	}
+	effectiveUID := os.Geteuid()
+	if !databaseFileOwnerSafe(stat.Uid, effectiveUID, false) {
+		return fmt.Errorf(
+			"usage database sidecar %q has unsafe owner uid %d; want root or effective uid %d",
+			path,
+			stat.Uid,
+			effectiveUID,
+		)
+	}
+	if !databaseFileModeSafe(os.FileMode(stat.Mode)) {
+		return fmt.Errorf(
+			"usage database sidecar %q is writable by another local user: mode %#o",
+			path,
+			os.FileMode(stat.Mode).Perm(),
+		)
+	}
+	return verifyDescriptorACL("usage database sidecar", path, fd, descriptorHasExtendedACL)
+}
+
+func databaseSidecarOpenError(path string, cause error) error {
+	if errors.Is(cause, syscall.ELOOP) {
+		return fmt.Errorf("usage database sidecar %q is a symbolic link", path)
+	}
+	return fmt.Errorf("open usage database sidecar %q without following links: %w", path, cause)
+}
+
+// openSecureToolingSource validates an existing usage database with the same
+// descriptor-relative ancestor, sidecar, and leaf policy the live serve path
+// applies, but strictly read-only: it never creates a component, never chmods, and
+// never otherwise modifies the source. Snapshot and export use it so a foreign
+// local UID cannot substitute a path component, or preplant a sidecar, before
+// SQLite opens the pathname.
+func openSecureToolingSource(path string) (identity sourceIdentity, result error) {
+	path = filepath.Clean(path)
+	absolute, absErr := filepath.Abs(path)
+	if absErr != nil {
+		return sourceIdentity{}, fmt.Errorf("resolve usage database path %q: %w", path, absErr)
+	}
+	parentFD, parentErr := openSecureDatabaseParent(filepath.Dir(absolute), rejectMissingComponents)
+	if parentErr != nil {
+		return sourceIdentity{}, parentErr
+	}
+	defer func() {
+		if closeErr := syscall.Close(parentFD); closeErr != nil {
+			result = errors.Join(result, fmt.Errorf("close usage database parent %q: %w", filepath.Dir(path), closeErr))
+			identity = sourceIdentity{}
+		}
+	}()
+	name := filepath.Base(absolute)
+	if sidecarErr := verifyDatabaseSidecars(parentFD, name, path); sidecarErr != nil {
+		return sourceIdentity{}, sidecarErr
+	}
+	return inspectToolingSourceFile(parentFD, name, path)
+}
+
+// inspectToolingSourceFile opens the validated parent's named entry read-only
+// and applies the leaf owner, mode, and extended-ACL policy without mutating it.
+func inspectToolingSourceFile(parentFD int, name, path string) (sourceIdentity, error) {
+	// O_NONBLOCK so a planted FIFO or a slow character device cannot park this
+	// read-only open before fstat can refuse the shape; a bare O_RDONLY open of a
+	// pipe with no writer never returns. It is ignored for the regular files this
+	// check accepts.
+	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | syscall.O_CLOEXEC
+	fd, openErr := unix.Openat(parentFD, name, flags, 0)
+	if openErr != nil {
+		if errors.Is(openErr, syscall.ENOENT) {
+			return sourceIdentity{}, fmt.Errorf("usage database %q does not exist", path)
+		}
+		return sourceIdentity{}, databaseFileOpenError(path, openErr)
+	}
+	identity, inspectErr := inspectToolingSourceDescriptor(fd, path)
+	if inspectErr != nil {
+		return sourceIdentity{}, closeDescriptorAfterError(fd, "usage database source handle", inspectErr)
+	}
+	if closeErr := syscall.Close(fd); closeErr != nil {
+		return sourceIdentity{}, fmt.Errorf("close usage database %q source handle: %w", path, closeErr)
+	}
+	return identity, nil
+}
+
+func inspectToolingSourceDescriptor(fd int, path string) (sourceIdentity, error) {
+	var stat syscall.Stat_t
+	if statErr := syscall.Fstat(fd, &stat); statErr != nil {
+		return sourceIdentity{}, fmt.Errorf("inspect usage database %q opened handle: %w", path, statErr)
+	}
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return sourceIdentity{}, fmt.Errorf("usage database path %q is not a regular file", path)
+	}
+	effectiveUID := os.Geteuid()
+	if !databaseFileOwnerSafe(stat.Uid, effectiveUID, false) {
+		return sourceIdentity{}, fmt.Errorf(
+			"usage database %q has unsafe owner uid %d; want root or effective uid %d",
+			path,
+			stat.Uid,
+			effectiveUID,
+		)
+	}
+	if !databaseFileModeSafe(os.FileMode(stat.Mode)) {
+		return sourceIdentity{}, fmt.Errorf(
+			"usage database %q is writable by another local user: mode %#o",
+			path,
+			os.FileMode(stat.Mode).Perm(),
+		)
+	}
+	if aclErr := verifyDescriptorACL("usage database", path, fd, descriptorHasExtendedACL); aclErr != nil {
+		return sourceIdentity{}, aclErr
+	}
+	return sourceIdentity{
+		device: fmt.Sprintf("%d", stat.Dev),
+		inode:  fmt.Sprintf("%d", stat.Ino),
+	}, nil
+}
+
+// missingComponentPolicy decides what a traversal does with an absent ancestor:
+// the live serve path creates it, while read-only tooling refuses.
+type missingComponentPolicy bool
+
+const (
+	createMissingComponents missingComponentPolicy = true
+	rejectMissingComponents missingComponentPolicy = false
+)
+
+func openSecureDatabaseParent(parent string, missing missingComponentPolicy) (int, error) {
 	flags := syscall.O_RDONLY | syscall.O_DIRECTORY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
 	current, openErr := syscall.Open(string(filepath.Separator), flags, 0)
 	if openErr != nil {
 		return -1, fmt.Errorf("open usage database path root: %w", openErr)
+	}
+	if verifyErr := verifyDatabaseParentDescriptor(parent, string(filepath.Separator), current); verifyErr != nil {
+		return -1, closeDescriptorAfterError(current, "usage database path root", verifyErr)
 	}
 	trimmed := strings.TrimPrefix(filepath.Clean(parent), string(filepath.Separator))
 	components := strings.Split(trimmed, string(filepath.Separator))
@@ -184,7 +374,7 @@ func openSecureDatabaseParent(parent string) (int, error) {
 		if component == "" || component == "." {
 			continue
 		}
-		next, componentErr := openSecureDatabaseParentComponent(current, component, parent, flags)
+		next, componentErr := openSecureDatabaseParentComponent(current, component, parent, flags, missing)
 		if componentErr != nil {
 			return -1, closeDescriptorAfterError(current, "usage database parent traversal handle", componentErr)
 		}
@@ -194,10 +384,18 @@ func openSecureDatabaseParent(parent string) (int, error) {
 		}
 		current = next
 	}
+	if verifyErr := verifyDatabaseImmediateParentDescriptor(parent, current); verifyErr != nil {
+		return -1, closeDescriptorAfterError(current, "usage database immediate parent", verifyErr)
+	}
 	return current, nil
 }
 
-func openSecureDatabaseParentComponent(parentFD int, component, parent string, flags int) (int, error) {
+func openSecureDatabaseParentComponent(
+	parentFD int,
+	component, parent string,
+	flags int,
+	missing missingComponentPolicy,
+) (int, error) {
 	next, openErr := unix.Openat(parentFD, component, flags, 0)
 	if openErr == nil {
 		if verifyErr := verifyDatabaseParentDescriptor(parent, component, next); verifyErr != nil {
@@ -207,6 +405,9 @@ func openSecureDatabaseParentComponent(parentFD int, component, parent string, f
 	}
 	if !errors.Is(openErr, syscall.ENOENT) {
 		return -1, databaseParentComponentError(parent, component, openErr)
+	}
+	if missing == rejectMissingComponents {
+		return -1, fmt.Errorf("usage database parent %q component %q does not exist", parent, component)
 	}
 	return createDatabaseParentComponent(parentFD, component, parent, flags)
 }
@@ -239,14 +440,84 @@ func createDatabaseParentComponent(parentFD int, component, parent string, flags
 }
 
 func verifyDatabaseParentDescriptor(parent, component string, fd int) error {
-	var stat syscall.Stat_t
-	if statErr := syscall.Fstat(fd, &stat); statErr != nil {
+	var stat unix.Stat_t
+	if statErr := unix.Fstat(fd, &stat); statErr != nil {
 		return fmt.Errorf("inspect usage database parent %q component %q: %w", parent, component, statErr)
 	}
-	if stat.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return fmt.Errorf("usage database parent %q component %q is not a directory", parent, component)
 	}
+	if !databaseParentDescriptorSafe(stat, os.Geteuid()) {
+		return fmt.Errorf(
+			"usage database parent %q component %q is replaceable by another local user: uid %d, mode %#o",
+			parent,
+			component,
+			stat.Uid,
+			stat.Mode&(unix.S_ISVTX|unix.S_IRWXU|unix.S_IRWXG|unix.S_IRWXO),
+		)
+	}
+	return verifyDescriptorACL(
+		fmt.Sprintf("usage database parent %q component", parent),
+		component,
+		fd,
+		descriptorHasExtendedACL,
+	)
+}
+
+func verifyDatabaseImmediateParentDescriptor(parent string, fd int) error {
+	var stat unix.Stat_t
+	if statErr := unix.Fstat(fd, &stat); statErr != nil {
+		return fmt.Errorf("inspect usage database immediate parent %q: %w", parent, statErr)
+	}
+	if stat.Mode&(unix.S_IWGRP|unix.S_IWOTH) != 0 {
+		return fmt.Errorf(
+			"usage database parent %q is a shared writable immediate parent; SQLite sidecar paths would be replaceable by another local user",
+			parent,
+		)
+	}
 	return nil
+}
+
+func databaseParentDescriptorSafe(stat unix.Stat_t, effectiveUID int) bool {
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return false
+	}
+	if stat.Uid != 0 && int64(stat.Uid) != int64(effectiveUID) {
+		return false
+	}
+	if stat.Mode&(unix.S_IWGRP|unix.S_IWOTH) == 0 {
+		return true
+	}
+	return stat.Mode&unix.S_ISVTX != 0
+}
+
+type descriptorACLInspector func(int) (bool, error)
+
+func verifyDescriptorACL(
+	label string,
+	path string,
+	fd int,
+	inspect descriptorACLInspector,
+) error {
+	hasACL, inspectErr := inspect(fd)
+	if inspectErr != nil {
+		return fmt.Errorf("inspect %s %q extended ACL: %w", label, path, inspectErr)
+	}
+	if hasACL {
+		return fmt.Errorf("%s %q has a nontrivial extended ACL", label, path)
+	}
+	return nil
+}
+
+func databaseFileModeSafe(mode os.FileMode) bool {
+	return mode&(os.FileMode(unix.S_IWGRP)|os.FileMode(unix.S_IWOTH)) == 0
+}
+
+func databaseFileOwnerSafe(ownerUID uint32, effectiveUID int, created bool) bool {
+	if created {
+		return int64(ownerUID) == int64(effectiveUID)
+	}
+	return ownerUID == 0 || int64(ownerUID) == int64(effectiveUID)
 }
 
 func verifyCreatedDatabaseParentDescriptor(parent string, fd int, effectiveUID int) error {
@@ -274,7 +545,12 @@ func verifyCreatedDatabaseParentDescriptor(parent string, fd int, effectiveUID i
 			parentMode,
 		)
 	}
-	return nil
+	return verifyDescriptorACL(
+		"created usage database parent",
+		parent,
+		fd,
+		descriptorHasExtendedACL,
+	)
 }
 
 func databaseParentComponentError(parent, component string, cause error) error {
@@ -289,7 +565,11 @@ func databaseParentComponentError(parent, component string, cause error) error {
 }
 
 func openSecureDatabaseFile(parentFD int, name, path string) (sourceIdentity, error) {
-	flags := syscall.O_RDWR | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+	// O_NONBLOCK for the same reason as the read-only tooling open: refuse a
+	// planted special file promptly rather than waiting on a peer that an
+	// attacker will never provide. It has no effect on the regular files this
+	// path opens or creates.
+	flags := syscall.O_RDWR | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | syscall.O_CLOEXEC
 	for {
 		fd, openErr := unix.Openat(parentFD, name, flags, 0)
 		if openErr == nil {
@@ -328,21 +608,82 @@ func inspectSecureDatabaseFile(fd int, created bool, path string) (sourceIdentit
 		return sourceIdentity{}, closeDescriptorAfterError(fd, "non-regular usage database", cause)
 	}
 	identity := sourceIdentity{device: fmt.Sprintf("%d", stat.Dev), inode: fmt.Sprintf("%d", stat.Ino)}
+	effectiveUID := os.Geteuid()
+	if !databaseFileOwnerSafe(stat.Uid, effectiveUID, created) {
+		ownerErr := fmt.Errorf(
+			"usage database %q has unsafe owner uid %d; want root or effective uid %d",
+			path,
+			stat.Uid,
+			effectiveUID,
+		)
+		if created {
+			ownerErr = fmt.Errorf(
+				"created usage database %q changed owner while opening: uid %d, want %d",
+				path,
+				stat.Uid,
+				effectiveUID,
+			)
+		}
+		return sourceIdentity{}, closeDescriptorAfterError(fd, "usage database after owner rejection", ownerErr)
+	}
+	if !created && !databaseFileModeSafe(os.FileMode(stat.Mode)) {
+		modeErr := fmt.Errorf(
+			"usage database %q is writable by another local user: mode %#o",
+			path,
+			os.FileMode(stat.Mode).Perm(),
+		)
+		return sourceIdentity{}, closeDescriptorAfterError(fd, "usage database after mode rejection", modeErr)
+	}
+	if aclErr := verifyDescriptorACL(
+		"usage database",
+		path,
+		fd,
+		descriptorHasExtendedACL,
+	); aclErr != nil {
+		return sourceIdentity{}, closeDescriptorAfterError(fd, "usage database after ACL rejection", aclErr)
+	}
 	if created {
 		if secureErr := secureCreatedDatabase(path, fd, syscall.Fchmod, syscall.Close); secureErr != nil {
 			return sourceIdentity{}, secureErr
 		}
 		return identity, nil
 	}
-	if secureErr := secureExistingDatabaseDescriptor(path, fd); secureErr != nil {
+	if secureErr := secureExistingDatabaseDescriptor(
+		path,
+		fd,
+		stat.Uid,
+		effectiveUID,
+		syscall.Fchmod,
+		syscall.Close,
+	); secureErr != nil {
 		return sourceIdentity{}, secureErr
 	}
 	return identity, nil
 }
 
-func secureExistingDatabaseDescriptor(path string, fd int) error {
-	chmodErr := syscall.Fchmod(fd, databaseMode)
-	closeErr := syscall.Close(fd)
+func secureExistingDatabaseDescriptor(
+	path string,
+	fd int,
+	ownerUID uint32,
+	effectiveUID int,
+	chmod func(int, uint32) error,
+	closeFile func(int) error,
+) error {
+	if !databaseFileOwnerSafe(ownerUID, effectiveUID, false) {
+		ownerErr := fmt.Errorf(
+			"usage database %q has unsafe owner uid %d; want root or effective uid %d",
+			path,
+			ownerUID,
+			effectiveUID,
+		)
+		closeErr := closeFile(fd)
+		if closeErr != nil {
+			closeErr = fmt.Errorf("close usage database %q after owner rejection: %w", path, closeErr)
+		}
+		return errors.Join(ownerErr, closeErr)
+	}
+	chmodErr := chmod(fd, databaseMode)
+	closeErr := closeFile(fd)
 	if chmodErr != nil {
 		chmodErr = fmt.Errorf("secure usage database %q: %w", path, chmodErr)
 	}

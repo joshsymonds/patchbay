@@ -9,10 +9,13 @@ configuration. A Context publishes exact model-selector-to-Seat-ID bindings and
 names a default Seat. An optional marked-subagent policy can select separate
 Seats when Claude Code sends a valid direct agent marker.
 
-It is a single static CGO-free binary. Its one module dependency is a pure-Go
-SQLite driver, which backs the accounting database. `sigv4` Seats also require
-the AWS CLI because patchbay runs `aws configure export-credentials` for the
-configured profile.
+It is a single static CGO-free binary. It has three direct module dependencies:
+a pure-Go SQLite driver, which backs the accounting database; `golang.org/x/sys`
+for the descriptor-relative syscalls that harden the database path; and
+`github.com/ebitengine/purego`, which is used only on Darwin, to call
+libSystem's ACL functions through dynamic symbol lookup rather than CGO. `sigv4`
+Seats also require the AWS CLI because patchbay runs
+`aws configure export-credentials` for the configured profile.
 
 ## Resolution
 
@@ -314,10 +317,285 @@ removes one only after acquiring its lock nonblocking; a held lock proves the
 staging directory is live, while younger residue is retained until a later run.
 
 The live `PATCHBAY_USAGE_DB` must remain on a local filesystem. Snapshot and
-export destinations can be anywhere. To restore a snapshot, stop the daemon,
-plain-copy the snapshot over the resolved `$PATCHBAY_USAGE_DB` path, then start
-the daemon. `patchbay serve` opens the restored database and automatically
-migrates an older-schema snapshot forward before serving.
+export destinations can be on any filesystem. Patchbay traverses the live
+database path relative to open directory descriptors without following symlinks.
+Every
+preexisting ancestor must be a directory owned by root or Patchbay's effective
+UID. A group- or world-writable traversal ancestor is accepted only when sticky-
+directory semantics protect the next validated component; the immediate
+database parent must never be group- or world-writable because SQLite opens WAL,
+shared-memory, and rollback-journal sidecars there. Every existing `-wal`,
+`-shm`, and `-journal` sidecar beside the database is itself validated before
+SQLite receives the pathname — a regular file reached without following a
+symbolic link, owned by root or the effective UID, not group- or world-writable,
+and free of a nontrivial Darwin ACL — because a sidecar planted while the parent
+was briefly exposed is read or replayed during the first connection. A rejected
+sidecar is left exactly as it was found. A missing sidecar is safe: the accepted
+immediate parent already excludes other local UIDs from creating one. A
+foreign-owned ancestor is
+refused even when its current mode is private because its owner can change that
+mode after validation. A preexisting database leaf must likewise be owned by
+root or the effective UID and must not be group- or world-writable; Patchbay
+refuses rather than repairs write exposure because an already-open writable
+descriptor survives chmod. That refusal covers the file's current state only —
+an inode that passes every check here can still be held open for writing by a
+UID that opened it during an earlier exposure, which no metadata check can
+detect or revoke. See [Residual exposure](#residual-exposure-descriptors-retained-from-before-validation)
+below for the disposition and remediation. Newly created ancestors and database leaves must
+remain owned by the effective UID; ancestors require exact mode 0700, and the
+database is secured to 0600 through its opened descriptor before SQLite receives
+the pathname. On Darwin, every preexisting or newly created ancestor and
+database leaf must also have no nontrivial extended ACL. ACL inspection failures
+are fatal.
+
+`patchbay usage snapshot` and `patchbay usage export` apply that same traversal
+to their source in a read-only form: a missing component is refused rather than
+created, and an accepted source is never chmodded or otherwise repaired. Both
+then run a read-only `PRAGMA integrity_check` against the exact database that
+connection opened, and refuse unless it reports the single result `ok`. Path
+validation and schema validation cannot stand in for that. Schema validation reads
+only the schema — `schema_migrations`, `sqlite_master`, the definitions it stores,
+and the structure SQLite parses out of them — and never a table's rows, while
+`VACUUM INTO` rebuilds secondary indexes from the table rows rather
+than copying them, so a source whose index no longer agrees with its table
+satisfies both while remaining a corrupt original — and a snapshot taken from it
+would be internally consistent, certifying that corruption as a good backup.
+
+Schema validation is a check of objects, not of names. The schema each version
+produces is rebuilt from this build's own migrations, in a private in-memory
+database that touches nothing on disk, and a database is held to everything the
+migrations it records declared. An object is identified by its SQLite object type
+together with its name, never by the name alone: SQLite keeps a namespace per type
+and will hold a trigger and an index of one name side by side, so a name identifies
+at most a namespace and a comparison keyed on it decides by whichever
+`sqlite_master` row it read last. Each declared object is therefore looked up by
+that full identity, on the table association its migration gave it, with
+the columns they declared in the order and with the type, nullability, default and
+primary-key role they declared, the keys and uniqueness they gave an index, and the
+stored definition itself — so a table's constraints and a trigger's body are
+compared, not merely its name. This is not redundant with the recorded version, and
+no later step recovers it: a migration already recorded is skipped rather than
+replayed, so an object dropped or redefined afterwards is never rebuilt. A database
+whose `schema_migrations` rows are a valid prefix but whose `rate_cards` table is
+gone reads as a supported older schema to a version check and reports `ok` to
+`PRAGMA integrity_check`, because the pages that remain are coherent; so does one
+whose rate-card immutability triggers keep their names over a body that has become
+`SELECT 1`, and one whose unique partial index on finalized response ids has been
+rebuilt without `UNIQUE`. The first fails only when something reads the table,
+which on a restored backup means `patchbay serve` failing to start; the other two
+never fail at all — they quietly stop enforcing what they were created to enforce,
+leaving immutable rate cards editable and one response id billable twice. All are
+refused here instead, before anything is staged or published.
+
+Definitions are compared for meaning rather than for text: comments, whitespace and
+keyword case are normalized away, while quoted strings and quoted identifiers are
+compared byte for byte. Migrations are immutable, so a database written by an
+earlier build stored the text of the same statements this build declares, and
+formatting is the only drift the comparison has to absorb.
+
+Additions are refused as well as omissions, because a schema is tampered with by
+addition as readily as by subtraction and an addition is active rather than inert.
+Every trigger and index attached to a table those migrations create —
+`accounting_requests`, `rate_cards`, `schema_migrations` — must be one they
+declared. A trigger nobody declared runs on every write to the table it is attached
+to, so an `AFTER INSERT … DELETE FROM accounting_requests` on a database whose every
+canonical definition is exact empties the ledger the first time Patchbay records a
+request; an index nobody declared decides which writes that table accepts at all.
+Nothing else catches either one: the extra object leaves every declared definition
+comparing equal, reports `ok` to `PRAGMA integrity_check`, is copied forward intact
+by `VACUUM INTO`, and survives the forward-migration proof, because migrations
+create objects and never remove one they do not know about.
+
+What exempts an addition from that sweep is the same full identity — object type
+and name — standing on the table its migration attached it to. A name alone would
+not: a trigger wearing the name of a declared index is a second object rather than
+that index, so the index is still present and exact while the trigger runs beside
+it, and exempting the trigger by name would wave through precisely the addition
+this sweep exists to refuse. The same holds in reverse for an index taking a
+declared trigger's name, and for either taking a declared name onto a different
+managed table. A schema holding two `sqlite_master` rows under one identity is
+refused outright rather than resolved to whichever row was read last.
+
+Indexes on those tables are refused whether or not they are `UNIQUE`. A unique index
+— whole-table, partial, or over an expression — rejects rows the migrations accept.
+A nonunique one is not the safe residue it looks like, since a key over an expression
+or a collation the writing build cannot evaluate fails every insert into the table it
+covers; all of them are refused rather than a subset whose safety would have to be
+re-argued index by index. The one exception is the index SQLite maintains for a
+`UNIQUE` or `PRIMARY KEY` constraint, which `rate_cards` requires and no migration
+names: those carry no stored `CREATE` text, and that absence is what identifies them.
+A reserved `sqlite_` name prefix would not — `CREATE` refuses such a name, but a
+principal who can write the file can insert the `sqlite_master` row directly and
+SQLite honours the trigger it finds there, so exempting that prefix would leave one
+namespace unexamined.
+
+Away from those tables the contract stays a floor rather than an inventory: an
+unrelated table or view, and the triggers and indexes attached to it, are neither
+required nor refused, because nothing there runs unless something writes to that
+table and Patchbay never does. A table whose name a pending migration wants is the
+one contradiction left over, and it surfaces where it has to — when that migration
+runs against the disposable clone and collides.
+
+The destination is a separate trust boundary and is deliberately not held to
+that local-UID policy. Snapshot and export destinations are routinely
+all-squashed network exports — the deployed NAS target maps every file and
+directory it serves to one fixed remote UID that Patchbay never runs as — so
+local ownership evidence does not exist there, and demanding it would refuse
+Patchbay's own output. Patchbay therefore neither traverses nor refuses
+destination ancestors, and does not claim local-UID security over them: the
+destination filesystem, its directory integrity, and its identity mapping are
+trusted. Choose a destination whose server and export you already trust, because
+a principal who controls that filesystem controls the artifact written to it.
+Within that trust, integrity rests on the private mode-0700 staging directory,
+its exclusive lock, and the no-replace link that publishes the finished file. The
+snapshot Patchbay generates inside that staging directory is validated as its own
+artifact rather than as an external source: it must be a regular file opened
+without following a symbolic link, must parse as a supported usage database, must
+pass its own `PRAGMA integrity_check`, and must present the same device and inode
+before and after SQLite opens it.
+
+A snapshot that records a supported older schema is published unchanged, but only
+after Patchbay proves that schema still migrates forward. It byte-copies the
+finished artifact into a disposable migration clone, created exclusively at mode
+0600 beside the artifact in the same private staging directory, applies every
+pending migration to the clone, and re-checks integrity and schema on the migrated
+result. The clone is opened under the same destination trust the artifact gets,
+not the strict source policy, because an all-squashed destination cannot supply
+local ownership evidence for a file Patchbay just created there. The clone and any
+`-wal`, `-shm`, or `-journal` file derived from it are removed whether the proof
+succeeds or fails. The artifact itself is never migrated: it is what gets
+published. The object contract above covers the versions a snapshot records; the
+clone covers the ones it has yet to run, where a contradiction — an object already
+sitting under a name a pending migration needs — surfaces only when that migration
+executes. Either way it fails here rather than being restored later into a
+`patchbay serve` that cannot start.
+
+`patchbay usage export` writes the current schema's columns whatever schema its
+source records, so an older source has to be brought forward before it can be read
+that way. It is never brought forward in place: the source is a live accounting
+database and a read command leaves it byte for byte as it found it. Export copies
+it instead — through SQLite, so the copy agrees with a live WAL writer rather than
+being a torn read of the file — into a disposable migration clone inside the same
+private staging directory the output is built in, secured to mode 0600 through the
+clone's own descriptor, and it migrates and reads that copy. The clone is held to
+the same destination trust the snapshot artifact gets, and to the same checks once
+the migrations have run: `PRAGMA integrity_check`, and the recorded schema objects
+at the current version. The clone and any `-wal`, `-shm`, or `-journal` file
+derived from it are removed whether the export succeeds, fails, or is canceled, so
+the finished export is the only thing that reaches the destination. A source
+already at the current schema is read directly, with no copy and no migration.
+
+These owner, mode, sticky-directory, and Darwin ACL checks exclude another
+local UID from ownership or replacement rights over validated components before
+SQLite opens the path. The validation descriptors are then closed before the
+SQLite driver opens it.
+Code running as Patchbay's effective UID or root can still replace validated
+components and remains inside the live-path trust boundary. Patchbay rechecks
+the opened database's device and inode after SQLite establishes its first
+connection to detect replacement during that initial open; it does not claim to
+defend later live-path mutation by those trusted principals.
+
+#### Residual exposure: descriptors retained from before validation
+
+Every check above is a statement about the pathname's *current* state. Together
+they establish present ownership, mode, and ACL, and they prevent a foreign UID
+from opening or replacing a validated component from validation onward. What they
+cannot do is detect or revoke a foreign writable descriptor retained from an
+earlier exposure. They establish nothing about how that file was reachable in the
+past, and that limit is structural rather than an implementation gap.
+
+The counterexample is concrete. Suppose the database or one of its sidecars was
+briefly mode 0666, or briefly owned by another UID, and during that window a
+process running as a different UID opened it `O_RDWR`. Suppose the owner and mode
+are then tightened to values this policy accepts. The retained descriptor keeps
+write access to that same inode: an open file description is capability-like, and
+neither the later `chmod` nor the later `chown` revokes it. That process can write
+the file before or during `Ping`, including into a sidecar SQLite is about to
+replay. The device and inode recheck cannot see it, because nothing about the
+pathname changed — it is the same inode, which is exactly the problem. No portable
+combination of `stat`, `openat`, and permission inspection can enumerate the open
+descriptors held against an inode, prove none exist, or revoke one.
+
+Treat any live database or sidecar that was ever exposed — ever world-writable,
+ever group-writable to an untrusted group, or ever owned by a foreign UID — as
+compromised, even if it now passes every check and its contents look intact.
+Passing validation afterwards says nothing about whether a descriptor survived
+from the exposure window; it is only evidence about the pathname today.
+
+The remediation is a fresh inode, because that is the one operation a retained
+descriptor cannot follow. Do not reuse the suspect inode by truncating it,
+chmodding it, chowning it, or writing over it in place; an ordinary `cp` onto the
+resolved `$PATCHBAY_USAGE_DB` path does exactly that, because it opens the
+existing file and truncates it. The pathname then holds restored data in the same
+inode the foreign process still has open for writing, so that process can write
+the restored database. The suspect `-wal`, `-shm`, and `-journal` sidecars come
+from the same exposure window and must be discarded rather than copied forward or
+left beside the new file.
+
+With Patchbay stopped, restore a trusted snapshot onto a new inode in this order.
+Create a fresh temporary file with `O_CREAT|O_EXCL`, or a securely-created
+`mktemp` file, in the same secure local parent directory that holds the resolved
+`$PATCHBAY_USAGE_DB` path, so the replacement is built where this policy already
+excludes other local UIDs. Exclusive creation is what makes it a new inode: a
+plain create can reopen a name that already exists and hand the replacement back
+to whatever descriptor is already attached to it. Copy or restore the trusted
+snapshot into that new file, set it to mode 0600, fsync it, and close it.
+
+Validate that fresh candidate before publishing it, while the suspect database
+and its sidecars are all still exactly where they are. Point
+`PATCHBAY_USAGE_DB` at the fresh candidate path and run
+`patchbay usage snapshot <throwaway>` against a throwaway `.db` destination that
+does not already exist, in a trusted directory of your choosing. Usage tooling
+reads `$PATCHBAY_USAGE_DB` directly and needs neither a running gateway nor a
+caller key, so this runs mid-procedure with Patchbay still stopped. The
+destination has to be a path that does not exist yet because the tooling refuses
+to publish over an existing file, which also keeps a stale artifact from an
+earlier attempt from being mistaken for this attempt's evidence.
+
+A zero exit status is the evidence to publish on. The validating read opens the
+candidate through the same strict path traversal the live database gets, and in
+read-only mode, so success establishes that the candidate is the regular file at
+the path named, that it is readable SQLite rather than a truncated or corrupt
+copy, and that it is a Patchbay usage database this build supports — not an
+unrecognized file, not an unknown future schema, and not a database missing a
+table, column, index, or trigger the version it records promised or holding one
+that keeps its name over a weakened definition. A read-only
+`PRAGMA integrity_check` runs against that exact opened candidate and must report
+the single result `ok`, so every page reads back coherently and every secondary
+index still agrees with the table it indexes, rather than only the header a wrong
+file could still carry. It accepts an older schema that `patchbay serve` would
+migrate forward, so this gate does not narrow which snapshots are restorable —
+and it proves that forward migration rather than inferring it from the recorded
+version. Every pending migration is applied to a disposable clone of the
+command's own output, and integrity and schema are rechecked on the migrated
+clone, so a candidate that claims a supported older version but contradicts it on
+disk fails the gate instead of being restored into a `patchbay serve` that cannot
+start. The read does not modify the candidate and leaves no sidecar beside it;
+the clone is a copy, it is what gets migrated, and it is removed either way.
+Remove the throwaway output once the command exits zero; it is produced to prove
+the read succeeded, not to be kept.
+
+Any validation failure aborts the restore. Nothing has been removed or renamed
+yet, which is exactly why aborting is still free: leave the suspect database and
+all of its `-wal`, `-shm`, and `-journal` sidecars untouched, remove only the
+fresh candidate and any partial validation output, and start again from a
+snapshot that validates. Publishing first and validating afterwards is a
+different procedure with no recovery in it — once the sidecars are gone and the
+rename has landed, a truncated, corrupt, wrong, or future-schema candidate has
+already replaced the database, and the sidecars that would have been needed to
+recover it are gone too.
+
+Only after validation succeeds, publish. Remove every suspect `-wal`, `-shm`,
+and `-journal` sidecar at the resolved path — a surviving sidecar is read or
+replayed into the restored database on the first connection. Leave the suspect
+database itself in place and rename the fresh file directly onto the resolved
+path. That rename replaces the suspect inode with the
+fresh one in a single atomic step, which is the fresh-inode replacement this
+remediation depends on, and it leaves no window in which the resolved path is
+missing. Then fsync the parent directory so the rename survives a crash. Start
+Patchbay only after the replacement is in place; `patchbay serve` opens the
+restored database and automatically migrates an older-schema snapshot forward
+before serving.
 
 ### Legacy ledger import
 
