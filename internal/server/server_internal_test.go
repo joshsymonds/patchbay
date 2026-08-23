@@ -2,18 +2,23 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/registry"
+	"github.com/joshsymonds/patchbay/internal/usage"
 )
 
 // trackerDeadline bounds every call that must NOT block, so a deadlock fails
@@ -118,6 +123,289 @@ func invalidDetails(t *testing.T, output []byte) []string {
 // begins a freshness acquisition. Every request path may acquire once, while
 // prefixed introspection must carry that state into document construction rather
 // than asking the registry again.
+type admissionAccountant struct {
+	pending atomic.Int64
+}
+
+func (accountant *admissionAccountant) InsertPending(
+	context.Context,
+	usage.PendingRequest,
+) (int64, error) {
+	return accountant.pending.Add(1), nil
+}
+
+func (*admissionAccountant) MarkUpstreamDispatched(
+	context.Context,
+	int64,
+	time.Time,
+	string,
+) error {
+	return nil
+}
+
+func (*admissionAccountant) Finalize(
+	context.Context,
+	int64,
+	usage.FinalizedRequest,
+) error {
+	return nil
+}
+
+type admissionTransport struct {
+	contacts atomic.Int64
+}
+
+func (transport *admissionTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	transport.contacts.Add(1)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"type":"message","content":[]}`)),
+	}, nil
+}
+
+func admissionRegistry(t *testing.T) *registry.Registry {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "registry.json")
+	if err := os.WriteFile(path, []byte(staleValidRegistry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reg
+}
+
+func TestHandlerAdmissionPrecedesContextResolutionAndBypassesBareIntrospection(t *testing.T) {
+	reg := admissionRegistry(t)
+	accountant := &admissionAccountant{}
+	transport := &admissionTransport{}
+	pipeline, err := proxy.New(proxy.Config{
+		Registry:   reg,
+		Accountant: accountant,
+		Client:     &http.Client{Transport: transport},
+		Host:       "host",
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 64)
+	hold := pipeline.AdmissionMiddleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		entered <- struct{}{}
+		<-release
+	}))
+	for range 34 {
+		go hold.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+	}
+	for range 34 {
+		await(t, entered, "all Proxy admission permits")
+	}
+
+	var resolutions atomic.Int64
+	stopObserving := reg.ObserveStatsForTest(func(string) { resolutions.Add(1) })
+	defer stopObserving()
+
+	handler := Handler(Config{
+		Proxy:               pipeline,
+		Registry:            reg,
+		AdmissionMiddleware: pipeline.AdmissionMiddleware(),
+	})
+	overload := httptest.NewRecorder()
+	overloadRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/messages",
+		strings.NewReader(`{"model":"test"}`),
+	)
+	overloadDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(overload, overloadRequest)
+		close(overloadDone)
+	}()
+	select {
+	case <-overloadDone:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("over-capacity request did not receive a prompt local refusal")
+	}
+	if overload.Code != http.StatusServiceUnavailable {
+		t.Fatalf("overload status = %d; want %d", overload.Code, http.StatusServiceUnavailable)
+	}
+	if got := resolutions.Load(); got != 0 {
+		t.Fatalf("registry resolutions = %d; want zero before overload refusal", got)
+	}
+	if got := accountant.pending.Load(); got != 0 {
+		t.Fatalf("pending accounting inserts = %d; want zero before overload refusal", got)
+	}
+	if got := transport.contacts.Load(); got != 0 {
+		t.Fatalf("upstream contacts = %d; want zero before overload refusal", got)
+	}
+
+	keyPath := filepath.Join(t.TempDir(), "caller.key")
+	if err := os.WriteFile(keyPath, []byte("caller-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(proxy.CallerKeyEnvFile, keyPath)
+	introspection := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/_patchbay/nothing", nil)
+	request.Header.Set(proxy.CallerKeyHeader, "caller-key")
+	handler.ServeHTTP(introspection, request)
+	if introspection.Code != http.StatusNotFound {
+		t.Fatalf(
+			"bare introspection status = %d; want %d while routed admission is full",
+			introspection.Code,
+			http.StatusNotFound,
+		)
+	}
+
+	close(release)
+}
+
+func TestAdmissionMiddlewareReleasesPermitAfterPanic(t *testing.T) {
+	pipeline, err := proxy.New(proxy.Config{Accountant: &admissionAccountant{}, Host: "host"})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	middleware := pipeline.AdmissionMiddleware()
+	panicking := middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("test panic")
+	}))
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != "test panic" {
+				t.Fatalf("panic = %v; want test panic", recovered)
+			}
+		}()
+		panicking.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}()
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 64)
+	hold := middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		entered <- struct{}{}
+		<-release
+	}))
+	for range 33 {
+		go hold.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}
+	for range 33 {
+		await(t, entered, "all but one permits after a panic")
+	}
+
+	candidate := httptest.NewRecorder()
+	middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(candidate, httptest.NewRequest(http.MethodGet, "/", nil))
+	if candidate.Code != http.StatusNoContent {
+		t.Fatalf("request after panic status = %d; want %d", candidate.Code, http.StatusNoContent)
+	}
+
+	close(release)
+}
+
+func TestAdmissionMiddlewareDoesNotAdmitAnotherProxy(t *testing.T) {
+	first, err := proxy.New(proxy.Config{Accountant: &admissionAccountant{}, Host: "first"})
+	if err != nil {
+		t.Fatalf("New(first) error: %v", err)
+	}
+
+	secondRegistry := admissionRegistry(t)
+	secondAccountant := &admissionAccountant{}
+	secondTransport := &admissionTransport{}
+	second, err := proxy.New(proxy.Config{
+		Registry:   secondRegistry,
+		Accountant: secondAccountant,
+		Client:     &http.Client{Transport: secondTransport},
+		Host:       "second",
+	})
+	if err != nil {
+		t.Fatalf("New(second) error: %v", err)
+	}
+
+	release := make(chan struct{})
+	defer func() {
+		close(release)
+		second.Drain(t.Context())
+	}()
+	entered := make(chan struct{}, 64)
+	hold := second.AdmissionMiddleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		entered <- struct{}{}
+		<-release
+	}))
+	for range 34 {
+		go hold.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+	}
+	for range 34 {
+		await(t, entered, "all second Proxy admission permits")
+	}
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"test"}`))
+	request.Header.Set("X-Api-Key", "caller-key")
+	first.AdmissionMiddleware()(second).ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("mismatched admission status = %d; want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if got := secondAccountant.pending.Load(); got != 0 {
+		t.Fatalf("second pending accounting inserts = %d; want zero", got)
+	}
+	if got := secondTransport.contacts.Load(); got != 0 {
+		t.Fatalf("second upstream contacts = %d; want zero", got)
+	}
+}
+
+func TestHandlerAdmissionAcquiresOnceBeforeProxy(t *testing.T) {
+	reg := admissionRegistry(t)
+	accountant := &admissionAccountant{}
+	transport := &admissionTransport{}
+	pipeline, err := proxy.New(proxy.Config{
+		Registry:   reg,
+		Accountant: accountant,
+		Client:     &http.Client{Transport: transport},
+		Host:       "host",
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 64)
+	hold := pipeline.AdmissionMiddleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		entered <- struct{}{}
+		<-release
+	}))
+	for range 33 {
+		go hold.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+	}
+	for range 33 {
+		await(t, entered, "all but one Proxy admission permits")
+	}
+
+	handler := Handler(Config{
+		Proxy:               pipeline,
+		Registry:            reg,
+		AdmissionMiddleware: pipeline.AdmissionMiddleware(),
+	})
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"test"}`))
+	request.Header.Set("X-Api-Key", "caller-key")
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("admitted request status = %d; want %d", response.Code, http.StatusOK)
+	}
+	if got := transport.contacts.Load(); got != 1 {
+		t.Fatalf("upstream contacts = %d; want 1", got)
+	}
+	if got := accountant.pending.Load(); got != 1 {
+		t.Fatalf("pending accounting inserts = %d; want 1", got)
+	}
+
+	close(release)
+	pipeline.Drain(t.Context())
+}
+
 func TestGatewayPathsObserveRegistryFreshnessOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
 	writeRegistryFile(t, path, staleValidRegistry, time.Now().Add(-time.Hour).Truncate(time.Second))

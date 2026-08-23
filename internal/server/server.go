@@ -79,6 +79,11 @@ type Config struct {
 	// Registry supplies the public bindings the model endpoints advertise. Required.
 	Registry *registry.Registry
 
+	// AdmissionMiddleware bounds routed work before context resolution. A nil
+	// middleware leaves the handler composition unchanged for callers that do not
+	// need request admission.
+	AdmissionMiddleware func(http.Handler) http.Handler
+
 	// Usage supplies durable request-accounting summaries. A nil Usage leaves the
 	// gateway available but makes the local usage endpoint report 503.
 	Usage UsageSummaryStore
@@ -230,7 +235,12 @@ func Handler(cfg Config) http.Handler {
 	mux.HandleFunc(modelPattern, gw.showModel)
 	mux.Handle(rootPattern, cfg.Proxy)
 
-	return gw.selectIntrospection(gw.selectContext(gw.selectIntrospection(mux)))
+	routed := gw.selectContext(gw.selectIntrospection(mux))
+	if cfg.AdmissionMiddleware != nil {
+		return gw.selectIntrospection(cfg.AdmissionMiddleware(routed))
+	}
+
+	return gw.selectIntrospection(routed)
 }
 
 // selectIntrospection answers everything under patchbay's own path prefix and

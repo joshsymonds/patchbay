@@ -131,6 +131,8 @@ type requestCompletion struct {
 	appendLedger bool
 }
 
+type admissionContextKey struct{}
+
 // Proxy is the resolve, tee and forward pipeline. It is safe for concurrent
 // use: every request carries its own state, and the only shared values are the
 // registry and the client, which are themselves concurrent.
@@ -189,6 +191,42 @@ func New(cfg Config) (*Proxy, error) {
 	}, nil
 }
 
+// AdmissionMiddleware bounds routed work before a caller resolves a Context.
+// It marks admitted requests so ServeHTTP can preserve the same bound for direct
+// callers without acquiring the permit a second time.
+func (p *Proxy) AdmissionMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !p.tryAdmission() {
+				p.refuseOverload(w, r)
+				return
+			}
+			defer func() { <-p.admission }()
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), admissionContextKey{}, p)))
+		})
+	}
+}
+
+func (p *Proxy) tryAdmission() bool {
+	select {
+	case p.admission <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Proxy) directAdmission(w http.ResponseWriter, r *http.Request) func() {
+	if owner, ok := r.Context().Value(admissionContextKey{}).(*Proxy); ok && owner == p {
+		return func() {}
+	}
+	if !p.tryAdmission() {
+		p.refuseOverload(w, r)
+		return nil
+	}
+	return func() { <-p.admission }
+}
+
 // ServeHTTP resolves one immutable Context snapshot, selects a Seat, accounts
 // for the request, forwards, streams the answer, and records the v2 resolution.
 //
@@ -198,16 +236,14 @@ func New(cfg Config) (*Proxy, error) {
 // before a single byte is sent. Every refusal that precedes selection has no
 // Seat to account against, so it is recorded in the ledger alone.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Admission precedes routing and accounting so every path that can submit a
-	// completion is bounded. Refused requests never entered the service and must
-	// bypass completion persistence rather than contend for the stalled queue.
-	select {
-	case p.admission <- struct{}{}:
-		defer func() { <-p.admission }()
-	default:
-		p.refuseOverload(w, r)
+	// Direct callers have no outer admission middleware, so acquire a fallback
+	// permit. Production-routed requests carry the private marker from the outer
+	// middleware and must consume exactly one shared permit.
+	release := p.directAdmission(w, r)
+	if release == nil {
 		return
 	}
+	defer release()
 
 	start := time.Now()
 	sel := registry.SelectionFrom(r.Context())
@@ -281,7 +317,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	exch.upstreamTarget = upstreamTarget
+	p.dispatch(r, w, seat, upstreamBody, req, generation, upstreamTarget, exch)
+}
 
+func (p *Proxy) dispatch(
+	r *http.Request,
+	w http.ResponseWriter,
+	seat registry.Seat,
+	upstreamBody []byte,
+	req *http.Request,
+	generation uint64,
+	upstreamTarget string,
+	exch *exchange,
+) {
 	sent := time.Now()
 	if accountingErr := p.markDispatched(r.Context(), exch, sent); accountingErr != nil {
 		p.abort(r.Context(), w, exch, accountingErr)
