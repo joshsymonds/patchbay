@@ -37,6 +37,11 @@ const streamChunkBytes = 32768
 const (
 	completionQueueCapacity = 32
 	completionWorkerCount   = 2
+
+	// requestAdmissionCapacity permits one bounded handler set to wait behind a
+	// fully occupied completion pipeline without allowing blocked submitters to
+	// accumulate without limit.
+	requestAdmissionCapacity = completionWorkerCount + completionQueueCapacity
 )
 
 // The Messages endpoints an inject seat is allowed to relay. An inject seat
@@ -141,6 +146,7 @@ type Proxy struct {
 	// one cache per profile shared by every request that rides one.
 	credentials *awssig.CredentialSource
 
+	admission         chan struct{}
 	completionQueue   chan requestCompletion
 	completionMu      sync.Mutex
 	completionWorkers int
@@ -178,6 +184,7 @@ func New(cfg Config) (*Proxy, error) {
 		host:            cfg.Host,
 		logger:          logger,
 		credentials:     awssig.NewCredentialSource(),
+		admission:       make(chan struct{}, requestAdmissionCapacity),
 		completionQueue: make(chan requestCompletion, completionQueueCapacity),
 	}, nil
 }
@@ -191,6 +198,17 @@ func New(cfg Config) (*Proxy, error) {
 // before a single byte is sent. Every refusal that precedes selection has no
 // Seat to account against, so it is recorded in the ledger alone.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Admission precedes routing and accounting so every path that can submit a
+	// completion is bounded. Refused requests never entered the service and must
+	// bypass completion persistence rather than contend for the stalled queue.
+	select {
+	case p.admission <- struct{}{}:
+		defer func() { <-p.admission }()
+	default:
+		p.refuseOverload(w, r)
+		return
+	}
+
 	start := time.Now()
 	sel := registry.SelectionFrom(r.Context())
 	credential := classifyCredential(r.Header)
@@ -408,6 +426,22 @@ func (p *Proxy) Drain(ctx context.Context) {
 		p.logger.ErrorContext(ctx, "usage accounting drain timed out; finalization may be incomplete",
 			slog.Int64("in_flight_records", p.inFlight.Load()))
 	}
+}
+
+// refuseOverload answers before admission, so it deliberately performs no
+// routing, upstream contact, accounting, ledger capture, or completion enqueue.
+func (p *Proxy) refuseOverload(w http.ResponseWriter, r *http.Request) {
+	err := errors.New("proxy completion capacity exhausted")
+	body := anthropic.TypedErrorBody(anthropic.ErrorTypeAPI, err)
+
+	w.Header().Set(anthropic.HeaderContentType, "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	if _, writeErr := w.Write(body); writeErr != nil {
+		p.logger.WarnContext(r.Context(), "client went away before the overload refusal reached it",
+			slog.Any("error", writeErr))
+	}
+	p.logger.WarnContext(r.Context(), "gateway overloaded; request refused before admission",
+		slog.Int("capacity", requestAdmissionCapacity))
 }
 
 // abort answers a failure patchbay originated, in Anthropic's error shape, and

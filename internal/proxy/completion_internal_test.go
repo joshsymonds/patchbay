@@ -2,18 +2,30 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/joshsymonds/patchbay/internal/anthropic"
 	"github.com/joshsymonds/patchbay/internal/ledger"
+	"github.com/joshsymonds/patchbay/internal/registry"
 	usagepkg "github.com/joshsymonds/patchbay/internal/usage"
 )
 
 type completionAccountant struct {
 	release chan struct{}
 	started chan int64
+
+	nextID atomic.Int64
 
 	mu        sync.Mutex
 	finalized []int64
@@ -24,7 +36,7 @@ func (accountant *completionAccountant) InsertPending(
 	context.Context,
 	usagepkg.PendingRequest,
 ) (int64, error) {
-	return 1, nil
+	return accountant.nextID.Add(1), nil
 }
 
 func (accountant *completionAccountant) MarkUpstreamDispatched(
@@ -78,9 +90,16 @@ func (sink *completionLogSink) Handle(_ context.Context, record slog.Record) err
 func (sink *completionLogSink) WithAttrs([]slog.Attr) slog.Handler { return sink }
 func (sink *completionLogSink) WithGroup(string) slog.Handler      { return sink }
 
-func newCompletionProxy(t *testing.T, accountant Accountant, recorder Recorder, logger *slog.Logger) *Proxy {
+func newCompletionProxy(
+	t *testing.T,
+	accountant Accountant,
+	recorder Recorder,
+	logger *slog.Logger,
+) *Proxy {
 	t.Helper()
-	pipeline, err := New(Config{Accountant: accountant, Recorder: recorder, Logger: logger, Host: "host"})
+	pipeline, err := New(
+		Config{Accountant: accountant, Recorder: recorder, Logger: logger, Host: "host"},
+	)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -109,7 +128,7 @@ func waitForCompletionStarts(t *testing.T, started <-chan int64, count int) {
 	}
 }
 
-func fillCompletionQueue(t *testing.T, pipeline *Proxy, accountant *completionAccountant) chan struct{} {
+func fillCompletionQueue(t *testing.T, pipeline *Proxy, accountant *completionAccountant) {
 	t.Helper()
 	for index := range completionWorkerCount {
 		pipeline.record(context.Background(), completionExchange(int64(index+1)), nil)
@@ -122,38 +141,225 @@ func fillCompletionQueue(t *testing.T, pipeline *Proxy, accountant *completionAc
 			nil,
 		)
 	}
-	blocked := make(chan struct{})
-	go func() {
-		pipeline.record(
-			context.Background(),
-			completionExchange(int64(completionWorkerCount+completionQueueCapacity+1)),
-			nil,
-		)
-		close(blocked)
-	}()
-	return blocked
 }
 
-func TestCompletionQueueBackpressuresWhenFull(t *testing.T) {
+type completionTransport struct {
+	contacts atomic.Int64
+}
+
+func (transport *completionTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	transport.contacts.Add(1)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"type":"message","content":[]}`)),
+	}, nil
+}
+
+func completionRegistry(t *testing.T) *registry.Registry {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "registry.json")
+	body := []byte(`{
+		"default_context":"personal",
+		"seats":{"default":{"upstream":"https://api.anthropic.com","auth_mode":"forward"}},
+		"contexts":{"personal":{"default_seat":"default","models":{}}}
+	}`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+	reg, err := registry.New(path)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	return reg
+}
+
+func completionRequest() *http.Request {
+	req := httptest.NewRequest(http.MethodPost, messagesPath, strings.NewReader(`{"model":"test"}`))
+	req.Header.Set(anthropic.HeaderClientKey, "caller-key")
+	return req
+}
+
+func TestServeHTTPBoundsFullCompletionQueueAndRefusesOverload(t *testing.T) {
 	accountant := &completionAccountant{
 		release: make(chan struct{}),
 		started: make(chan int64, completionWorkerCount),
 	}
-	pipeline := newCompletionProxy(t, accountant, nil, nil)
-	blocked := fillCompletionQueue(t, pipeline, accountant)
-
-	select {
-	case <-blocked:
-		t.Fatal("completion submission returned while every worker and queue slot were occupied")
-	case <-time.After(100 * time.Millisecond):
+	transport := &completionTransport{}
+	pipeline, err := New(Config{
+		Registry:   completionRegistry(t),
+		Accountant: accountant,
+		Client:     &http.Client{Transport: transport},
+		Host:       "host",
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
 	}
-	close(accountant.release)
+	fillCompletionQueue(t, pipeline, accountant)
+
+	blocked := make(chan struct{}, completionWorkerCount+completionQueueCapacity)
+	for range completionWorkerCount + completionQueueCapacity {
+		go func() {
+			pipeline.ServeHTTP(httptest.NewRecorder(), completionRequest())
+			blocked <- struct{}{}
+		}()
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for transport.contacts.Load() != completionWorkerCount+completionQueueCapacity && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := transport.contacts.Load(); got != completionWorkerCount+completionQueueCapacity {
+		t.Fatalf(
+			"upstream contacts before overload = %d; want %d admitted requests",
+			got,
+			completionWorkerCount+completionQueueCapacity,
+		)
+	}
 	select {
 	case <-blocked:
-	case <-time.After(5 * time.Second):
-		t.Fatal("completion submission remained blocked after queue capacity became available")
+		t.Fatal("an admitted handler returned while completion persistence was stalled")
+	default:
+	}
+
+	overload := httptest.NewRecorder()
+	overloadDone := make(chan struct{})
+	go func() {
+		pipeline.ServeHTTP(overload, completionRequest())
+		close(overloadDone)
+	}()
+	select {
+	case <-overloadDone:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("over-capacity request did not receive a prompt local refusal")
+	}
+	if overload.Code != http.StatusServiceUnavailable {
+		t.Fatalf("overload status = %d; want %d", overload.Code, http.StatusServiceUnavailable)
+	}
+	var errorBody struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(overload.Body.Bytes(), &errorBody); err != nil {
+		t.Fatalf("decode overload response: %v", err)
+	}
+	if errorBody.Type != "error" || errorBody.Error.Type != anthropic.ErrorTypeAPI {
+		t.Fatalf("overload response = %+v; want Anthropic API error shape", errorBody)
+	}
+	if got := transport.contacts.Load(); got != completionWorkerCount+completionQueueCapacity {
+		t.Fatalf(
+			"upstream contacts after overload = %d; want %d",
+			got,
+			completionWorkerCount+completionQueueCapacity,
+		)
+	}
+	if got := accountant.nextID.Load(); got != completionWorkerCount+completionQueueCapacity {
+		t.Fatalf(
+			"pending accounting inserts after overload = %d; want %d",
+			got,
+			completionWorkerCount+completionQueueCapacity,
+		)
+	}
+
+	close(accountant.release)
+	for range completionWorkerCount + completionQueueCapacity {
+		select {
+		case <-blocked:
+		case <-time.After(5 * time.Second):
+			t.Fatal("admitted handler remained blocked after persistence resumed")
+		}
 	}
 	pipeline.Drain(t.Context())
+
+	accountant.mu.Lock()
+	defer accountant.mu.Unlock()
+	wantFinalized := completionWorkerCount + completionQueueCapacity + completionWorkerCount + completionQueueCapacity
+	if got := len(accountant.finalized); got != wantFinalized {
+		t.Fatalf(
+			"finalized completions = %d; want %d lossless admitted completions",
+			got,
+			wantFinalized,
+		)
+	}
+}
+
+func TestServeHTTPBoundsFailuresBeforeSeatSelection(t *testing.T) {
+	const pipelineCapacity = completionWorkerCount + completionQueueCapacity
+	accountant := &completionAccountant{
+		release: make(chan struct{}),
+		started: make(chan int64, completionWorkerCount),
+	}
+	recorder := &completionRecorder{records: make(chan ledger.Record, pipelineCapacity*2)}
+	transport := &completionTransport{}
+	pipeline, err := New(Config{
+		Registry:   completionRegistry(t),
+		Recorder:   recorder,
+		Accountant: accountant,
+		Client:     &http.Client{Transport: transport},
+		Host:       "host",
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	fillCompletionQueue(t, pipeline, accountant)
+
+	blocked := make(chan struct{}, pipelineCapacity)
+	for range pipelineCapacity {
+		go func() {
+			req := completionRequest()
+			req = req.WithContext(registry.WithResolutionError(req.Context(), registry.ErrInvalid))
+			pipeline.ServeHTTP(httptest.NewRecorder(), req)
+			blocked <- struct{}{}
+		}()
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for pipeline.inFlight.Load() != pipelineCapacity*2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := pipeline.inFlight.Load(); got != pipelineCapacity*2 {
+		t.Fatalf(
+			"in-flight completions = %d; want %d including bounded pre-seat failures",
+			got,
+			pipelineCapacity*2,
+		)
+	}
+	select {
+	case <-blocked:
+		t.Fatal("a pre-seat failure handler returned while completion persistence was stalled")
+	default:
+	}
+
+	overload := httptest.NewRecorder()
+	pipeline.ServeHTTP(overload, completionRequest())
+	if overload.Code != http.StatusServiceUnavailable {
+		t.Fatalf("overload status = %d; want %d", overload.Code, http.StatusServiceUnavailable)
+	}
+	if got := transport.contacts.Load(); got != 0 {
+		t.Fatalf("upstream contacts = %d; want zero before-seat and overload refusals", got)
+	}
+	if got := accountant.nextID.Load(); got != 0 {
+		t.Fatalf("pending accounting inserts = %d; want zero before seat selection", got)
+	}
+
+	close(accountant.release)
+	for range pipelineCapacity {
+		select {
+		case <-blocked:
+		case <-time.After(5 * time.Second):
+			t.Fatal("pre-seat failure handler remained blocked after persistence resumed")
+		}
+	}
+	pipeline.Drain(t.Context())
+	if got := len(recorder.records); got != pipelineCapacity*2 {
+		t.Fatalf(
+			"ledger records = %d; want %d lossless admitted completions",
+			got,
+			pipelineCapacity*2,
+		)
+	}
 }
 
 func TestDrainRemainsBoundedWithAFullCompletionQueue(t *testing.T) {
@@ -163,7 +369,12 @@ func TestDrainRemainsBoundedWithAFullCompletionQueue(t *testing.T) {
 	}
 	sink := &completionLogSink{messages: make(chan string, 8)}
 	pipeline := newCompletionProxy(t, accountant, nil, slog.New(sink))
-	blocked := fillCompletionQueue(t, pipeline, accountant)
+	fillCompletionQueue(t, pipeline, accountant)
+	blocked := make(chan struct{})
+	go func() {
+		pipeline.record(context.Background(), completionExchange(1000), nil)
+		close(blocked)
+	}()
 
 	drainCtx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
@@ -242,8 +453,12 @@ func TestCompletionMaterializesBeforePersistenceBlocks(t *testing.T) {
 
 	select {
 	case record := <-recorder.records:
-		if record.Status != 200 || record.RequestBody != "before" || record.ErrorBody == string(capt.buf) {
-			t.Fatalf("queued ledger record = %+v; want values materialized before persistence blocked", record)
+		if record.Status != 200 || record.RequestBody != "before" ||
+			record.ErrorBody == string(capt.buf) {
+			t.Fatalf(
+				"queued ledger record = %+v; want values materialized before persistence blocked",
+				record,
+			)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("queued ledger record was not appended")
