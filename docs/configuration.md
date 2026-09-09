@@ -138,9 +138,11 @@ by ID.
 | `insecure` | Allows non-loopback HTTP on an `inject` Seat. |
 | `strip_cache_control` | Recursively removes object fields named `cache_control`. |
 | `capture_bodies` | Stores rewritten request and captured response bodies in ledger v2. |
+| `speed` | `fast` requests the upstream's fast tier on every request: Anthropic fast mode on a Claude upstream, the Codex priority tier through CLIProxyAPI, which maps this field. Written after `extra_body`, so the Seat value wins over the caller's and over `extra_body`. Not allowed on `sigv4`. |
 
 For `forward` and `inject`, the original request bytes are preserved unless the
-Seat sets `model`, `extra_body`, `strip_cache_control`, or `max_output_tokens`.
+Seat sets `model`, `extra_body`, `strip_cache_control`, `max_output_tokens`, or
+`speed`.
 When a rewrite is needed, the body must be a JSON object and is re-encoded after
 those operations. SigV4 always performs an additional Bedrock translation. See
 [auth-modes.md](auth-modes.md).

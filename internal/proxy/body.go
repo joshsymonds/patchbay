@@ -17,6 +17,7 @@ const (
 	fieldModel        = "model"
 	fieldMaxTokens    = "max_tokens"
 	fieldCacheControl = "cache_control"
+	fieldSpeed        = "speed"
 )
 
 // extractModel reads the top-level model name from a request body with a
@@ -42,7 +43,8 @@ func isIdentity(seat registry.Seat) bool {
 	return seat.Model == "" &&
 		len(seat.ExtraBody) == 0 &&
 		!seat.StripCacheControl &&
-		seat.MaxOutputTokens == 0
+		seat.MaxOutputTokens == 0 &&
+		seat.Speed == ""
 }
 
 // forwardBody returns the bytes to send upstream. On an identity seat that is
@@ -104,6 +106,20 @@ func forwardBody(body []byte, seat registry.Seat) ([]byte, *gatewayError) {
 			status: http.StatusInternalServerError,
 			err:    fmt.Errorf("the selected Seat has an unusable extra_body: %w", err),
 		}
+	}
+
+	// The Seat's speed is policy, applied after extra_body so that it wins over
+	// both the caller and any speed an extra_body happened to carry.
+	if seat.Speed != "" {
+		rewritten, err := json.Marshal(seat.Speed)
+		if err != nil {
+			return nil, &gatewayError{
+				status: http.StatusInternalServerError,
+				err:    fmt.Errorf("encode seat speed: %w", err),
+			}
+		}
+
+		document[fieldSpeed] = rewritten
 	}
 
 	if seat.StripCacheControl {

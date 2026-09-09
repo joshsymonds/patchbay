@@ -233,6 +233,9 @@ func validateSeat(seat Seat) error {
 	if err := validateBilling(seat); err != nil {
 		return err
 	}
+	if err := validateSpeed(seat); err != nil {
+		return err
+	}
 	if seat.MaxInputTokens < 0 {
 		return fmt.Errorf("%s must not be negative", fieldMaxInputTokens)
 	}
@@ -418,6 +421,16 @@ func validateUpstream(raw string, insecure bool) error {
 // key, and the merge would carry whichever the decoder happened to keep, at the
 // root or anywhere below it. Its top-level model member is reserved because the
 // selected Seat is the sole authority for an upstream model rewrite.
+// validateSpeed keeps speed off the Bedrock path: the vocabulary is held at
+// parse time, but the translation a sigv4 seat performs has no field to carry
+// the tier at all.
+func validateSpeed(seat Seat) error {
+	if seat.Speed != "" && seat.AuthMode == AuthSigV4 {
+		return fmt.Errorf("%s is not a Bedrock request field and cannot be set on a sigv4 seat", fieldSpeed)
+	}
+	return nil
+}
+
 func validateExtraBody(body json.RawMessage) error {
 	if len(body) == 0 {
 		return nil

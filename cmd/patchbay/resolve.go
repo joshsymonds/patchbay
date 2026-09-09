@@ -65,6 +65,7 @@ func (c cli) writeResolution(
 	writeLine(c.stdout, "auth_mode", quoted(string(res.Seat.AuthMode)))
 	writeLine(c.stdout, "upstream", quoted(res.Seat.EffectiveUpstream()))
 	writeLine(c.stdout, "model", nullable(upstreamModel(res.Seat, requestModel)))
+	writeLine(c.stdout, "speed", nullable(res.Seat.Speed))
 	writeLine(c.stdout, "config_source", quoted(res.Seat.CredentialSource()))
 	writeLine(c.stdout, "api_key_env_file", nullable(res.Seat.APIKeyEnvFile))
 	writeLine(c.stdout, "aws_profile", nullable(res.Seat.AWSProfile))

@@ -337,7 +337,7 @@ func TestResolveKeepsOpaqueModelsOnOneLine(t *testing.T) {
 			t.Errorf("resolve %q emitted a blank line, so a value ended one: %q", value, got.stdout)
 		}
 		// One line per field, whatever bytes the selector carries.
-		if want := 19; len(lines(got.stdout)) != want {
+		if want := 20; len(lines(got.stdout)) != want {
 			t.Errorf("resolve %q printed %d lines; want %d\n%s",
 				value, len(lines(got.stdout)), want, got.stdout)
 		}
@@ -476,6 +476,7 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				"auth_mode: \"inject\"\n" +
 				"upstream: \"https://openrouter.ai/api\"\n" +
 				"model: \"openai/gpt-5.6-luna\"\n" +
+				"speed: null\n" +
 				"config_source: \"OPENROUTER_API_KEY_FILE\"\n" +
 				"api_key_env_file: \"OPENROUTER_API_KEY_FILE\"\n" +
 				"aws_profile: null\n" +
@@ -499,6 +500,7 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				"auth_mode: \"inject\"\n" +
 				"upstream: \"https://openrouter.ai/api\"\n" +
 				"model: \"openrouter/worker\"\n" +
+				"speed: null\n" +
 				"config_source: \"OPENROUTER_API_KEY_FILE\"\n" +
 				"api_key_env_file: \"OPENROUTER_API_KEY_FILE\"\n" +
 				"aws_profile: null\n" +

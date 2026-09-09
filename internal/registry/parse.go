@@ -32,6 +32,7 @@ const (
 	fieldInsecure          = "insecure"
 	fieldStripCacheControl = "strip_cache_control"
 	fieldCaptureBodies     = "capture_bodies"
+	fieldSpeed             = "speed"
 )
 
 type document struct {
@@ -116,6 +117,7 @@ func parseSeat(raw json.RawMessage) (Seat, error) {
 		fieldInsecure,
 		fieldStripCacheControl,
 		fieldCaptureBodies,
+		fieldSpeed,
 	}
 	if fieldsErr := exactFields(fields, allowed, nil); fieldsErr != nil {
 		return Seat{}, fieldsErr
@@ -149,6 +151,7 @@ func seatFieldDecoders(seat *Seat) map[string]func(json.RawMessage) error {
 			return decodeField(&seat.StripCacheControl, fieldStripCacheControl, raw)
 		},
 		fieldCaptureBodies: func(raw json.RawMessage) error { return decodeField(&seat.CaptureBodies, fieldCaptureBodies, raw) },
+		fieldSpeed:         func(raw json.RawMessage) error { return decodeSpeed(seat, raw) },
 	}
 }
 
@@ -171,6 +174,21 @@ func decodeBilling(seat *Seat, raw json.RawMessage) error {
 	}
 	seat.BillingClass = class
 	seat.BillingClassSet = true
+	return nil
+}
+
+// decodeSpeed parses the one tier a Seat may ask an upstream for. Like
+// billing, a value outside the vocabulary — a blank string included — fails the
+// document here, so a Seat never carries a speed that parsed but means nothing.
+func decodeSpeed(seat *Seat, raw json.RawMessage) error {
+	var value string
+	if err := decodeField(&value, fieldSpeed, raw); err != nil {
+		return err
+	}
+	if value != SpeedFast {
+		return fmt.Errorf("field %q: must be %q or omitted", fieldSpeed, SpeedFast)
+	}
+	seat.Speed = value
 	return nil
 }
 

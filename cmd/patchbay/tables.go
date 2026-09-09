@@ -162,6 +162,7 @@ func registryState(doc server.Document) registry.State {
 			Insecure:          summary.Insecure,
 			StripCacheControl: summary.StripCacheControl,
 			CaptureBodies:     summary.CaptureBodies,
+			Speed:             summary.Speed,
 		}
 	}
 	for id, summary := range doc.Contexts {

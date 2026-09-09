@@ -178,6 +178,7 @@ seat: "openrouter-kimi-k2"
 auth_mode: "inject"
 upstream: "https://openrouter.ai/api"
 model: "moonshotai/kimi-k2"
+speed: null
 config_source: "PATCHBAY_OPENROUTER_KEY_FILE"
 api_key_env_file: "PATCHBAY_OPENROUTER_KEY_FILE"
 aws_profile: null
@@ -215,6 +216,7 @@ seat: "sol-subscription"
 auth_mode: "inject"
 upstream: "http://127.0.0.1:8317"
 model: "gpt-5.6-sol"
+speed: null
 config_source: "PATCHBAY_CHATGPT_KEY_FILE"
 api_key_env_file: "PATCHBAY_CHATGPT_KEY_FILE"
 aws_profile: null

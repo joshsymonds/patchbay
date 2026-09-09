@@ -21,6 +21,11 @@ const (
 	bedrockEndpointSuffix = ".amazonaws.com"
 )
 
+// SpeedFast is the one value the speed field carries: the upstream's fast
+// tier. It is Anthropic's own fast-mode request value, and the Codex
+// translator maps the same field onto its priority service tier.
+const SpeedFast = "fast"
+
 // Seat is a reusable upstream destination and all policy applied when it is used.
 type Seat struct {
 	Upstream        string
@@ -45,6 +50,11 @@ type Seat struct {
 	Insecure          bool
 	StripCacheControl bool
 	CaptureBodies     bool
+
+	// Speed is the upstream tier this seat asks for on every request it
+	// carries: empty for the upstream's default, SpeedFast for its fast tier.
+	// It is seat policy, so it replaces whatever the caller sent.
+	Speed string
 }
 
 // EffectiveUpstream is the API root this seat reaches.

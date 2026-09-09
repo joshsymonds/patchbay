@@ -186,3 +186,33 @@ func TestStripOnlySeatKeepsEverythingElse(t *testing.T) {
 		t.Errorf("forwarded body = %s\nwant %v", call.body, want)
 	}
 }
+
+// TestSpeedSeatSetsFastOverTheCaller checks that a speed Seat writes its tier
+// into the request, replacing the caller's own value, and touches nothing else.
+func TestSpeedSeatSetsFastOverTheCaller(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	stub := newUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
+	seat := fmt.Sprintf(`%q:{"upstream":%q,"auth_mode":"inject","api_key_env_file":%q,`+
+		`"billing":"subscription","speed":"fast"}`, echoSelector, stub.url(), keyEnvName)
+	body := fmt.Sprintf(`{"model":%q,"max_tokens":16,"speed":"standard",`+
+		`"messages":[{"role":"user","content":"hi"}]}`, echoSelector)
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistry(t, seat),
+		Host:     testHost,
+	}, messagesRequest(body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	call := stub.call(t)
+
+	want := decodeJSON(t, []byte(fmt.Sprintf(`{"model":%q,"max_tokens":16,"speed":"fast",`+
+		`"messages":[{"role":"user","content":"hi"}]}`, echoSelector)))
+
+	if got := decodeJSON(t, call.body); !reflect.DeepEqual(got, want) {
+		t.Errorf("forwarded body = %s\nwant %v", call.body, want)
+	}
+}

@@ -77,6 +77,7 @@ type SeatSummary struct {
 	Insecure          bool   `json:"insecure,omitempty"`
 	StripCacheControl bool   `json:"strip_cache_control,omitempty"`
 	CaptureBodies     bool   `json:"capture_bodies,omitempty"`
+	Speed             string `json:"speed,omitempty"`
 }
 
 func (gw *gateway) introspect(w http.ResponseWriter, r *http.Request) {
@@ -199,6 +200,7 @@ func seatSummary(seat registry.Seat) SeatSummary {
 		Insecure:          seat.Insecure,
 		StripCacheControl: seat.StripCacheControl,
 		CaptureBodies:     seat.CaptureBodies,
+		Speed:             seat.Speed,
 	}
 
 	if seat.BillingClassSet {

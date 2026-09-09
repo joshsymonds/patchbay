@@ -810,6 +810,38 @@ func TestSeatInsecureOnlyBuysNonLoopbackHTTP(t *testing.T) {
 	})
 }
 
+// TestSeatSpeedIsFastOrNothing pins speed to the one tier an upstream names,
+// on the two auth modes whose bodies can carry the field.
+func TestSeatSpeedIsFastOrNothing(t *testing.T) {
+	t.Parallel()
+	runSeatCases(t, []seatCase{
+		{
+			name: "fast on inject accepted",
+			seat: `{"upstream":"http://127.0.0.1:8317","auth_mode":"inject","billing":"subscription","api_key_env_file":"KEY_FILE","speed":"fast"}`,
+		},
+		{
+			name: "fast on forward accepted",
+			seat: `{"upstream":"https://api.anthropic.com","auth_mode":"forward","speed":"fast"}`,
+		},
+		{
+			name:    "other tier rejected",
+			seat:    `{"upstream":"http://127.0.0.1:8317","auth_mode":"inject","billing":"subscription","api_key_env_file":"KEY_FILE","speed":"slow"}`,
+			wants:   []string{"speed", "fast", "omitted"},
+			forbids: []string{"slow"},
+		},
+		{
+			name:  "empty string rejected",
+			seat:  `{"upstream":"http://127.0.0.1:8317","auth_mode":"inject","billing":"subscription","api_key_env_file":"KEY_FILE","speed":""}`,
+			wants: []string{"speed", "fast", "omitted"},
+		},
+		{
+			name:  "fast on sigv4 rejected",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE","speed":"fast"}`,
+			wants: []string{"sigv4", "speed"},
+		},
+	})
+}
+
 func TestSeatUpstreamRejectsCredentialAndRoutingMaterialWithoutEchoingIt(t *testing.T) {
 	t.Parallel()
 	const injectTail = `","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`
