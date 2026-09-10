@@ -217,6 +217,7 @@ type accountingRequestExportRow struct {
 	NormalizationComplete      *int64  `json:"normalization_complete"`
 	InputTokens                *int64  `json:"input_tokens"`
 	OutputTokens               *int64  `json:"output_tokens"`
+	ReasoningOutputTokens      *int64  `json:"reasoning_output_tokens"`
 	CacheCreationInputTokens   *int64  `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens       *int64  `json:"cache_read_input_tokens"`
 	CacheCreation5mInputTokens *int64  `json:"cache_creation_5m_input_tokens"`
@@ -233,6 +234,7 @@ type accountingRequestExportRow struct {
 	RateCardID                 *int64  `json:"rate_card_id"`
 	ImportSource               *string `json:"import_source"`
 	ImportLine                 *int64  `json:"import_line"`
+	FirstContentAt             *int64  `json:"first_content_at"`
 }
 
 func writeExport(ctx context.Context, db *sql.DB, writer *bufio.Writer) (result error) {
@@ -309,10 +311,10 @@ func writeAccountingRequestExport(ctx context.Context, tx *sql.Tx, encoder *json
 		outcome, upstream_contacted, route_host, route_context, route_alias, route_upstream,
 		request_model, resolved_model, auth_mode, credential_class, billing_policy, billing_class,
 		cost_status, response_id, http_status, normalization_complete, input_tokens, output_tokens,
-		cache_creation_input_tokens, cache_read_input_tokens, cache_creation_5m_input_tokens,
+		reasoning_output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cache_creation_5m_input_tokens,
 		cache_creation_1h_input_tokens, provider_cost_present, provider_cost_valid,
 		provider_cost_nano_usd, stop_reason, block_shape, duration_ms, upstream_ms, cost_basis,
-		final_cost_nano_usd, rate_card_id, import_source, import_line
+		final_cost_nano_usd, rate_card_id, import_source, import_line, first_content_at
 	FROM accounting_requests ORDER BY id`)
 	if queryErr != nil {
 		return fmt.Errorf("read accounting requests for usage export: %w", queryErr)
@@ -345,10 +347,10 @@ func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, er
 	var row accountingRequestExportRow
 	var completedAt, upstreamDispatchedAt, httpStatus, normalizationComplete sql.NullInt64
 	var upstreamTarget sql.NullString
-	var inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens sql.NullInt64
+	var inputTokens, outputTokens, reasoningOutputTokens, cacheCreationInputTokens, cacheReadInputTokens sql.NullInt64
 	var cacheCreation5mInputTokens, cacheCreation1hInputTokens sql.NullInt64
 	var providerCostPresent, providerCostValid, providerCostNanoUSD sql.NullInt64
-	var durationMS, upstreamMS, finalCostNanoUSD, rateCardID, importLine sql.NullInt64
+	var durationMS, upstreamMS, finalCostNanoUSD, rateCardID, importLine, firstContentAt sql.NullInt64
 	var outcome, routeAlias, billingClass, responseID, stopReason, blockShape, costBasis, importSource sql.NullString
 	if scanErr := rows.Scan(
 		&row.ID,
@@ -376,6 +378,7 @@ func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, er
 		&normalizationComplete,
 		&inputTokens,
 		&outputTokens,
+		&reasoningOutputTokens,
 		&cacheCreationInputTokens,
 		&cacheReadInputTokens,
 		&cacheCreation5mInputTokens,
@@ -392,6 +395,7 @@ func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, er
 		&rateCardID,
 		&importSource,
 		&importLine,
+		&firstContentAt,
 	); scanErr != nil {
 		return accountingRequestExportRow{}, fmt.Errorf("scan accounting request for usage export: %w", scanErr)
 	}
@@ -406,6 +410,7 @@ func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, er
 	row.NormalizationComplete = nullableExportInt(normalizationComplete)
 	row.InputTokens = nullableExportInt(inputTokens)
 	row.OutputTokens = nullableExportInt(outputTokens)
+	row.ReasoningOutputTokens = nullableExportInt(reasoningOutputTokens)
 	row.CacheCreationInputTokens = nullableExportInt(cacheCreationInputTokens)
 	row.CacheReadInputTokens = nullableExportInt(cacheReadInputTokens)
 	row.CacheCreation5mInputTokens = nullableExportInt(cacheCreation5mInputTokens)
@@ -422,6 +427,7 @@ func scanAccountingRequestExport(rows *sql.Rows) (accountingRequestExportRow, er
 	row.RateCardID = nullableExportInt(rateCardID)
 	row.ImportSource = nullableExportString(importSource)
 	row.ImportLine = nullableExportInt(importLine)
+	row.FirstContentAt = nullableExportInt(firstContentAt)
 	return row, nil
 }
 

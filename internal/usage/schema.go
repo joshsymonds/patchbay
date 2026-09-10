@@ -25,6 +25,8 @@ const upstreamTargetDispatchEvidenceMigrationVersion = 5
 
 const summaryQueryIndexesMigrationVersion = 6
 
+const responseDetailTimingMigrationVersion = 7
+
 const (
 	summaryWindowIndexName        = "accounting_requests_summary_window"
 	summaryContextWindowIndexName = "accounting_requests_summary_context_window"
@@ -128,6 +130,7 @@ func declaredMigrations() []migration {
 		importedLedgerProvenanceMigration(),
 		upstreamTargetDispatchEvidenceMigration(),
 		summaryQueryIndexesMigration(),
+		responseDetailTimingMigration(),
 	}
 }
 
@@ -1124,4 +1127,15 @@ func rollbackMigration(ctx context.Context, conn *sql.Conn, cause error) error {
 		return errors.Join(cause, fmt.Errorf("roll back migration: %w", rollbackErr))
 	}
 	return cause
+}
+
+func responseDetailTimingMigration() migration {
+	return migration{
+		version: responseDetailTimingMigrationVersion,
+		name:    "response_detail_timing",
+		statements: []string{
+			`ALTER TABLE accounting_requests ADD COLUMN reasoning_output_tokens INTEGER CHECK (reasoning_output_tokens IS NULL OR reasoning_output_tokens >= 0)`,
+			`ALTER TABLE accounting_requests ADD COLUMN first_content_at INTEGER CHECK (first_content_at IS NULL OR first_content_at >= upstream_dispatched_at)`,
+		},
+	}
 }

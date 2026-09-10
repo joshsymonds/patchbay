@@ -1,12 +1,66 @@
 package proxy
 
 import (
+	_ "embed"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/joshsymonds/patchbay/internal/accounting"
 )
+
+//go:embed testdata/openrouter-deepseek-null-usage.sse
+var nullUsageFixture []byte
+
+func TestSummarizeStreamNullUsageFields(t *testing.T) {
+	got := summarize(nullUsageFixture, "text/event-stream")
+	want := summary{
+		responseID:                   "gen-1789068530-Ivr5m8xYeB4g5bYUfNbQ",
+		blockTypes:                   []string{"thinking", "text"},
+		inputTokens:                  37,
+		inputTokensPresent:           true,
+		outputTokens:                 22,
+		outputTokensPresent:          true,
+		cacheReadInputTokens:         0,
+		cacheReadInputTokensPresent:  true,
+		reasoningOutputTokens:        20,
+		reasoningOutputTokensPresent: true,
+		providerCost:                 accounting.NanoUSD(18_750),
+		providerCostPresent:          true,
+		providerCostValid:            true,
+		stopReason:                   "end_turn",
+		complete:                     true,
+	}
+	assertSummary(t, got, want)
+}
+
+func TestSummarizeMessageNullUsageFields(t *testing.T) {
+	body := []byte(`{
+		"id":"msg_null",
+		"content":[],
+		"usage":{
+			"input_tokens":37,
+			"output_tokens":22,
+			"output_tokens_details":null,
+			"cache_creation_input_tokens":null,
+			"cache_read_input_tokens":null,
+			"cache_creation":null
+		},
+		"stop_reason":"end_turn"
+	}`)
+	got := summarize(body, "application/json")
+	want := summary{
+		responseID:          "msg_null",
+		blockTypes:          []string{},
+		inputTokens:         37,
+		inputTokensPresent:  true,
+		outputTokens:        22,
+		outputTokensPresent: true,
+		stopReason:          "end_turn",
+		complete:            true,
+	}
+	assertSummary(t, got, want)
+}
 
 func TestSummarizeMessageNormalizesAccounting(t *testing.T) {
 	got := summarize([]byte(`{
@@ -398,7 +452,7 @@ func TestSummarizeTokenPresenceAndValidation(t *testing.T) {
 			wantPresent:  true,
 			wantComplete: true,
 		},
-		{name: "null input", usage: `{"input_tokens":null}`, field: "input", wantComplete: false},
+		{name: "null input", usage: `{"input_tokens":null}`, field: "input", wantComplete: true},
 		{
 			name:         "string output",
 			usage:        `{"output_tokens":"7"}`,
@@ -415,7 +469,7 @@ func TestSummarizeTokenPresenceAndValidation(t *testing.T) {
 			name:         "null nested cache creation",
 			usage:        `{"cache_creation":{"ephemeral_5m_input_tokens":null}}`,
 			field:        "cache creation 5m",
-			wantComplete: false,
+			wantComplete: true,
 		},
 		{
 			name:         "string nested cache creation",

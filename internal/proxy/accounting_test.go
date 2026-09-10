@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"errors"
 	"io"
 	"log/slog"
@@ -17,6 +18,9 @@ import (
 	"github.com/joshsymonds/patchbay/internal/proxy"
 	"github.com/joshsymonds/patchbay/internal/usage"
 )
+
+//go:embed testdata/openrouter-deepseek-null-usage.sse
+var nullUsageAccountingFixture []byte
 
 // stubAccountant records lifecycle calls and can fail either synchronous gate.
 type stubAccountant struct {
@@ -632,6 +636,53 @@ func TestAccountingStoreLifecycle(t *testing.T) {
 			contacted, completedAt, dispatchedAt, complete, responseID, status, input, output,
 			cacheCreation, cacheRead, cache5m, cache1h, providerPresent,
 			providerValid, providerCost, stopReason, blockShape, duration, upstream)
+	}
+}
+
+func TestAccountingStreamRecordsFirstContentAtAndReasoningTokens(t *testing.T) {
+	writeKeyFile(t, testAPIKey)
+
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store, err := usage.Open(path)
+	if err != nil {
+		t.Fatalf("open usage store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	db, err := sql.Open("sqlite", "file:"+path+"?_foreign_keys=1")
+	if err != nil {
+		t.Fatalf("open usage database for inspection: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	stub := newUpstream(t, sseHandler(t, string(nullUsageAccountingFixture), nil))
+	pipeline := newProxy(t, proxy.Config{
+		Registry:   newRegistry(t, identitySeat(stub.url())),
+		Host:       testHost,
+		Accountant: store,
+	})
+	answer := httptest.NewRecorder()
+	pipeline.ServeHTTP(answer, messagesRequest(fidelityBody))
+	if answer.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", answer.Code, http.StatusOK)
+	}
+	pipeline.Drain(t.Context())
+
+	var dispatchedAt, firstContentAt sql.NullInt64
+	var reasoning sql.NullInt64
+	if err := db.QueryRow(`SELECT upstream_dispatched_at, first_content_at, reasoning_output_tokens
+		FROM accounting_requests`).Scan(&dispatchedAt, &firstContentAt, &reasoning); err != nil {
+		t.Fatalf("query finalized stream accounting: %v", err)
+	}
+	if !dispatchedAt.Valid || !firstContentAt.Valid || firstContentAt.Int64 <= dispatchedAt.Int64 {
+		t.Fatalf(
+			"timestamps = dispatched=%v first_content=%v; want first content after dispatch",
+			dispatchedAt,
+			firstContentAt,
+		)
+	}
+	if !reasoning.Valid || reasoning.Int64 != 20 {
+		t.Fatalf("reasoning_output_tokens = %v; want 20", reasoning)
 	}
 }
 

@@ -72,8 +72,8 @@ func TestOpenCreatesSecureMigratedDatabase(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read migration version: %v", err)
 	}
-	if version != summaryQueryIndexesMigrationVersion {
-		t.Fatalf("migration version = %d; want %d", version, summaryQueryIndexesMigrationVersion)
+	if version != responseDetailTimingMigrationVersion {
+		t.Fatalf("migration version = %d; want %d", version, responseDetailTimingMigrationVersion)
 	}
 
 	var table string
@@ -1108,13 +1108,13 @@ func TestOpenIsIdempotent(t *testing.T) {
 		Scan(&count, &version); err != nil {
 		t.Fatal(err)
 	}
-	if count != summaryQueryIndexesMigrationVersion ||
-		version != summaryQueryIndexesMigrationVersion {
+	if count != responseDetailTimingMigrationVersion ||
+		version != responseDetailTimingMigrationVersion {
 		t.Fatalf("migration rows = %d, max version = %d; want %d, %d",
 			count,
 			version,
-			summaryQueryIndexesMigrationVersion,
-			summaryQueryIndexesMigrationVersion,
+			responseDetailTimingMigrationVersion,
+			responseDetailTimingMigrationVersion,
 		)
 	}
 }
@@ -1174,6 +1174,8 @@ func TestAccountingRequestsSchema(t *testing.T) {
 		{"import_source", "TEXT", 0, 0},
 		{"import_line", "INTEGER", 0, 0},
 		{"upstream_target", "TEXT", 0, 0},
+		{"reasoning_output_tokens", "INTEGER", 0, 0},
+		{"first_content_at", "INTEGER", 0, 0},
 	}
 
 	rows, err := db.Query(`PRAGMA table_info(accounting_requests)`)
@@ -1714,18 +1716,18 @@ func TestValidateRecordedSchemaObjectsJudgesExtrasByTheTableTheyActOn(t *testing
 		{
 			name:  "a trigger on the ledger is refused",
 			extra: []string{`CREATE TRIGGER ledger_purge AFTER INSERT ON accounting_requests BEGIN SELECT 1; END`},
-			wantErr: `schema version 6 does not declare trigger "ledger_purge" ` +
+			wantErr: `schema version 7 does not declare trigger "ledger_purge" ` +
 				`on table "accounting_requests"`,
 		},
 		{
 			name:    "an index on the rate cards table is refused",
 			extra:   []string{`CREATE INDEX rate_cards_by_source ON rate_cards(source)`},
-			wantErr: `schema version 6 does not declare index "rate_cards_by_source" on table "rate_cards"`,
+			wantErr: `schema version 7 does not declare index "rate_cards_by_source" on table "rate_cards"`,
 		},
 		{
 			name:  "an index on the migration bookkeeping table is refused",
 			extra: []string{`CREATE INDEX schema_migrations_by_name ON schema_migrations(name)`},
-			wantErr: `schema version 6 does not declare index "schema_migrations_by_name" ` +
+			wantErr: `schema version 7 does not declare index "schema_migrations_by_name" ` +
 				`on table "schema_migrations"`,
 		},
 	} {
@@ -1797,7 +1799,7 @@ func TestValidateRecordedSchemaObjectsIdentifiesObjectsByKindAndName(t *testing.
 		{
 			name:  "a destructive trigger has taken a canonical index name",
 			extra: []string{destructiveLedgerTrigger(summaryWindowIndexName, "INSERT")},
-			wantErr: `schema version 6 does not declare trigger "` + summaryWindowIndexName + `" ` +
+			wantErr: `schema version 7 does not declare trigger "` + summaryWindowIndexName + `" ` +
 				`on table "accounting_requests"`,
 		},
 		{
@@ -1807,19 +1809,19 @@ func TestValidateRecordedSchemaObjectsIdentifiesObjectsByKindAndName(t *testing.
 				destructiveLedgerTrigger(summaryWindowIndexName, "INSERT"),
 				canonicalSummaryWindowIndex,
 			},
-			wantErr: `schema version 6 does not declare trigger "` + summaryWindowIndexName + `" ` +
+			wantErr: `schema version 7 does not declare trigger "` + summaryWindowIndexName + `" ` +
 				`on table "accounting_requests"`,
 		},
 		{
 			name:  "a destructive trigger has taken the other canonical index name",
 			extra: []string{destructiveLedgerTrigger(summaryContextWindowIndexName, "UPDATE")},
-			wantErr: `schema version 6 does not declare trigger "` + summaryContextWindowIndexName + `" ` +
+			wantErr: `schema version 7 does not declare trigger "` + summaryContextWindowIndexName + `" ` +
 				`on table "accounting_requests"`,
 		},
 		{
 			name:  "an index has taken a canonical trigger name",
 			extra: []string{`CREATE INDEX rate_cards_forbid_update ON rate_cards(source)`},
-			wantErr: `schema version 6 does not declare index "rate_cards_forbid_update" ` +
+			wantErr: `schema version 7 does not declare index "rate_cards_forbid_update" ` +
 				`on table "rate_cards"`,
 		},
 		{
@@ -1829,19 +1831,19 @@ func TestValidateRecordedSchemaObjectsIdentifiesObjectsByKindAndName(t *testing.
 				`CREATE INDEX rate_cards_forbid_update ON rate_cards(source)`,
 				canonicalRateCardsForbidUpdate,
 			},
-			wantErr: `schema version 6 does not declare index "rate_cards_forbid_update" ` +
+			wantErr: `schema version 7 does not declare index "rate_cards_forbid_update" ` +
 				`on table "rate_cards"`,
 		},
 		{
 			name:  "an index has taken a canonical trigger name on another managed table",
 			extra: []string{`CREATE INDEX accounting_requests_validate_finalized_snapshot ON rate_cards(model)`},
-			wantErr: `schema version 6 does not declare index "accounting_requests_validate_finalized_snapshot" ` +
+			wantErr: `schema version 7 does not declare index "accounting_requests_validate_finalized_snapshot" ` +
 				`on table "rate_cards"`,
 		},
 		{
 			name:  "a destructive trigger has taken a canonical table name",
 			extra: []string{destructiveLedgerTrigger(rateCardsTable, "DELETE")},
-			wantErr: `schema version 6 does not declare trigger "` + rateCardsTable + `" ` +
+			wantErr: `schema version 7 does not declare trigger "` + rateCardsTable + `" ` +
 				`on table "accounting_requests"`,
 		},
 	} {
@@ -2215,7 +2217,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	}
 	defer db.Close()
 
-	failing := migration{version: 7, name: "fail", statements: []string{
+	failing := migration{version: responseDetailTimingMigrationVersion + 1, name: "fail", statements: []string{
 		`CREATE TABLE must_not_survive (id INTEGER)`,
 		`THIS IS NOT SQL`,
 	}}
@@ -2232,7 +2234,7 @@ func TestFailingMigrationIsAtomic(t *testing.T) {
 	if count != 0 {
 		t.Fatal("failed migration published partial schema")
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = 7`).
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, failing.version).
 		Scan(&count); err != nil {
 		t.Fatal(err)
 	}
