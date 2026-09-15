@@ -1033,6 +1033,62 @@ func applyMigrations(ctx context.Context, db *sql.DB, declared []migration) erro
 	return nil
 }
 
+// requireCurrentVersion refuses a database whose recorded schema differs from
+// the migrations this build declares, writing nothing either way. A database
+// ahead of this build is refused exactly as migrate refuses it; one behind
+// belongs to a process still serving the older schema, and migrating it out
+// from under that process would leave it unable to reopen its own database.
+func requireCurrentVersion(ctx context.Context, db *sql.DB) error {
+	declared := declaredMigrations()
+	if err := validateMigrations(declared); err != nil {
+		return err
+	}
+	latest := 0
+	if len(declared) > 0 {
+		latest = declared[len(declared)-1].version
+	}
+	recorded, err := recordedVersion(ctx, db)
+	if err != nil {
+		return err
+	}
+	switch {
+	case recorded > latest:
+		return rejectFutureVersion(ctx, db, declared)
+	case recorded < latest:
+		return fmt.Errorf(
+			"schema version %d is behind the version %d this build declares; "+
+				"upgrade the running patchbay daemon so it migrates the database first",
+			recorded,
+			latest,
+		)
+	}
+	return nil
+}
+
+// recordedVersion reports the highest applied migration version, and 0 for a
+// database no migration has ever touched.
+func recordedVersion(ctx context.Context, db *sql.DB) (int, error) {
+	var present int
+	if err := db.QueryRowContext(
+		ctx,
+		`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?`,
+		schemaMigrationsTable,
+	).Scan(&present); err != nil {
+		return 0, fmt.Errorf("inspect schema migrations table: %w", err)
+	}
+	if present == 0 {
+		return 0, nil
+	}
+	var version int
+	if err := db.QueryRowContext(
+		ctx,
+		`SELECT coalesce(max(version), 0) FROM schema_migrations`,
+	).Scan(&version); err != nil {
+		return 0, fmt.Errorf("inspect schema version: %w", err)
+	}
+	return version, nil
+}
+
 func rejectFutureVersion(ctx context.Context, db *sql.DB, declared []migration) error {
 	latest := 0
 	if len(declared) > 0 {

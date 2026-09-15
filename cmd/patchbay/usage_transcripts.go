@@ -41,7 +41,13 @@ func (c cli) usageImportTranscripts(ctx context.Context, args []string) (exitCod
 	flags := flag.NewFlagSet("import-transcripts", flag.ContinueOnError)
 	flags.SetOutput(c.stderr)
 	inventory := flags.String("inventory", "", "transcript inventory path")
-	dbPath := flags.String("db", "", "usage database path")
+	dbPath := flags.String(
+		"db",
+		"",
+		"usage database to import into, an operator's own copy, migrated to the schema this build\n"+
+			"declares; without it the daemon's database is imported into as it stands, and a schema\n"+
+			"version other than this build's is refused rather than migrated under the daemon",
+	)
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || strings.TrimSpace(*inventory) == "" {
 		if err == nil {
 			fmt.Fprintln(c.stderr, "patchbay: usage import-transcripts requires --inventory")
@@ -49,6 +55,7 @@ func (c cli) usageImportTranscripts(ctx context.Context, args []string) (exitCod
 		return exitUsage
 	}
 	resolvedDB := strings.TrimSpace(*dbPath)
+	openDatabase := usage.Open
 	if resolvedDB == "" {
 		cfg, err := resolveConfig(c.lookupEnv)
 		if err != nil {
@@ -56,8 +63,9 @@ func (c cli) usageImportTranscripts(ctx context.Context, args []string) (exitCod
 			return exitFailure
 		}
 		resolvedDB = cfg.usageDB
+		openDatabase = usage.OpenAtCurrentSchema
 	}
-	store, err := usage.Open(resolvedDB)
+	store, err := openDatabase(resolvedDB)
 	if err != nil {
 		c.fail(fmt.Errorf("open usage database %s: %w", resolvedDB, err))
 		return exitFailure

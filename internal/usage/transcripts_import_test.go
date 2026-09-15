@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -178,7 +177,7 @@ func TestImportTranscripts(t *testing.T) {
 		t.Fatalf("pi file result = %#v", result.Files[2])
 	}
 	rows, err := store.db.Query(
-		`SELECT response_id, import_source, import_line, request_model, resolved_model, request_kind, route_host, route_context, cost_status, http_status, input_tokens, output_tokens, reasoning_output_tokens, cache_creation_input_tokens, cache_read_input_tokens, stop_reason, block_shape, started_at, completed_at, outcome, first_content_at FROM accounting_requests WHERE import_source IS NOT NULL ORDER BY id`,
+		`SELECT response_id, import_source, import_line, request_model, resolved_model, request_kind, route_host, route_context, cost_status, http_status, input_tokens, output_tokens, reasoning_output_tokens, cache_creation_input_tokens, cache_read_input_tokens, stop_reason, block_shape, started_at, completed_at, outcome, first_content_at, upstream_dispatched_at, upstream_contacted FROM accounting_requests WHERE import_source IS NOT NULL ORDER BY id`,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -188,9 +187,9 @@ func TestImportTranscripts(t *testing.T) {
 		responseID, source, model, resolved, kind, host, ctx, cost, stop string
 		line                                                             int64
 		input, output, reasoning, cacheWrite, cacheRead                  sql.NullInt64
-		http, first                                                      sql.NullInt64
+		http, first, dispatched                                          sql.NullInt64
 		shape                                                            string
-		started, completed                                               int64
+		started, completed, contacted                                    int64
 		outcome                                                          string
 	}
 	var got []gotRow
@@ -218,6 +217,8 @@ func TestImportTranscripts(t *testing.T) {
 			&row.completed,
 			&row.outcome,
 			&row.first,
+			&row.dispatched,
+			&row.contacted,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -228,6 +229,16 @@ func TestImportTranscripts(t *testing.T) {
 	}
 	if len(got) != 5 {
 		t.Fatalf("rows = %#v", got)
+	}
+	for i, row := range got {
+		if row.dispatched.Valid || row.contacted != 0 {
+			t.Fatalf(
+				"row %d dispatched = %#v contacted = %d; want NULL and 0, the gateway carried no imported request",
+				i,
+				row.dispatched,
+				row.contacted,
+			)
+		}
 	}
 	if got[0].responseID != "msg-1" || got[0].source != "claude-transcript:proj/session.jsonl" || got[0].line != 2 ||
 		got[0].input.Int64 != 10 ||
@@ -266,8 +277,6 @@ func TestImportTranscripts(t *testing.T) {
 }
 
 func joinLines(lines []string) string {
-	b, _ := json.Marshal(lines)
-	_ = b
 	out := ""
 	for _, line := range lines {
 		out += line + "\n"

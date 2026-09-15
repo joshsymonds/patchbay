@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"testing/iotest"
@@ -21,6 +22,12 @@ import (
 
 //go:embed testdata/openrouter-deepseek-null-usage.sse
 var nullUsageAccountingFixture []byte
+
+// contentDeliveryPause is how long the stream stands still on either side of
+// the first content delta. It is long enough that no plausible scheduling delay
+// between the proxy reading those bytes and timestamping them could carry the
+// observation out of the window.
+const contentDeliveryPause = 50 * time.Millisecond
 
 // stubAccountant records lifecycle calls and can fail either synchronous gate.
 type stubAccountant struct {
@@ -655,7 +662,17 @@ func TestAccountingStreamRecordsFirstContentAtAndReasoningTokens(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	stub := newUpstream(t, sseHandler(t, string(nullUsageAccountingFixture), nil))
+	// The upstream holds the stream still around the first thinking delta, so
+	// the recorded instant can be attributed to that delta alone: a stamp taken
+	// on message_start, on content_block_start or on the first byte of any kind
+	// lands before the window, and one taken on a later event lands after it.
+	fixture := string(nullUsageAccountingFixture)
+	firstDelta := strings.Index(fixture, "event: content_block_delta")
+	if firstDelta < 0 {
+		t.Fatal("fixture carries no content_block_delta event")
+	}
+	handler, windows := pausedSSEHandler(t, fixture, firstDelta, contentDeliveryPause)
+	stub := newUpstream(t, handler)
 	pipeline := newProxy(t, proxy.Config{
 		Registry:   newRegistry(t, identitySeat(stub.url())),
 		Host:       testHost,
@@ -679,6 +696,15 @@ func TestAccountingStreamRecordsFirstContentAtAndReasoningTokens(t *testing.T) {
 			"timestamps = dispatched=%v first_content=%v; want first content after dispatch",
 			dispatchedAt,
 			firstContentAt,
+		)
+	}
+	window := <-windows
+	if firstContentAt.Int64 < window.before.UnixNano() || firstContentAt.Int64 > window.after.UnixNano() {
+		t.Fatalf(
+			"first_content_at = %d; want it within [%d, %d], the window the first thinking delta was delivered in",
+			firstContentAt.Int64,
+			window.before.UnixNano(),
+			window.after.UnixNano(),
 		)
 	}
 	if !reasoning.Valid || reasoning.Int64 != 20 {

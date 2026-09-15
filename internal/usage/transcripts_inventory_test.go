@@ -35,7 +35,7 @@ func TestInventoryTranscripts(t *testing.T) {
 		`{"type":"message","id":"p","timestamp":"2026-09-01T00:00:02Z","message":{"role":"assistant","model":"pi-test","usage":{"input":1,"output":1},"stopReason":"stop","content":[{"type":"text"}]}}` + "\n",
 	)
 	for path, contents := range map[string][]byte{
-		filepath.Join(claudeA, "session.jsonl"):                         contentsOr(claudeLine),
+		filepath.Join(claudeA, "session.jsonl"):                         claudeLine,
 		filepath.Join(claudeA, "session", "subagents", "agent-x.jsonl"): subagentLine,
 		filepath.Join(claudeB, "session.jsonl"):                         claudeLine,
 		filepath.Join(pi, "sess", "session.jsonl"):                      piLine,
@@ -79,5 +79,3 @@ func TestInventoryTranscripts(t *testing.T) {
 		t.Fatalf("duplicates = %#v", inventory.Duplicates)
 	}
 }
-
-func contentsOr(value []byte) []byte { return value }

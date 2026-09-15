@@ -1695,8 +1695,16 @@ func TestUsageTranscriptCommandsParseFlagsAndResolveDefaultDatabase(t *testing.T
 		t.Fatal(err)
 	}
 	inventory := filepath.Join(t.TempDir(), "inventory.json")
+	usageDB := filepath.Join(t.TempDir(), "usage.sqlite")
+	store, err := usage.Open(usageDB)
+	if err != nil {
+		t.Fatalf("open the daemon usage database: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close the daemon usage database: %v", err)
+	}
 	env := map[string]string{
-		envUsageDB: filepath.Join(t.TempDir(), "usage.sqlite"),
+		envUsageDB: usageDB,
 		envHome:    t.TempDir(),
 	}
 	got := invoke(t, env, "usage", "inventory-transcripts",

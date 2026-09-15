@@ -41,6 +41,9 @@ const (
 	sseType      = "text/event-stream"
 	jsonType     = "application/json"
 
+	// sseEventSeparator is the blank line that terminates one server-sent event.
+	sseEventSeparator = "\n\n"
+
 	// callBuffer sizes the recorded-call channel: wide enough that a concurrent
 	// test never blocks the stub upstream.
 	callBuffer = 64
@@ -186,6 +189,59 @@ func sseHandler(t *testing.T, body string, splits []int) http.HandlerFunc {
 			prev = offset
 		}
 	}
+}
+
+// sseDeliveryWindow brackets one event's delivery inside a paused stream. The
+// upstream wrote nothing between before and after other than that event, so an
+// observation timestamped inside the window can only have come from it.
+type sseDeliveryWindow struct {
+	before, after time.Time
+}
+
+// pausedSSEHandler streams body as an event stream in three flushes — the bytes
+// before offset, the single event beginning at offset, then the remainder —
+// holding the connection silent for pause on either side of the middle flush,
+// and reports the window bracketing it.
+func pausedSSEHandler(
+	t *testing.T,
+	body string,
+	offset int,
+	pause time.Duration,
+) (http.HandlerFunc, <-chan sseDeliveryWindow) {
+	t.Helper()
+
+	separator := strings.Index(body[offset:], sseEventSeparator)
+	if separator < 0 {
+		t.Fatalf("event stream has no event terminator after offset %d", offset)
+	}
+	end := offset + separator + len(sseEventSeparator)
+	windows := make(chan sseDeliveryWindow, 1)
+
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", sseType)
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, isFlusher := w.(http.Flusher)
+		if !isFlusher {
+			t.Error("upstream response writer is not an http.Flusher")
+
+			return
+		}
+
+		io.WriteString(w, body[:offset])
+		flusher.Flush()
+
+		time.Sleep(pause)
+		before := time.Now()
+		io.WriteString(w, body[offset:end])
+		flusher.Flush()
+
+		time.Sleep(pause)
+		windows <- sseDeliveryWindow{before: before, after: time.Now()}
+		io.WriteString(w, body[end:])
+		flusher.Flush()
+	}, windows
 }
 
 // boundaries sorts, deduplicates and clamps split offsets, always ending at the

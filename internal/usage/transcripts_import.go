@@ -284,10 +284,7 @@ func deriveTranscriptAccountingRow(
 	if attempt.startedAt.IsZero() || attempt.completedAt.IsZero() {
 		return transcriptAccountingRow{}, errors.New("attempt timestamps are incomplete")
 	}
-	duration, err := millisecondsBetween(attempt.startedAt, attempt.completedAt)
-	if err != nil {
-		return transcriptAccountingRow{}, err
-	}
+	duration := millisecondsBetween(attempt.startedAt, attempt.completedAt)
 	shape, err := canonicalImportedBlockShape(attempt.shape)
 	if err != nil {
 		return transcriptAccountingRow{}, err
@@ -384,6 +381,11 @@ func transcriptResponseIdentityExists(ctx context.Context, conn *sql.Conn, ident
 	return false, fmt.Errorf("check transcript response identity %q: %w", identity, err)
 }
 
+// insertTranscriptAccountingRow writes one imported attempt. The gateway never
+// carried this request, so it records no upstream contact and no dispatch
+// instant: the transcript timestamps are the harness's own, and binding them to
+// upstream_dispatched_at would hand a reader gateway-observed timing that was
+// never measured.
 func insertTranscriptAccountingRow(ctx context.Context, conn *sql.Conn, row transcriptAccountingRow) (bool, error) {
 	result, err := conn.ExecContext(ctx, `INSERT INTO accounting_requests (
 		started_at, completed_at, upstream_dispatched_at, request_kind, lifecycle_state, outcome,
@@ -394,10 +396,10 @@ func insertTranscriptAccountingRow(ctx context.Context, conn *sql.Conn, row tran
 		cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, provider_cost_present,
 		provider_cost_valid, provider_cost_nano_usd, stop_reason, block_shape, duration_ms, upstream_ms,
 		cost_basis, final_cost_nano_usd, rate_card_id, first_content_at, import_source, import_line
-	) VALUES (?, ?, ?, 'messages', 'finalized', ?, 1, ?, 'transcript', NULL, ?, ?, ?, '', '', '', NULL, 'unknown',
+	) VALUES (?, ?, NULL, 'messages', 'finalized', ?, 0, ?, 'transcript', NULL, ?, ?, ?, '', '', '', NULL, 'unknown',
 		?, NULL, 0, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, 0, ?, ?, ?, ?, 'unknown', NULL, NULL, NULL, ?, ?)
 	ON CONFLICT(import_source, import_line) WHERE import_source IS NOT NULL DO NOTHING`,
-		row.startedAt, row.completedAt, row.startedAt, row.outcome.String(), row.host, row.upstream,
+		row.startedAt, row.completedAt, row.outcome.String(), row.host, row.upstream,
 		row.model, row.model, row.identity, row.inputTokens, row.outputTokens, row.reasoningTokens,
 		row.cacheCreation, row.cacheRead, row.stopReason, row.shape, row.durationMS, row.durationMS,
 		row.source, row.line,

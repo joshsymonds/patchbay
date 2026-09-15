@@ -93,7 +93,6 @@ type claudeMessage struct {
 	Usage      *claudeUsage  `json:"usage"`
 	Content    claudeContent `json:"content"`
 	StopReason *string       `json:"stop_reason"`
-	Role       string        `json:"role"`
 }
 
 type claudeTranscriptRow struct {
@@ -101,9 +100,6 @@ type claudeTranscriptRow struct {
 	UUID              string              `json:"uuid"`
 	ParentUUID        string              `json:"-"`
 	Timestamp         transcriptTimestamp `json:"timestamp"`
-	SessionID         string              `json:"-"`
-	AgentID           string              `json:"-"`
-	IsSidechain       bool                `json:"-"`
 	IsAPIErrorMessage bool                `json:"-"`
 	RequestID         string              `json:"-"`
 	Message           *claudeMessage      `json:"message"`
@@ -147,9 +143,6 @@ func (row *claudeTranscriptRow) UnmarshalJSON(contents []byte) error {
 		{name: "uuid", target: &row.UUID},
 		{name: "parentUuid", target: &row.ParentUUID},
 		{name: transcriptJSONTimestamp, target: &row.Timestamp},
-		{name: "sessionId", target: &row.SessionID},
-		{name: "agentId", target: &row.AgentID},
-		{name: "isSidechain", target: &row.IsSidechain},
 		{name: "isApiErrorMessage", target: &row.IsAPIErrorMessage},
 		{name: "requestId", target: &row.RequestID},
 		{name: transcriptJSONMessage, target: &row.Message},
@@ -383,10 +376,6 @@ func transcriptLineError(path string, line int, err error) error {
 	return fmt.Errorf("read transcript %s:%d: %w", path, line, err)
 }
 
-func millisecondsBetween(started, completed time.Time) (int64, error) {
-	duration := completed.Sub(started)
-	if duration < 0 {
-		return 0, fmt.Errorf("completed timestamp precedes started timestamp")
-	}
-	return duration.Milliseconds(), nil
+func millisecondsBetween(started, completed time.Time) int64 {
+	return completed.Sub(started).Milliseconds()
 }
