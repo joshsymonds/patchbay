@@ -25,6 +25,8 @@ const upstreamTargetDispatchEvidenceMigrationVersion = 5
 
 const summaryQueryIndexesMigrationVersion = 6
 
+const responseDetailTimingMigrationVersion = 7
+
 const (
 	summaryWindowIndexName        = "accounting_requests_summary_window"
 	summaryContextWindowIndexName = "accounting_requests_summary_context_window"
@@ -128,6 +130,7 @@ func declaredMigrations() []migration {
 		importedLedgerProvenanceMigration(),
 		upstreamTargetDispatchEvidenceMigration(),
 		summaryQueryIndexesMigration(),
+		responseDetailTimingMigration(),
 	}
 }
 
@@ -1030,6 +1033,62 @@ func applyMigrations(ctx context.Context, db *sql.DB, declared []migration) erro
 	return nil
 }
 
+// requireCurrentVersion refuses a database whose recorded schema differs from
+// the migrations this build declares, writing nothing either way. A database
+// ahead of this build is refused exactly as migrate refuses it; one behind
+// belongs to a process still serving the older schema, and migrating it out
+// from under that process would leave it unable to reopen its own database.
+func requireCurrentVersion(ctx context.Context, db *sql.DB) error {
+	declared := declaredMigrations()
+	if err := validateMigrations(declared); err != nil {
+		return err
+	}
+	latest := 0
+	if len(declared) > 0 {
+		latest = declared[len(declared)-1].version
+	}
+	recorded, err := recordedVersion(ctx, db)
+	if err != nil {
+		return err
+	}
+	switch {
+	case recorded > latest:
+		return rejectFutureVersion(ctx, db, declared)
+	case recorded < latest:
+		return fmt.Errorf(
+			"schema version %d is behind the version %d this build declares; "+
+				"upgrade the running patchbay daemon so it migrates the database first",
+			recorded,
+			latest,
+		)
+	}
+	return nil
+}
+
+// recordedVersion reports the highest applied migration version, and 0 for a
+// database no migration has ever touched.
+func recordedVersion(ctx context.Context, db *sql.DB) (int, error) {
+	var present int
+	if err := db.QueryRowContext(
+		ctx,
+		`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?`,
+		schemaMigrationsTable,
+	).Scan(&present); err != nil {
+		return 0, fmt.Errorf("inspect schema migrations table: %w", err)
+	}
+	if present == 0 {
+		return 0, nil
+	}
+	var version int
+	if err := db.QueryRowContext(
+		ctx,
+		`SELECT coalesce(max(version), 0) FROM schema_migrations`,
+	).Scan(&version); err != nil {
+		return 0, fmt.Errorf("inspect schema version: %w", err)
+	}
+	return version, nil
+}
+
 func rejectFutureVersion(ctx context.Context, db *sql.DB, declared []migration) error {
 	latest := 0
 	if len(declared) > 0 {
@@ -1124,4 +1183,15 @@ func rollbackMigration(ctx context.Context, conn *sql.Conn, cause error) error {
 		return errors.Join(cause, fmt.Errorf("roll back migration: %w", rollbackErr))
 	}
 	return cause
+}
+
+func responseDetailTimingMigration() migration {
+	return migration{
+		version: responseDetailTimingMigrationVersion,
+		name:    "response_detail_timing",
+		statements: []string{
+			`ALTER TABLE accounting_requests ADD COLUMN reasoning_output_tokens INTEGER CHECK (reasoning_output_tokens IS NULL OR reasoning_output_tokens >= 0)`,
+			`ALTER TABLE accounting_requests ADD COLUMN first_content_at INTEGER CHECK (first_content_at IS NULL OR first_content_at >= upstream_dispatched_at)`,
+		},
+	}
 }

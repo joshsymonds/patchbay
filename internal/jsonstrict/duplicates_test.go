@@ -196,20 +196,110 @@ func TestMalformedJSONKeepsItsOwnError(t *testing.T) {
 		}
 	}
 
-	// A document that stops mid-value runs the token stream out, which
-	// encoding/json reports as io.EOF. The path carried alongside it is what
-	// says where the bytes ran out.
-	for _, tc := range []struct{ data, path string }{
-		{data: `{`, path: "$"},
-		{data: `{"reasoning":{"effort":"low"`, path: "$.reasoning"},
-		{data: `[{"a":1}`, path: "$"},
+	// A document that stops mid-value is refused by either decoder the toolchain
+	// can ship, and each names that end its own way, so the assertion follows
+	// the decoder that is actually running rather than accepting both spellings
+	// from either. What is asserted of both is that the refusal carries the
+	// decoder's own error and says where the bytes ran out.
+	variant := runningDecoder(t)
+	for _, tc := range []struct{ data, v1Path, v2Path string }{
+		{data: `{`, v1Path: "$", v2Path: "$"},
+		{data: `{"reasoning":{"effort":"low"`, v1Path: "$.reasoning", v2Path: "$.reasoning"},
+		// The decoders disagree about how far an unclosed array got: v1 runs out
+		// at the array, jsonv2 while already looking for the element after the
+		// last complete one.
+		{data: `[{"a":1}`, v1Path: "$", v2Path: "$[1]"},
 	} {
 		err := jsonstrict.RejectDuplicateNames([]byte(tc.data))
-		if !errors.Is(err, io.EOF) {
-			t.Errorf("RejectDuplicateNames(%s) = %v; want a wrapped io.EOF", tc.data, err)
+		if err == nil {
+			t.Errorf("RejectDuplicateNames(%s) = nil; want the truncated document refused", tc.data)
+
+			continue
 		}
-		if err != nil && !strings.Contains(err.Error(), tc.path) {
-			t.Errorf("error %q does not say where the bytes ran out (%s)", err, tc.path)
+
+		var syntax *json.SyntaxError
+		path := tc.v1Path
+		if variant == decoderV2 {
+			path = tc.v2Path
 		}
+		switch variant {
+		case decoderV1:
+			if !errors.Is(err, io.EOF) || errors.As(err, &syntax) {
+				t.Errorf(
+					"RejectDuplicateNames(%s) = %v; want the io.EOF sentinel the v1 decoder reports, wrapped",
+					tc.data, err,
+				)
+			}
+		case decoderV2:
+			if !errors.As(err, &syntax) {
+				t.Errorf(
+					"RejectDuplicateNames(%s) = %v; want the *json.SyntaxError the jsonv2 decoder reports, wrapped",
+					tc.data, err,
+				)
+			}
+			if errors.Is(err, io.EOF) {
+				t.Errorf(
+					"RejectDuplicateNames(%s) = %v; a truncated document must not read as a clean end",
+					tc.data, err,
+				)
+			}
+		}
+		// The trailing colon is what makes this exact: "$" alone is a prefix of
+		// every deeper path, and a check for it would pass wherever the bytes
+		// ran out.
+		if where := "decode JSON at " + path + ":"; !strings.Contains(err.Error(), where) {
+			t.Errorf("error %q does not say where the bytes ran out (%s)", err, where)
+		}
+	}
+}
+
+// decoderVariant names which encoding/json the toolchain built this test with.
+// The two spell the end of a truncated document differently, and neither
+// spelling is a defect: it is the decoder's account of the bytes, which this
+// package wraps rather than replaces.
+type decoderVariant int
+
+const (
+	// decoderV1 is the original decoder, whose Decoder.More reports no further
+	// input at a truncated end, so the closing token is read and comes back as
+	// the io.EOF sentinel.
+	decoderV1 decoderVariant = iota
+	// decoderV2 is the GOEXPERIMENT=jsonv2 decoder, whose Decoder.More reports
+	// that more input is still expected, so the next token is read from inside
+	// the unfinished value and comes back as a *json.SyntaxError.
+	decoderV2
+)
+
+// runningDecoder asks the decoder which one it is instead of reading a build
+// tag. A bare open brace is one object that never ends, so reading past it is
+// exactly the truncated end the two decoders disagree about.
+//
+// The Decoder.More call between the two reads is what makes the two answer
+// differently, and it is there because the package asks the same question in
+// the same order: reading straight past the brace gets the io.EOF sentinel from
+// either decoder, so a probe without it would report v1 under both.
+func runningDecoder(t *testing.T) decoderVariant {
+	t.Helper()
+
+	decoder := json.NewDecoder(strings.NewReader("{"))
+	if _, err := decoder.Token(); err != nil {
+		t.Fatalf(`Token() on "{" = %v; want the opening brace`, err)
+	}
+	more := decoder.More()
+	_, err := decoder.Token()
+	var syntax *json.SyntaxError
+	switch {
+	case !more && errors.Is(err, io.EOF):
+		return decoderV1
+	case more && errors.As(err, &syntax):
+		return decoderV2
+	default:
+		t.Fatalf(
+			`past "{": More() = %v, Token() = %v; want either no more input and the io.EOF `+
+				`sentinel, or more input and a *json.SyntaxError`,
+			more, err,
+		)
+
+		return decoderV1
 	}
 }

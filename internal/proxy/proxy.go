@@ -536,7 +536,16 @@ func (p *Proxy) stream(ctx context.Context, w http.ResponseWriter, resp *http.Re
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, canFlush := w.(http.Flusher)
-	capt := &capture{buf: nil, dropped: false, truncated: false}
+	observeSSE := strings.Contains(
+		strings.ToLower(resp.Header.Get(anthropic.HeaderContentType)),
+		eventStreamType,
+	)
+	capt := &capture{
+		buf:        nil,
+		dropped:    false,
+		truncated:  false,
+		observeSSE: observeSSE,
+	}
 	buf := make([]byte, streamChunkBytes)
 
 	for {
@@ -576,6 +585,7 @@ func (p *Proxy) writeChunk(
 	canFlush bool,
 	chunk []byte,
 ) bool {
+	capt.observeChunk(chunk, time.Now())
 	capt.write(chunk)
 
 	if _, err := w.Write(chunk); err != nil {

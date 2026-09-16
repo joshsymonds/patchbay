@@ -1143,6 +1143,8 @@ func TestHelpIsNotAnError(t *testing.T) {
 			t.Errorf("%v code = %d; want %d", args, got.code, exitOK)
 		}
 		got.contains(t, "stdout", "usage: patchbay <command>")
+		got.contains(t, "stdout", "usage inventory-transcripts")
+		got.contains(t, "stdout", "usage import-transcripts")
 		if got.stderr != "" {
 			t.Errorf("%v wrote usage to stderr: %q", args, got.stderr)
 		}
@@ -1663,5 +1665,84 @@ func TestRegistryStatePreservesSeatBillingDeclaration(t *testing.T) {
 			seat.BillingClass,
 			seat.BillingClassSet,
 		)
+	}
+}
+
+func TestUsageTranscriptCommandsParseFlagsAndResolveDefaultDatabase(t *testing.T) {
+	claude := t.TempDir()
+	claudeProject := filepath.Join(claude, "project")
+	if err := os.MkdirAll(claudeProject, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(claudeProject, "session.jsonl"),
+		[]byte(
+			`{"type":"assistant","uuid":"a","timestamp":"2026-09-01T00:00:00Z","message":{"id":"string-content","model":"claude-test","usage":{"input_tokens":1,"output_tokens":1},"content":"hello","stop_reason":"end_turn"}}`+"\n"+
+				`{"type":"assistant","uuid":"bad","timestamp":"2026-09-01T00:00:01Z","message":{"content":{"type":"text"}}}`+"\n",
+		),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	pi := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(pi, "session.jsonl"),
+		[]byte(
+			`{"type":"message","id":"u","timestamp":"2026-09-01T00:00:00Z","message":{"role":"assistant","model":"pi-test","usage":{"input":1,"output":1},"stopReason":"stop","content":[{"type":"text"}]}}`+"\n",
+		),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inventory := filepath.Join(t.TempDir(), "inventory.json")
+	usageDB := filepath.Join(t.TempDir(), "usage.sqlite")
+	store, err := usage.Open(usageDB)
+	if err != nil {
+		t.Fatalf("open the daemon usage database: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close the daemon usage database: %v", err)
+	}
+	env := map[string]string{
+		envUsageDB: usageDB,
+		envHome:    t.TempDir(),
+	}
+	got := invoke(t, env, "usage", "inventory-transcripts",
+		"--claude-projects", claude,
+		"--pi-sessions", pi,
+		"--out", inventory,
+	)
+	if got.code != exitOK {
+		t.Fatalf("inventory command code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
+	}
+	got.contains(t, "stdout", "OK usage inventory-transcripts")
+	got = invoke(t, env, "usage", "import-transcripts", "--inventory", inventory)
+	if got.code != exitOK {
+		t.Fatalf("import-transcripts command code = %d; want %d (stderr %q)", got.code, exitOK, got.stderr)
+	}
+	got.contains(
+		t,
+		"stdout",
+		"OK usage import-transcripts project/session.jsonl: imported=1 skipped-existing=0 skipped-changed=0",
+	)
+	if strings.Contains(got.stdout, "unreadable") {
+		t.Fatalf("stdout changed format: %q", got.stdout)
+	}
+	if got.stderr != "patchbay: project/session.jsonl: 1 unreadable rows skipped\n" {
+		t.Fatalf("stderr = %q", got.stderr)
+	}
+}
+
+func TestUsageTranscriptCommandsRequireNamedFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"usage", "inventory-transcripts"},
+		{"usage", "inventory-transcripts", "--out", "one"},
+		{"usage", "import-transcripts"},
+		{"usage", "import-transcripts", "--db", "one"},
+	} {
+		got := invoke(t, nil, args...)
+		if got.code != exitUsage {
+			t.Errorf("%v code = %d; want %d", args, got.code, exitUsage)
+		}
 	}
 }

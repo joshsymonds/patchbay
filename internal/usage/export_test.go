@@ -86,8 +86,8 @@ func TestExportIsDeterministicAndComplete(t *testing.T) {
 	if err := json.Unmarshal(lines[0], &header); err != nil {
 		t.Fatalf("decode header: %v", err)
 	}
-	if header.PatchbayUsageExport != 1 || header.SchemaVersion != summaryQueryIndexesMigrationVersion {
-		t.Fatalf("header = %+v; want export 1 and schema %d", header, summaryQueryIndexesMigrationVersion)
+	if header.PatchbayUsageExport != 1 || header.SchemaVersion != responseDetailTimingMigrationVersion {
+		t.Fatalf("header = %+v; want export 1 and schema %d", header, responseDetailTimingMigrationVersion)
 	}
 
 	var rateCardRow map[string]any
@@ -149,11 +149,11 @@ func TestExportIsDeterministicAndComplete(t *testing.T) {
 		t.Fatalf("undispatched route_alias = %#v; want %q", got, defaultSeatID)
 	}
 	for _, column := range []string{
-		"completed_at", "upstream_dispatched_at", "upstream_target", "outcome", "response_id", "http_status", "normalization_complete", "input_tokens", "output_tokens",
+		"completed_at", "upstream_dispatched_at", "upstream_target", "outcome", "response_id", "http_status", "normalization_complete", "input_tokens", "output_tokens", "reasoning_output_tokens",
 		"cache_creation_input_tokens", "cache_read_input_tokens", "cache_creation_5m_input_tokens",
 		"cache_creation_1h_input_tokens", "provider_cost_present", "provider_cost_valid",
 		"provider_cost_nano_usd", "stop_reason", "block_shape", "duration_ms", "upstream_ms",
-		"cost_basis", "final_cost_nano_usd", "rate_card_id",
+		"cost_basis", "final_cost_nano_usd", "rate_card_id", "first_content_at",
 	} {
 		if undispatched[column] != nil {
 			t.Fatalf("undispatched %s = %#v; want JSON null", column, undispatched[column])
@@ -198,6 +198,7 @@ func exportSeedColumns() []exportSeedColumn {
 		{name: "normalization_complete", introduced: finalizedResponseAccountingMigrationVersion, value: int64(1)},
 		{name: "input_tokens", introduced: finalizedResponseAccountingMigrationVersion, value: int64(11)},
 		{name: "output_tokens", introduced: finalizedResponseAccountingMigrationVersion, value: int64(22)},
+		{name: "reasoning_output_tokens", introduced: responseDetailTimingMigrationVersion, value: int64(20)},
 		{
 			name:       "cache_creation_input_tokens",
 			introduced: finalizedResponseAccountingMigrationVersion,
@@ -231,6 +232,7 @@ func exportSeedColumns() []exportSeedColumn {
 			introduced: upstreamTargetDispatchEvidenceMigrationVersion,
 			value:      "arn:aws:bedrock:us-east-2:123:application-inference-profile/export",
 		},
+		{name: "first_content_at", introduced: responseDetailTimingMigrationVersion, value: int64(1750)},
 	}
 }
 

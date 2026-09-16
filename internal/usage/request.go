@@ -118,6 +118,8 @@ type FinalizedRequest struct {
 	InputTokensPresent                bool
 	OutputTokens                      int64
 	OutputTokensPresent               bool
+	ReasoningOutputTokens             int64
+	ReasoningOutputTokensPresent      bool
 	CacheCreationInputTokens          int64
 	CacheCreationInputTokensPresent   bool
 	CacheReadInputTokens              int64
@@ -133,6 +135,7 @@ type FinalizedRequest struct {
 	BlockShape                        []string
 	DurationMS                        int64
 	UpstreamMS                        int64
+	FirstContentAt                    time.Time
 }
 
 // PendingRequest is the immutable request identity captured before upstream contact.
@@ -232,7 +235,7 @@ func (store *Store) InsertPending(ctx context.Context, request PendingRequest) (
 }
 
 const (
-	finalizeUpdateArgumentCount = 43
+	finalizeUpdateArgumentCount = 47
 	finalizedLifecycleState     = "finalized"
 )
 
@@ -244,6 +247,7 @@ type finalizedSnapshot struct {
 	normalizationComplete      int64
 	inputTokens                sql.NullInt64
 	outputTokens               sql.NullInt64
+	reasoningOutputTokens      sql.NullInt64
 	cacheCreationInputTokens   sql.NullInt64
 	cacheReadInputTokens       sql.NullInt64
 	cacheCreation5mInputTokens sql.NullInt64
@@ -255,6 +259,7 @@ type finalizedSnapshot struct {
 	blockShape                 string
 	durationMS                 int64
 	upstreamMS                 int64
+	firstContentAt             sql.NullInt64
 }
 
 type finalCost struct {
@@ -339,6 +344,7 @@ func (store *Store) finalizeAfterPendingRead(
 		normalization_complete = ?,
 		input_tokens = ?,
 		output_tokens = ?,
+		reasoning_output_tokens = ?,
 		cache_creation_input_tokens = ?,
 		cache_read_input_tokens = ?,
 		cache_creation_5m_input_tokens = ?,
@@ -349,7 +355,8 @@ func (store *Store) finalizeAfterPendingRead(
 		stop_reason = ?,
 		block_shape = ?,
 		duration_ms = ?,
-		upstream_ms = ?
+		upstream_ms = ?,
+		first_content_at = ?
 	WHERE id = ? AND (
 		(lifecycle_state = 'pending'
 			AND started_at <= ?
@@ -364,6 +371,7 @@ func (store *Store) finalizeAfterPendingRead(
 			AND normalization_complete IS ?
 			AND input_tokens IS ?
 			AND output_tokens IS ?
+			AND reasoning_output_tokens IS ?
 			AND cache_creation_input_tokens IS ?
 			AND cache_read_input_tokens IS ?
 			AND cache_creation_5m_input_tokens IS ?
@@ -374,7 +382,8 @@ func (store *Store) finalizeAfterPendingRead(
 			AND stop_reason IS ?
 			AND block_shape IS ?
 			AND duration_ms IS ?
-			AND upstream_ms IS ?)
+			AND upstream_ms IS ?
+			AND first_content_at IS ?)
 	)`, snapshot.updateArguments(id, cost)...)
 	if err != nil {
 		return fmt.Errorf("finalize request %d: update finalized snapshot: %w", id, err)
@@ -419,6 +428,7 @@ func deriveFinalizedSnapshot(
 		normalizationComplete: boolInteger(finalized.NormalizationComplete),
 		inputTokens:           nullableInt64(finalized.InputTokens, finalized.InputTokensPresent),
 		outputTokens:          nullableInt64(finalized.OutputTokens, finalized.OutputTokensPresent),
+		reasoningOutputTokens: nullableInt64(finalized.ReasoningOutputTokens, finalized.ReasoningOutputTokensPresent),
 		cacheCreationInputTokens: nullableInt64(
 			finalized.CacheCreationInputTokens,
 			finalized.CacheCreationInputTokensPresent,
@@ -442,6 +452,7 @@ func deriveFinalizedSnapshot(
 		blockShape:          string(encodedShape),
 		durationMS:          finalized.DurationMS,
 		upstreamMS:          finalized.UpstreamMS,
+		firstContentAt:      nullableInt64(finalized.FirstContentAt.UnixNano(), !finalized.FirstContentAt.IsZero()),
 	}, nil
 }
 
@@ -465,6 +476,12 @@ func validateFinalizedRequest(
 	completedAt := finalized.CompletedAt.UnixNano()
 	if !time.Unix(0, completedAt).Equal(finalized.CompletedAt) {
 		return 0, fmt.Errorf("finalize request completed at cannot round-trip through UnixNano")
+	}
+	if !finalized.FirstContentAt.IsZero() {
+		firstContentAt := finalized.FirstContentAt.UnixNano()
+		if !time.Unix(0, firstContentAt).Equal(finalized.FirstContentAt) {
+			return 0, fmt.Errorf("finalize request first content at cannot round-trip through UnixNano")
+		}
 	}
 	if !finalized.Outcome.Valid() {
 		return 0, fmt.Errorf("finalize request outcome %q is invalid", finalized.Outcome)
@@ -492,6 +509,7 @@ func validateFinalizedMetrics(finalized FinalizedRequest) error {
 	}{
 		{"input tokens", finalized.InputTokens, finalized.InputTokensPresent},
 		{"output tokens", finalized.OutputTokens, finalized.OutputTokensPresent},
+		{"reasoning output tokens", finalized.ReasoningOutputTokens, finalized.ReasoningOutputTokensPresent},
 		{
 			"cache creation input tokens",
 			finalized.CacheCreationInputTokens,
@@ -591,6 +609,7 @@ func (snapshot finalizedSnapshot) updateArguments(id int64, cost finalCost) []an
 		snapshot.normalizationComplete,
 		nullableValue(snapshot.inputTokens),
 		nullableValue(snapshot.outputTokens),
+		nullableValue(snapshot.reasoningOutputTokens),
 		nullableValue(snapshot.cacheCreationInputTokens),
 		nullableValue(snapshot.cacheReadInputTokens),
 		nullableValue(snapshot.cacheCreation5mInputTokens),
@@ -602,6 +621,7 @@ func (snapshot finalizedSnapshot) updateArguments(id int64, cost finalCost) []an
 		snapshot.blockShape,
 		snapshot.durationMS,
 		snapshot.upstreamMS,
+		nullableValue(snapshot.firstContentAt),
 		id,
 		snapshot.completedAt,
 		snapshot.completedAt,
@@ -614,6 +634,7 @@ func (snapshot finalizedSnapshot) updateArguments(id int64, cost finalCost) []an
 		snapshot.normalizationComplete,
 		nullableValue(snapshot.inputTokens),
 		nullableValue(snapshot.outputTokens),
+		nullableValue(snapshot.reasoningOutputTokens),
 		nullableValue(snapshot.cacheCreationInputTokens),
 		nullableValue(snapshot.cacheReadInputTokens),
 		nullableValue(snapshot.cacheCreation5mInputTokens),
@@ -625,6 +646,7 @@ func (snapshot finalizedSnapshot) updateArguments(id int64, cost finalCost) []an
 		snapshot.blockShape,
 		snapshot.durationMS,
 		snapshot.upstreamMS,
+		nullableValue(snapshot.firstContentAt),
 	)
 }
 
@@ -662,6 +684,7 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 		normalization_complete,
 		input_tokens,
 		output_tokens,
+		reasoning_output_tokens,
 		cache_creation_input_tokens,
 		cache_read_input_tokens,
 		cache_creation_5m_input_tokens,
@@ -672,7 +695,8 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 		stop_reason,
 		block_shape,
 		duration_ms,
-		upstream_ms
+		upstream_ms,
+		first_content_at
 	FROM accounting_requests WHERE id = ?`, id).Scan(
 		&state.startedAt,
 		&state.resolvedModel,
@@ -687,6 +711,7 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 		&normalizationComplete,
 		&state.snapshot.inputTokens,
 		&state.snapshot.outputTokens,
+		&state.snapshot.reasoningOutputTokens,
 		&state.snapshot.cacheCreationInputTokens,
 		&state.snapshot.cacheReadInputTokens,
 		&state.snapshot.cacheCreation5mInputTokens,
@@ -698,6 +723,7 @@ func (store *Store) readFinalizationState(ctx context.Context, id int64) (finali
 		&blockShape,
 		&durationMS,
 		&upstreamMS,
+		&state.snapshot.firstContentAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return finalizationState{}, fmt.Errorf("finalize request %d: request does not exist", id)

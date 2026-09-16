@@ -32,7 +32,10 @@ const rootPath = "$"
 // a concept: only names can collide.
 //
 // encoding/json's own syntax and type errors are wrapped rather than replaced,
-// so a caller can still tell malformed bytes from ambiguous ones.
+// so a caller can still tell malformed bytes from ambiguous ones. That includes
+// a document that stops mid-value: whichever error the decoder in this build
+// reports for the end of the bytes is what a caller is handed, carrying the path
+// the reading had reached.
 func RejectDuplicateNames(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	// Nothing here reads a value, and parsing numbers is how a document holding
@@ -42,12 +45,14 @@ func RejectDuplicateNames(data []byte) error {
 	if err := checkValue(decoder, rootPath); err != nil {
 		return err
 	}
-	// Reading once past the value tells the three ends apart. Clean EOF is the
-	// document ending where it should. An error is encoding/json's account of
-	// bytes it could not parse, wrapped like every other one so the reason
-	// survives; replacing it with the refusal below would tell a caller the bytes
-	// were surplus when they were malformed. Anything that parses IS surplus: one
-	// more value nobody will look at.
+	// Reading once past the value tells the three ends apart. Only a clean EOF
+	// here is the document ending where it should, and only a value this function
+	// already read to completion can reach this point — a document that stopped
+	// mid-value was refused above, at the path it stopped in. Any other error is
+	// encoding/json's account of bytes it could not parse, wrapped like every
+	// other one so the reason survives; replacing it with the refusal below would
+	// tell a caller the bytes were surplus when they were malformed. Anything that
+	// parses IS surplus: one more value nobody will look at.
 	if _, err := decoder.Token(); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil
@@ -109,8 +114,10 @@ func checkArray(decoder *json.Decoder, path string) error {
 	return closingToken(decoder, path)
 }
 
-// closingToken consumes the } or ] the loop above stopped at, which is also
-// where a document that ends early surfaces as one.
+// closingToken consumes the } or ] the loop above stopped at. Whether a
+// truncated document surfaces here or in the loop's own read depends on where
+// the decoder decides no more members are coming, so both report it the same
+// way: the decoder's error, at the path being read.
 func closingToken(decoder *json.Decoder, path string) error {
 	if _, err := decoder.Token(); err != nil {
 		return fmt.Errorf("decode JSON at %s: %w", path, err)

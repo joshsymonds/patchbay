@@ -83,6 +83,10 @@ commands:
   usage snapshot <dest>        write a consistent SQLite usage database snapshot
   usage export <dest>          write a deterministic JSONL usage database export
   usage import <ledger-dir>    import legacy JSONL ledger accounting
+  usage inventory-transcripts --claude-projects <dir> --pi-sessions <dir> --out <inventory.json>
+                               write a frozen Claude Code and pi transcript inventory
+  usage import-transcripts --inventory <inventory.json> [--db <path>]
+                               import inventoried transcript accounting
 
   -h, --help                   print this text
 
@@ -242,22 +246,30 @@ func (c cli) usage(w io.Writer) {
 // usageTooling writes a consistent snapshot or deterministic export of the
 // durable usage database without starting a daemon or changing the source.
 func (c cli) usageTooling(ctx context.Context, args []string) int {
-	if len(args) != usageToolingArgumentCount {
+	if len(args) == 0 {
 		c.usage(c.stderr)
-
 		return exitUsage
 	}
-	operation, dest := args[0], args[1]
+	operation := args[0]
+	if operation == "inventory-transcripts" {
+		return c.usageInventoryTranscripts(ctx, args[1:])
+	}
+	if operation == "import-transcripts" {
+		return c.usageImportTranscripts(ctx, args[1:])
+	}
+	if len(args) != usageToolingArgumentCount {
+		c.usage(c.stderr)
+		return exitUsage
+	}
+	dest := args[1]
 	if operation != "snapshot" && operation != "export" && operation != "import" {
 		c.fail(fmt.Errorf("unknown usage subcommand %q", operation))
 		c.usage(c.stderr)
-
 		return exitUsage
 	}
 	cfg, err := resolveConfig(c.lookupEnv)
 	if err != nil {
 		c.fail(err)
-
 		return exitFailure
 	}
 	if operation == "import" {

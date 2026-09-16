@@ -30,6 +30,7 @@ type usage struct {
 	CacheReadInputTokens       *int64
 	CacheCreation5mInputTokens *int64
 	CacheCreation1hInputTokens *int64
+	ReasoningOutputTokens      *int64
 	Cost                       json.RawMessage
 }
 
@@ -55,6 +56,8 @@ type summary struct {
 	cacheCreation5mInputTokensPresent bool
 	cacheCreation1hInputTokens        int64
 	cacheCreation1hInputTokensPresent bool
+	reasoningOutputTokens             int64
+	reasoningOutputTokensPresent      bool
 
 	providerCost        accounting.NanoUSD
 	providerCostPresent bool
@@ -396,24 +399,44 @@ func decodeUsage(raw json.RawMessage) (usage, bool) {
 	valid = valid && ok
 	result.CacheReadInputTokens, ok = decodeToken(fields, "cache_read_input_tokens")
 	valid = valid && ok
-
-	if rawCreation, found := fields["cache_creation"]; found {
-		creation, creationOK := decodeObject(rawCreation)
-		if !creationOK {
-			valid = false
-		} else {
-			result.CacheCreation5mInputTokens, ok = decodeToken(creation, "ephemeral_5m_input_tokens")
-			valid = valid && ok
-			result.CacheCreation1hInputTokens, ok = decodeToken(creation, "ephemeral_1h_input_tokens")
-			valid = valid && ok
-		}
-	}
+	result.ReasoningOutputTokens, ok = decodeReasoningOutputTokens(fields)
+	valid = valid && ok
+	result.CacheCreation5mInputTokens, result.CacheCreation1hInputTokens, ok = decodeCacheCreationTokens(fields)
+	valid = valid && ok
 
 	if rawCost, found := fields["cost"]; found {
 		result.Cost = append(json.RawMessage(nil), bytes.TrimSpace(rawCost)...)
 	}
 
 	return result, valid
+}
+
+// decodeReasoningOutputTokens decodes the optional thinking-token detail object.
+func decodeReasoningOutputTokens(fields map[string]json.RawMessage) (*int64, bool) {
+	rawDetails, found := fields["output_tokens_details"]
+	if !found || isNull(rawDetails) {
+		return nil, true
+	}
+	details, ok := decodeObject(rawDetails)
+	if !ok {
+		return nil, false
+	}
+	return decodeToken(details, "thinking_tokens")
+}
+
+// decodeCacheCreationTokens decodes optional ephemeral cache-token details.
+func decodeCacheCreationTokens(fields map[string]json.RawMessage) (*int64, *int64, bool) {
+	rawCreation, found := fields["cache_creation"]
+	if !found || isNull(rawCreation) {
+		return nil, nil, true
+	}
+	creation, ok := decodeObject(rawCreation)
+	if !ok {
+		return nil, nil, false
+	}
+	fiveMinute, fiveMinuteOK := decodeToken(creation, "ephemeral_5m_input_tokens")
+	oneHour, oneHourOK := decodeToken(creation, "ephemeral_1h_input_tokens")
+	return fiveMinute, oneHour, fiveMinuteOK && oneHourOK
 }
 
 // decodeToken distinguishes an omitted token count from an explicit zero.
@@ -423,7 +446,7 @@ func decodeToken(fields map[string]json.RawMessage, name string) (*int64, bool) 
 		return nil, true
 	}
 	if isNull(raw) {
-		return nil, false
+		return nil, true
 	}
 
 	var value int64
@@ -470,6 +493,7 @@ func (s *summary) mergeUsage(value usage) {
 	s.mergeToken(value.CacheReadInputTokens, &s.cacheReadInputTokens, &s.cacheReadInputTokensPresent)
 	s.mergeToken(value.CacheCreation5mInputTokens, &s.cacheCreation5mInputTokens, &s.cacheCreation5mInputTokensPresent)
 	s.mergeToken(value.CacheCreation1hInputTokens, &s.cacheCreation1hInputTokens, &s.cacheCreation1hInputTokensPresent)
+	s.mergeToken(value.ReasoningOutputTokens, &s.reasoningOutputTokens, &s.reasoningOutputTokensPresent)
 
 	if value.Cost == nil {
 		return

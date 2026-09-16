@@ -83,6 +83,10 @@ func (e *exchange) accountingOutcome(capt *capture, sum summary) usagepkg.Outcom
 
 func (e *exchange) finalizedRequest(capt *capture) usagepkg.FinalizedRequest {
 	sum := e.accountingSummary(capt)
+	firstContentAt := time.Time{}
+	if capt != nil {
+		firstContentAt = capt.firstContentAt
+	}
 
 	return usagepkg.FinalizedRequest{
 		CompletedAt:                       time.Now(),
@@ -94,6 +98,8 @@ func (e *exchange) finalizedRequest(capt *capture) usagepkg.FinalizedRequest {
 		InputTokensPresent:                sum.inputTokensPresent,
 		OutputTokens:                      sum.outputTokens,
 		OutputTokensPresent:               sum.outputTokensPresent,
+		ReasoningOutputTokens:             sum.reasoningOutputTokens,
+		ReasoningOutputTokensPresent:      sum.reasoningOutputTokensPresent,
 		CacheCreationInputTokens:          sum.cacheCreationInputTokens,
 		CacheCreationInputTokensPresent:   sum.cacheCreationInputTokensPresent,
 		CacheReadInputTokens:              sum.cacheReadInputTokens,
@@ -109,6 +115,7 @@ func (e *exchange) finalizedRequest(capt *capture) usagepkg.FinalizedRequest {
 		BlockShape:                        sum.blockTypes,
 		DurationMS:                        e.durationMS,
 		UpstreamMS:                        e.upstreamMS,
+		FirstContentAt:                    firstContentAt,
 	}
 }
 

@@ -36,6 +36,43 @@ type Store struct {
 
 // Open opens path and applies all pending schema migrations.
 func Open(path string) (*Store, error) {
+	db, err := openJournaledDatabase(path)
+	if err != nil {
+		return nil, err
+	}
+	if migrateErr := migrate(context.Background(), db); migrateErr != nil {
+		return nil, closeAfterError(db, fmt.Errorf("open usage database %q: migrate: %w", path, migrateErr))
+	}
+
+	return &Store{
+		db:          db,
+		writePermit: make(chan struct{}, 1),
+	}, nil
+}
+
+// OpenAtCurrentSchema opens path without applying any migration, refusing a
+// database whose recorded schema version is not the version this build
+// declares. A database a running daemon serves can be appended to this way
+// without its schema advancing under that daemon, which could not reopen a
+// version it does not know.
+func OpenAtCurrentSchema(path string) (*Store, error) {
+	db, err := openJournaledDatabase(path)
+	if err != nil {
+		return nil, err
+	}
+	if versionErr := requireCurrentVersion(context.Background(), db); versionErr != nil {
+		return nil, closeAfterError(db, fmt.Errorf("open usage database %q: %w", path, versionErr))
+	}
+
+	return &Store{
+		db:          db,
+		writePermit: make(chan struct{}, 1),
+	}, nil
+}
+
+// openJournaledDatabase opens path in WAL journal mode, leaving its schema
+// untouched for the caller to migrate or to measure.
+func openJournaledDatabase(path string) (*sql.DB, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("usage database path is blank")
 	}
@@ -57,14 +94,7 @@ func Open(path string) (*Store, error) {
 			fmt.Errorf("open usage database %q: initialize WAL journal mode: %w", path, walErr),
 		)
 	}
-	if migrateErr := migrate(context.Background(), db); migrateErr != nil {
-		return nil, closeAfterError(db, fmt.Errorf("open usage database %q: migrate: %w", path, migrateErr))
-	}
-
-	return &Store{
-		db:          db,
-		writePermit: make(chan struct{}, 1),
-	}, nil
+	return db, nil
 }
 
 func (store *Store) acquireWritePermit(ctx context.Context) error {

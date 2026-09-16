@@ -395,7 +395,7 @@ func (p *Proxy) streamBedrock(
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, canFlush := w.(http.Flusher)
-	capt := &capture{buf: nil, dropped: false, truncated: false}
+	capt := &capture{buf: nil, dropped: false, truncated: false, observeSSE: true}
 	decoder := awssig.NewDecoder(resp.Body)
 
 	for {
