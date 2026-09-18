@@ -236,6 +236,9 @@ func validateSeat(seat Seat) error {
 	if err := validateSpeed(seat); err != nil {
 		return err
 	}
+	if err := validateStripBetas(seat); err != nil {
+		return err
+	}
 	if seat.MaxInputTokens < 0 {
 		return fmt.Errorf("%s must not be negative", fieldMaxInputTokens)
 	}
@@ -427,6 +430,17 @@ func validateUpstream(raw string, insecure bool) error {
 func validateSpeed(seat Seat) error {
 	if seat.Speed != "" && seat.AuthMode == AuthSigV4 {
 		return fmt.Errorf("%s is not a Bedrock request field and cannot be set on a sigv4 seat", fieldSpeed)
+	}
+	return nil
+}
+
+// validateStripBetas keeps strip_betas on the Bedrock path: only the sigv4
+// translation rewrites the caller's beta flags, so on any other seat the list
+// would be policy that nothing applies.
+func validateStripBetas(seat Seat) error {
+	if len(seat.StripBetas) != 0 && seat.AuthMode != AuthSigV4 {
+		return fmt.Errorf("%s only applies to the Bedrock translation and cannot be set on a %s seat",
+			fieldStripBetas, seat.AuthMode)
 	}
 	return nil
 }

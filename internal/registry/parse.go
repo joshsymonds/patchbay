@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"github.com/joshsymonds/patchbay/internal/billing"
 )
@@ -33,6 +34,7 @@ const (
 	fieldStripCacheControl = "strip_cache_control"
 	fieldCaptureBodies     = "capture_bodies"
 	fieldSpeed             = "speed"
+	fieldStripBetas        = "strip_betas"
 )
 
 type document struct {
@@ -118,6 +120,7 @@ func parseSeat(raw json.RawMessage) (Seat, error) {
 		fieldStripCacheControl,
 		fieldCaptureBodies,
 		fieldSpeed,
+		fieldStripBetas,
 	}
 	if fieldsErr := exactFields(fields, allowed, nil); fieldsErr != nil {
 		return Seat{}, fieldsErr
@@ -152,7 +155,27 @@ func seatFieldDecoders(seat *Seat) map[string]func(json.RawMessage) error {
 		},
 		fieldCaptureBodies: func(raw json.RawMessage) error { return decodeField(&seat.CaptureBodies, fieldCaptureBodies, raw) },
 		fieldSpeed:         func(raw json.RawMessage) error { return decodeSpeed(seat, raw) },
+		fieldStripBetas:    func(raw json.RawMessage) error { return decodeStripBetas(seat, raw) },
 	}
+}
+
+// decodeStripBetas parses the beta flags a Seat withholds from its upstream.
+// Each entry must name one flag: a blank or padded name fails the document
+// here, because the flags a caller sends are compared by exact string and a
+// name that could never match would strip nothing while looking like policy.
+func decodeStripBetas(seat *Seat, raw json.RawMessage) error {
+	var value []string
+	if err := decodeField(&value, fieldStripBetas, raw); err != nil {
+		return err
+	}
+	for _, name := range value {
+		if name == "" || strings.TrimSpace(name) != name {
+			return fmt.Errorf("field %q: entry %q must be a beta flag name with no surrounding whitespace",
+				fieldStripBetas, name)
+		}
+	}
+	seat.StripBetas = value
+	return nil
 }
 
 // decodeBilling parses the explicit billing class a Seat declares and records

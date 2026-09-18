@@ -157,7 +157,17 @@ After common Seat rewrites, the body must be a JSON object. Bedrock translation:
 
 1. removes `model`;
 2. removes `stream`;
-3. sets `anthropic_version` to `bedrock-2023-05-31`.
+3. sets `anthropic_version` to `bedrock-2023-05-31`;
+4. moves the caller's beta flags into the body's `anthropic_beta` list: every
+   `Anthropic-Beta` header value, comma-split, is appended to whatever list the
+   body already carries, in the order first seen and without repeats, minus the
+   Seat's `strip_betas`; a list left empty is removed, and the header itself is
+   not sent. Bedrock reads beta flags only from the body, so a flag left in the
+   header gates nothing and every request field it would have unlocked comes
+   back as `Extra inputs are not permitted`. Bedrock refuses the whole request
+   over any flag it does not know, which is what `strip_betas` is for. A body
+   `anthropic_beta` that is not an array of strings is refused with 400 before
+   any credential export.
 
 Other fields are retained. The mapped Bedrock model ID goes in the invocation URL.
 

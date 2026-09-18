@@ -842,6 +842,49 @@ func TestSeatSpeedIsFastOrNothing(t *testing.T) {
 	})
 }
 
+// TestSeatStripBetasIsBedrockOnly keeps strip_betas on the one auth mode whose
+// translation rewrites the caller's beta flags, and holds every entry to a
+// name the translation could actually match.
+func TestSeatStripBetasIsBedrockOnly(t *testing.T) {
+	t.Parallel()
+	const sigv4Head = `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE"`
+	runSeatCases(t, []seatCase{
+		{
+			name: "names on sigv4 accepted",
+			seat: sigv4Head + `,"strip_betas":["advisor-tool-2026-03-01","prompt-caching-scope-2026-01-05"]}`,
+		},
+		{
+			name: "empty list on sigv4 accepted",
+			seat: sigv4Head + `,"strip_betas":[]}`,
+		},
+		{
+			name:  "names on forward rejected",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","strip_betas":["advisor-tool-2026-03-01"]}`,
+			wants: []string{"strip_betas", "forward"},
+		},
+		{
+			name:  "names on inject rejected",
+			seat:  `{"upstream":"http://127.0.0.1:8317","auth_mode":"inject","billing":"subscription","api_key_env_file":"KEY_FILE","strip_betas":["advisor-tool-2026-03-01"]}`,
+			wants: []string{"strip_betas", "inject"},
+		},
+		{
+			name:  "blank entry rejected",
+			seat:  sigv4Head + `,"strip_betas":[""]}`,
+			wants: []string{"strip_betas", "beta flag name"},
+		},
+		{
+			name:  "padded entry rejected",
+			seat:  sigv4Head + `,"strip_betas":[" advisor-tool-2026-03-01"]}`,
+			wants: []string{"strip_betas", "whitespace"},
+		},
+		{
+			name:  "non-string entry rejected",
+			seat:  sigv4Head + `,"strip_betas":[1]}`,
+			wants: []string{"strip_betas"},
+		},
+	})
+}
+
 func TestSeatUpstreamRejectsCredentialAndRoutingMaterialWithoutEchoingIt(t *testing.T) {
 	t.Parallel()
 	const injectTail = `","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE"}`

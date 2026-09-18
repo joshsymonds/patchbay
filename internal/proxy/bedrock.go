@@ -20,10 +20,14 @@ import (
 )
 
 // The Bedrock request shape. anthropic_version is the field Bedrock requires in
-// place of the model and stream fields it refuses, which is the whole of the
+// place of the model and stream fields it refuses, and anthropic_beta is where
+// it reads the beta flags an Anthropic client sends as a header — Bedrock never
+// reads the header, so a flag left there gates nothing and every field it
+// would have unlocked is refused as an extra input. That is the whole of the
 // request translation: everything else the caller sent rides along untouched.
 const (
 	fieldAnthropicVersion = "anthropic_version"
+	fieldAnthropicBeta    = "anthropic_beta"
 	fieldStream           = "stream"
 	bedrockAnthropicTag   = "bedrock-2023-05-31"
 )
@@ -116,6 +120,10 @@ func (p *Proxy) bedrockRequest(
 	}
 	target := bedrockInvocationURL(seat, upstreamTarget, documentWantsStream(document))
 
+	if betaErr := mergeBetas(document, r.Header.Values(anthropic.HeaderBeta), seat.StripBetas); betaErr != nil {
+		return nil, 0, "", betaErr
+	}
+
 	translated, translateErr := translateBedrockDocument(document)
 	if translateErr != nil {
 		return nil, 0, "", translateErr
@@ -144,6 +152,8 @@ func (p *Proxy) bedrockRequest(
 			headerContentLength,
 			headerAcceptEncoding,
 			CallerKeyHeader,
+			// Already carried in the body, where Bedrock reads it.
+			anthropic.HeaderBeta,
 		),
 	)
 	req.Header.Del(anthropic.HeaderAuthorization)
@@ -332,11 +342,81 @@ func documentWantsStream(document map[string]json.RawMessage) bool {
 	return streamed
 }
 
-// translateBedrockDocument is the whole request translation: drop the two
-// fields Bedrock carries in the URL rather than the body, add the version tag
-// it requires, and leave every other field exactly as the caller wrote it. The
-// document is walked as raw values rather than a struct on purpose — a field
-// this build has never heard of must still reach the model.
+// mergeBetas moves the caller's beta flags to where Bedrock reads them: the
+// header values, split on commas, are joined with whatever anthropic_beta list
+// the body already carries, in the order first seen and without repeats, minus
+// every flag the seat strips. Bedrock refuses the whole request over a flag it
+// does not know, so the operator names those on the seat. A body list that is
+// not an array of strings is the caller's own error and is refused as one.
+func mergeBetas(document map[string]json.RawMessage, header []string, strip []string) *gatewayError {
+	var body []string
+	if raw, present := document[fieldAnthropicBeta]; present {
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return &gatewayError{
+				status:  http.StatusBadRequest,
+				errType: anthropic.ErrorTypeInvalidRequest,
+				err:     fmt.Errorf("%s must be an array of strings: %w", fieldAnthropicBeta, err),
+			}
+		}
+	}
+
+	stripped := make(map[string]bool, len(strip))
+	for _, name := range strip {
+		stripped[name] = true
+	}
+
+	seen := make(map[string]bool)
+	merged := make([]string, 0, len(body)+len(header))
+	for _, name := range betaNames(body, header) {
+		if name == "" || seen[name] || stripped[name] {
+			continue
+		}
+		seen[name] = true
+		merged = append(merged, name)
+	}
+
+	if len(merged) == 0 {
+		delete(document, fieldAnthropicBeta)
+
+		return nil
+	}
+
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return &gatewayError{
+			status:  http.StatusInternalServerError,
+			errType: "",
+			err:     fmt.Errorf("encode the merged %s list: %w", fieldAnthropicBeta, err),
+		}
+	}
+	document[fieldAnthropicBeta] = encoded
+
+	return nil
+}
+
+// betaNames lists every flag named in the body list and then in the header
+// values, each header value split on commas as the header grammar allows and
+// each name trimmed of the whitespace that grammar also allows.
+func betaNames(body []string, header []string) []string {
+	names := make([]string, 0, len(body)+len(header))
+	for _, name := range body {
+		names = append(names, strings.TrimSpace(name))
+	}
+	for _, value := range header {
+		for _, name := range strings.Split(value, ",") {
+			names = append(names, strings.TrimSpace(name))
+		}
+	}
+
+	return names
+}
+
+// translateBedrockDocument is the rest of the request translation after
+// mergeBetas: drop the two fields Bedrock carries in the URL rather than the
+// body, add the version tag it requires, and leave every other field exactly
+// as the caller wrote it. The document is walked as raw values rather than a
+// struct on purpose — a field this build has never heard of must still reach
+// the model.
 //
 // It consumes the document rather than the bytes, so nothing here re-reads what
 // bedrockDocument already read.

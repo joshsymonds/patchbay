@@ -52,10 +52,16 @@ const (
 )
 
 // sigv4Seat is the registry entry for a Bedrock Seat: no upstream, since the
-// endpoint comes from the region.
-func sigv4Seat(model string) string {
+// endpoint comes from the region. It strips every beta flag named in strip.
+func sigv4Seat(strip ...string) string {
+	names, err := json.Marshal(strip)
+	if err != nil {
+		panic(err)
+	}
+
 	return fmt.Sprintf(`%q:{"auth_mode":"sigv4","aws_profile":%q,"aws_region":"us-east-2",`+
-		`"model_map_env_file":%q,"model":%q}`, bedrockSelector, awsProfile, mapEnvName, model)
+		`"model_map_env_file":%q,"model":%q,"strip_betas":%s}`,
+		bedrockSelector, awsProfile, mapEnvName, bedrockModel, names)
 }
 
 func sigv4DefaultRegistry(name string) []byte {
@@ -154,7 +160,7 @@ func bedrockConfig(t *testing.T, client *http.Client, rec proxy.Recorder) proxy.
 	t.Helper()
 
 	return proxy.Config{
-		Registry: newRegistry(t, sigv4Seat(bedrockModel)),
+		Registry: newRegistry(t, sigv4Seat()),
 		Recorder: rec,
 		Client:   client,
 		Logger:   nil,
@@ -567,6 +573,150 @@ func TestSigV4RefusesNonMessagesPaths(t *testing.T) {
 			assertNoCredentialMaterial(t, recorder.wait(t))
 		})
 	}
+}
+
+// TestSigV4MovesBetaFlagsIntoTheBody pins where Bedrock reads beta flags: the
+// caller's header — every value of it, comma-split — lands in the body's
+// anthropic_beta list, joined with whatever the body already named, deduplicated,
+// minus what the Seat strips; and the header itself is not signed through,
+// because Bedrock never reads it.
+func TestSigV4MovesBetaFlagsIntoTheBody(t *testing.T) {
+	const okBody = `{"id":"msg_1","content":[{"type":"text"}],"usage":{"input_tokens":3,"output_tokens":4},` +
+		`"stop_reason":"end_turn"}`
+
+	cases := []struct {
+		name      string
+		seat      string
+		header    []string
+		body      string
+		wantBetas []any
+	}{
+		{
+			name:   "header flags move into the body",
+			seat:   sigv4Seat(),
+			header: []string{"context-management-2025-06-27, effort-2025-11-24"},
+			body: `{"model":"bedrock/sonnet","max_tokens":5,"messages":[{"role":"user","content":"hi"}],` +
+				`"context_management":{"edits":[]}}`,
+			wantBetas: []any{"context-management-2025-06-27", "effort-2025-11-24"},
+		},
+		{
+			name:   "every header value counts and the body list comes first",
+			seat:   sigv4Seat(),
+			header: []string{"effort-2025-11-24", "context-1m-2025-08-07,effort-2025-11-24"},
+			body: `{"model":"bedrock/sonnet","max_tokens":5,"messages":[{"role":"user","content":"hi"}],` +
+				`"anthropic_beta":["interleaved-thinking-2025-05-14"]}`,
+			wantBetas: []any{"interleaved-thinking-2025-05-14", "effort-2025-11-24", "context-1m-2025-08-07"},
+		},
+		{
+			name:   "stripped flags are withheld wherever they were named",
+			seat:   sigv4Seat("advisor-tool-2026-03-01", "prompt-caching-scope-2026-01-05"),
+			header: []string{"context-1m-2025-08-07,advisor-tool-2026-03-01"},
+			body: `{"model":"bedrock/sonnet","max_tokens":5,"messages":[{"role":"user","content":"hi"}],` +
+				`"anthropic_beta":["prompt-caching-scope-2026-01-05","effort-2025-11-24"]}`,
+			wantBetas: []any{"effort-2025-11-24", "context-1m-2025-08-07"},
+		},
+		{
+			name:      "no flags anywhere means no list",
+			seat:      sigv4Seat(),
+			header:    nil,
+			body:      `{"model":"bedrock/sonnet","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}`,
+			wantBetas: nil,
+		},
+		{
+			name:      "a list stripped empty is removed rather than sent empty",
+			seat:      sigv4Seat("advisor-tool-2026-03-01"),
+			header:    []string{"advisor-tool-2026-03-01"},
+			body:      `{"model":"bedrock/sonnet","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}`,
+			wantBetas: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stub, client, _ := bedrockSetup(t, jsonHandler(http.StatusOK, okBody))
+			cfg := bedrockConfig(t, client, newRecorder())
+			cfg.Registry = newRegistry(t, tc.seat)
+
+			req := messagesRequest(tc.body)
+			for _, value := range tc.header {
+				req.Header.Add("Anthropic-Beta", value)
+			}
+
+			answer := serve(t, cfg, req)
+			if answer.Code != http.StatusOK {
+				t.Fatalf("status = %d (%s); want 200", answer.Code, answer.Body.String())
+			}
+
+			call := stub.call(t)
+
+			if got := call.header.Values("Anthropic-Beta"); len(got) != 0 {
+				t.Errorf("Anthropic-Beta header = %q; want it withheld, Bedrock reads the body", got)
+			}
+
+			var sent map[string]any
+			if err := json.Unmarshal(call.body, &sent); err != nil {
+				t.Fatalf("decode translated body %q: %v", call.body, err)
+			}
+
+			got, present := sent["anthropic_beta"]
+			if tc.wantBetas == nil {
+				if present {
+					t.Fatalf("anthropic_beta = %v; want the field absent", got)
+				}
+
+				return
+			}
+
+			list, isList := got.([]any)
+			if !isList || !equalAny(list, tc.wantBetas) {
+				t.Errorf("anthropic_beta = %v; want %v", got, tc.wantBetas)
+			}
+		})
+	}
+}
+
+// TestSigV4RefusesAMalformedBetaList is the caller's own error refused on its
+// face: a body anthropic_beta that is not an array of strings never reaches
+// Bedrock and never costs a credential export.
+func TestSigV4RefusesAMalformedBetaList(t *testing.T) {
+	stub, client, logPath := bedrockSetup(t, jsonHandler(http.StatusOK, `{}`))
+	cfg := bedrockConfig(t, client, newRecorder())
+
+	answer := serve(t, cfg, messagesRequest(
+		`{"model":"bedrock/sonnet","max_tokens":5,"messages":[{"role":"user","content":"hi"}],`+
+			`"anthropic_beta":"effort-2025-11-24"}`))
+
+	if answer.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d (%s); want 400", answer.Code, answer.Body.String())
+	}
+
+	if body := answer.Body.String(); !strings.Contains(body, "anthropic_beta") ||
+		!strings.Contains(body, "invalid_request_error") {
+		t.Errorf("body = %s; want it to name anthropic_beta as an invalid request", body)
+	}
+
+	if got := stub.hits(); got != 0 {
+		t.Errorf("upstream received %d requests; want 0", got)
+	}
+
+	if got := execCount(t, logPath); got != 0 {
+		t.Errorf("aws ran %d times; want 0", got)
+	}
+}
+
+// equalAny compares two decoded JSON arrays element by element.
+func equalAny(got, want []any) bool {
+	if len(got) != len(want) {
+		return false
+	}
+
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func TestSigV4TranslatesAStreamToSSE(t *testing.T) {

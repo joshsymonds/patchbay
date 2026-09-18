@@ -139,6 +139,7 @@ by ID.
 | `strip_cache_control` | Recursively removes object fields named `cache_control`. |
 | `capture_bodies` | Stores rewritten request and captured response bodies in ledger v2. |
 | `speed` | `fast` requests the upstream's fast tier on every request: Anthropic fast mode on a Claude upstream, the Codex priority tier through CLIProxyAPI, which maps this field. Written after `extra_body`, so the Seat value wins over the caller's and over `extra_body`. Not allowed on `sigv4`. |
+| `strip_betas` | Beta flags a `sigv4` Seat withholds from Bedrock. The Bedrock translation moves every flag the caller sent, by header or in the body, into the body's `anthropic_beta` list, and Bedrock refuses the whole request over any flag it does not know; this names those. Each entry is an exact flag name with no surrounding whitespace. Only allowed on `sigv4`. |
 
 For `forward` and `inject`, the original request bytes are preserved unless the
 Seat sets `model`, `extra_body`, `strip_cache_control`, `max_output_tokens`, or
@@ -156,6 +157,7 @@ those operations. SigV4 always performs an additional Bedrock translation. See
 | `billing` | Forbidden | Required | Forbidden |
 | `insecure` | Forbidden | Non-loopback HTTP only | Forbidden |
 | AWS fields | Forbidden | Forbidden | Profile, region, and model-map variable required |
+| `strip_betas` | Forbidden | Forbidden | Allowed |
 | `claude` in Seat rewrite | Allowed | Forbidden, case-insensitive | Allowed |
 
 All token ceilings must be non-negative. `extra_body` must be an object when

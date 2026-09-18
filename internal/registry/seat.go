@@ -55,6 +55,13 @@ type Seat struct {
 	// carries: empty for the upstream's default, SpeedFast for its fast tier.
 	// It is seat policy, so it replaces whatever the caller sent.
 	Speed string
+
+	// StripBetas names the beta flags a sigv4 seat withholds from Bedrock. The
+	// Bedrock translation moves every flag the caller sent, by header or in
+	// the body, into the body's anthropic_beta list, and Bedrock refuses the
+	// whole request over any flag it does not know; this is where the operator
+	// names those.
+	StripBetas []string
 }
 
 // EffectiveUpstream is the API root this seat reaches.
