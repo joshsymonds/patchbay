@@ -18,7 +18,7 @@ const validRegistry = `{
   "default_context":"personal",
   "seats":{
     "anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},
-    "luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"OPENROUTER_API_KEY_FILE"},
+    "luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"OPENROUTER_API_KEY_FILE"},
     "sol":{"upstream":"https://openrouter.ai/api","model":"openrouter/sol-1","auth_mode":"inject","billing":"metered","api_key_env_file":"OPENROUTER_API_KEY_FILE"},
     "bedrock":{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"BEDROCK_MODEL_MAP_FILE"}
   },
@@ -54,7 +54,7 @@ func TestNewLoadsRequiredGlobalSeatsAndContexts(t *testing.T) {
 		t.Fatalf("Resolve() = %v", err)
 	}
 	if res.Context != "personal" || res.SeatID != "luna" ||
-		res.Seat.Model != "openai/gpt-5.6-luna" {
+		res.Seat.Model != "openai/gpt-6-luna" {
 		t.Fatalf("resolution = %+v", res)
 	}
 	if res.Match.Kind != registry.SelectionModel || res.Match.Model == nil ||
@@ -245,7 +245,7 @@ const rejectedValue = "sk-live-secret"
 // variable name at all.
 const secretRegistry = `{
   "default_context":"personal",
-  "seats":{"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"` + rejectedValue + `"}},
+  "seats":{"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"` + rejectedValue + `"}},
   "contexts":{"personal":{"default_seat":"luna","models":{"luna-fast":"luna"}}}
 }`
 
@@ -737,7 +737,7 @@ func TestStateAndResolutionHandOutIsolatedCopies(t *testing.T) {
 	state := reg.State()
 	state.Seats["luna"] = registry.Seat{Model: "tampered"}
 	delete(state.Contexts, "personal")
-	if again := reg.State(); again.Seats["luna"].Model != "openai/gpt-5.6-luna" ||
+	if again := reg.State(); again.Seats["luna"].Model != "openai/gpt-6-luna" ||
 		len(again.Contexts) != 2 {
 		t.Fatalf("State() was mutated through a previous caller's copy: %+v", again)
 	}
@@ -828,7 +828,7 @@ func TestResolveStateSnapshotsTheStateItWasGiven(t *testing.T) {
 	delete(state.Contexts, "personal")
 	state.DefaultContext = "tampered"
 
-	if res.SeatID != "luna" || res.Seat.Model != "openai/gpt-5.6-luna" ||
+	if res.SeatID != "luna" || res.Seat.Model != "openai/gpt-6-luna" ||
 		string(res.Seat.ExtraBody) != wantExtraBody {
 		t.Errorf("selected Seat = %+v; want the pre-mutation snapshot", res.Seat)
 	}

@@ -18,7 +18,7 @@ func TestExtraBodyPreservesSeatModelRewrite(t *testing.T) {
 	rec := serve(t, proxy.Config{
 		Registry: newRegistryDocument(t, []byte(fmt.Sprintf(
 			`{"default_context":"personal","seats":{"rewriter":{"upstream":%q,`+
-				`"model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":%q,`+
+				`"model":"openai/gpt-6-luna","auth_mode":"inject","api_key_env_file":%q,`+
 				`"billing":"metered","extra_body":{"reasoning_effort":"low"}}},`+
 				`"contexts":{"personal":{"default_seat":"rewriter","models":{}}}}`,
 			stub.url(), keyEnvName,
@@ -35,7 +35,7 @@ func TestExtraBodyPreservesSeatModelRewrite(t *testing.T) {
 	if err := json.Unmarshal(stub.call(t).body, &body); err != nil {
 		t.Fatalf("decode upstream body: %v", err)
 	}
-	if got := string(body["model"]); got != `"openai/gpt-5.6-luna"` {
+	if got := string(body["model"]); got != `"openai/gpt-6-luna"` {
 		t.Fatalf("upstream model = %s; want Seat model rewrite", got)
 	}
 	if got := string(body["reasoning_effort"]); got != `"low"` {
@@ -131,7 +131,7 @@ func refuseRewrittenBody(t *testing.T, body string) string {
 	rec := serve(t, proxy.Config{
 		Registry: newRegistryDocument(t, []byte(fmt.Sprintf(
 			`{"default_context":"personal","seats":{"rewriter":{"upstream":%q,`+
-				`"model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":%q,`+
+				`"model":"openai/gpt-6-luna","auth_mode":"inject","api_key_env_file":%q,`+
 				`"billing":"metered"}},`+
 				`"contexts":{"personal":{"default_seat":"rewriter","models":{}}}}`,
 			stub.url(), keyEnvName,

@@ -20,7 +20,7 @@ func TestUniqueDocumentsAreAccepted(t *testing.T) {
 	for _, tc := range []struct{ name, data string }{
 		{name: "an empty object", data: `{}`},
 		{name: "an empty array", data: `[]`},
-		{name: "a bare scalar", data: `"gpt-5.6-sol"`},
+		{name: "a bare scalar", data: `"gpt-6-sol"`},
 		{name: "a bare null", data: `null`},
 		{name: "one flat object", data: `{"effort":"low","temperature":1}`},
 		{

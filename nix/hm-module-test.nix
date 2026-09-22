@@ -144,8 +144,8 @@ self: {
       port = 8317;
       listenerKey = "patchbay-local";
       bindings = {
-        "chatgpt/sol" = "gpt-5.6-sol";
-        "chatgpt/luna" = "gpt-5.6-luna";
+        "chatgpt/sol" = "gpt-6-sol";
+        "chatgpt/luna" = "gpt-6-luna";
       };
       contexts = [ "personal" ];
     };
@@ -197,7 +197,7 @@ self: {
       });
 
   claudeTarget = target: oneBinding "chatgpt/sol" target;
-  claudeSelector = selector: oneBinding selector "gpt-5.6-sol";
+  claudeSelector = selector: oneBinding selector "gpt-6-sol";
 
   # The selector half is about the document that comes out, not the option that
   # went in. A hand-written binding of the same selector wins, so a generated
@@ -221,7 +221,7 @@ self: {
               ) baseRegistry.contexts;
           };
         codexUpstream = enabledSettings.codexUpstream // {
-          bindings = { ${bridgeSelector} = "gpt-5.6-sol"; };
+          bindings = { ${bridgeSelector} = "gpt-6-sol"; };
           inherit contexts;
         };
       });
@@ -382,7 +382,7 @@ self: {
     }
     {
       name = "a target with claude embedded in it fails its assertion";
-      ok = assertionFor (claudeTarget "gpt-5.6-CLAUDE-bridge") targetFragment == false;
+      ok = assertionFor (claudeTarget "gpt-6-CLAUDE-bridge") targetFragment == false;
     }
     {
       name = "the configured GPT targets pass the target assertion";
@@ -410,11 +410,11 @@ self: {
     # gateway that will not load its own generated registry.
     {
       name = "an empty generated selector fails its assertion";
-      ok = assertionFor (oneBinding "" "gpt-5.6-sol") emptySelectorFragment == false;
+      ok = assertionFor (oneBinding "" "gpt-6-sol") emptySelectorFragment == false;
     }
     {
       name = "an ordinary generated selector passes the empty-selector assertion";
-      ok = assertionFor (oneBinding "chatgpt/sol" "gpt-5.6-sol") emptySelectorFragment == true;
+      ok = assertionFor (oneBinding "chatgpt/sol" "gpt-6-sol") emptySelectorFragment == true;
     }
     {
       name = "the configured selectors pass the empty-selector assertion";
@@ -517,9 +517,9 @@ in
           and .billing == "subscription"
           and .upstream == "http://127.0.0.1:8317"
           and .api_key_env_file == "PATCHBAY_CHATGPT_KEY_FILE"
-          and .model == "gpt-5.6-sol"
+          and .model == "gpt-6-sol"
           and .max_input_tokens == 372000)
-         and (.seats[$luna] | .model == "gpt-5.6-luna"
+         and (.seats[$luna] | .model == "gpt-6-luna"
            and .auth_mode == "inject"
            and .billing == "subscription")'
 

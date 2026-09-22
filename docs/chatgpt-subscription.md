@@ -95,6 +95,13 @@ $ curl -fsS -H 'Authorization: Bearer patchbay-local' \
 
 Model IDs can change. Use one returned by this endpoint.
 
+This list is CLIProxyAPI's built-in registry, not a live read of your
+subscription, and CLIProxyAPI refuses an ID its registry lacks
+(`unknown provider for model ...`). A newly released model therefore needs a
+newer CLIProxyAPI. The Codex backend also lists new models only to recent
+clients: gpt-6-sol and gpt-6-luna first appear for `client_version` 0.155.0.
+Update CLIProxyAPI before a model you expect is missing here.
+
 ### 5. Add the Seat and binding
 
 Create the listener-key file:
@@ -110,7 +117,7 @@ Add a global Seat:
 ```json
 "chatgpt-sol": {
   "upstream": "http://127.0.0.1:8317",
-  "model": "gpt-5.6-sol",
+  "model": "gpt-6-sol",
   "auth_mode": "inject",
   "api_key_env_file": "PATCHBAY_CHATGPT_KEY_FILE",
   "billing": "subscription",
@@ -147,8 +154,8 @@ The module can generate the global Seats and selected Context bindings:
 services.patchbay.codexUpstream = {
   enable = true;
   bindings = {
-    "chatgpt/sol" = "gpt-5.6-sol";
-    "chatgpt/luna" = "gpt-5.6-luna";
+    "chatgpt/sol" = "gpt-6-sol";
+    "chatgpt/luna" = "gpt-6-luna";
   };
   contexts = [ "personal" ];
 };

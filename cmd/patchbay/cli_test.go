@@ -110,7 +110,7 @@ func sampleDocument() server.Document {
 			"luna": {
 				AuthMode:       "inject",
 				Upstream:       "https://openrouter.ai/api",
-				Model:          "openai/gpt-5.6-luna",
+				Model:          "openai/gpt-6-luna",
 				APIKeyEnvFile:  "OPENROUTER_API_KEY_FILE",
 				MaxInputTokens: 262144,
 			},
@@ -419,7 +419,7 @@ func TestSeatsAndBindingsTables(t *testing.T) {
 		},
 		{
 			`"luna"`, `"inject"`, `"https://openrouter.ai/api"`,
-			`"openai/gpt-5.6-luna"`, "262144", `"OPENROUTER_API_KEY_FILE"`,
+			`"openai/gpt-6-luna"`, "262144", `"OPENROUTER_API_KEY_FILE"`,
 		},
 		{
 			`"worker"`, `"inject"`, `"https://openrouter.ai/api"`,
@@ -475,7 +475,7 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				"seat: \"luna\"\n" +
 				"auth_mode: \"inject\"\n" +
 				"upstream: \"https://openrouter.ai/api\"\n" +
-				"model: \"openai/gpt-5.6-luna\"\n" +
+				"model: \"openai/gpt-6-luna\"\n" +
 				"speed: null\n" +
 				"config_source: \"OPENROUTER_API_KEY_FILE\"\n" +
 				"api_key_env_file: \"OPENROUTER_API_KEY_FILE\"\n" +
@@ -1211,7 +1211,7 @@ const replacedValue = "sk-live-secret"
 // valid registry: a document the gateway refuses, whose validation error names
 // the field and the value behind the refusal.
 const replacedRegistry = `{"default_context":"personal","seats":{` +
-	`"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna",` +
+	`"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-6-luna",` +
 	`"auth_mode":"inject","api_key_env_file":"` + replacedValue + `"}},` +
 	`"contexts":{"personal":{"default_seat":"luna","models":{}}}}`
 

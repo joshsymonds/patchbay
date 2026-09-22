@@ -129,7 +129,7 @@ SEAT                  AUTH_MODE  UPSTREAM                                       
 "anthropic"           "forward"  "https://api.anthropic.com"                        null                  null              "caller"
 "openrouter-glm-4-6"  "inject"   "https://openrouter.ai/api"                        "z-ai/glm-4.6"        200000            "PATCHBAY_OPENROUTER_KEY_FILE"
 "openrouter-kimi-k2"  "inject"   "https://openrouter.ai/api"                        "moonshotai/kimi-k2"  262144            "PATCHBAY_OPENROUTER_KEY_FILE"
-"sol-subscription"    "inject"   "http://127.0.0.1:8317"                            "gpt-5.6-sol"         372000            "PATCHBAY_CHATGPT_KEY_FILE"
+"sol-subscription"    "inject"   "http://127.0.0.1:8317"                            "gpt-6-sol"         372000            "PATCHBAY_CHATGPT_KEY_FILE"
 "work-bedrock"        "sigv4"    "https://bedrock-runtime.us-west-2.amazonaws.com"  null                  null              "aws_profile:work-bedrock"
 "work-bedrock-opus"   "sigv4"    "https://bedrock-runtime.us-west-2.amazonaws.com"  "claude-opus-4-5"     200000            "aws_profile:work-bedrock"
 ```
@@ -215,7 +215,7 @@ selection_model: "claude-opus-5"
 seat: "sol-subscription"
 auth_mode: "inject"
 upstream: "http://127.0.0.1:8317"
-model: "gpt-5.6-sol"
+model: "gpt-6-sol"
 speed: null
 config_source: "PATCHBAY_CHATGPT_KEY_FILE"
 api_key_env_file: "PATCHBAY_CHATGPT_KEY_FILE"

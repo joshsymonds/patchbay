@@ -70,7 +70,7 @@ func validRecord(t *testing.T) ledger.Record {
 		Selection:       &ledger.Selection{Kind: ledger.SelectionModel, Model: model("luna-fast")},
 		Seat:            "luna",
 		Upstream:        "https://openrouter.ai/api",
-		Model:           model("openai/gpt-5.6-luna"),
+		Model:           model("openai/gpt-6-luna"),
 		RequestModel:    model("luna-fast"),
 		AuthMode:        "inject",
 		ConfigSource:    "OPENROUTER_API_KEY_FILE",
@@ -291,7 +291,7 @@ func TestPreSelectionWireOmitsModelAndSpellsAbsenceByOmission(t *testing.T) {
 		t.Fatalf("request_model encoded as %s; want the exact requested model", got)
 	}
 
-	for _, value := range []string{"null", `"openai/gpt-5.6-luna"`} {
+	for _, value := range []string{"null", `"openai/gpt-6-luna"`} {
 		carrying := wireObject(t, rec)
 		carrying["model"] = json.RawMessage(value)
 		scanRejects(t, carrying, "a pre-selection record carried model "+value)
@@ -350,7 +350,7 @@ func TestNoncanonicalModelPointersAreRefused(t *testing.T) {
 	}
 
 	pre = preSelectionRecord(t)
-	pre.Model = model("openai/gpt-5.6-luna")
+	pre.Model = model("openai/gpt-6-luna")
 	if err := pre.Validate(); err == nil {
 		t.Error("pre-selection record naming a model validated")
 	}
@@ -1229,7 +1229,7 @@ func TestScanKeepsNoValueFromARepeatedMember(t *testing.T) {
 	t.Parallel()
 
 	rec := validRecord(t)
-	rec.Model = model("openai/gpt-5.6-luna")
+	rec.Model = model("openai/gpt-6-luna")
 
 	dir := t.TempDir()
 	writeRawDayFile(t, dir, appendMember(t, rec, `"model":"decoy-last"`))

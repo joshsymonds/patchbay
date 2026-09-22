@@ -24,7 +24,7 @@ import (
 
 const testRegistry = `{"default_context":"personal","seats":{` +
 	`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},` +
-	`"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":"KEY","billing":"metered"}},` +
+	`"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-6-luna","auth_mode":"inject","api_key_env_file":"KEY","billing":"metered"}},` +
 	`"contexts":{"personal":{"default_seat":"anthropic","models":{"luna-fast":"luna"}},` +
 	`"work":{"default_seat":"anthropic","models":{}}}}`
 

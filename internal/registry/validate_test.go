@@ -995,7 +995,7 @@ func TestSeatExtraBodyReservesTopLevelModel(t *testing.T) {
 	runSeatCases(t, []seatCase{
 		{
 			name:  "inject seat with rewrite",
-			seat:  `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","extra_body":{"model":"x"}}`,
+			seat:  `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","extra_body":{"model":"x"}}`,
 			wants: []string{"extra_body", "model"},
 		},
 		{
@@ -1010,11 +1010,11 @@ func TestSeatExtraBodyReservesTopLevelModel(t *testing.T) {
 		},
 		{
 			name: "nested model accepted",
-			seat: `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","extra_body":{"provider":{"model":"x"}}}`,
+			seat: `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","extra_body":{"provider":{"model":"x"}}}`,
 		},
 		{
 			name: "case-sensitive Model accepted",
-			seat: `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","extra_body":{"Model":"x"}}`,
+			seat: `{"upstream":"https://openrouter.ai/api","model":"openai/gpt-6-luna","auth_mode":"inject","billing":"metered","api_key_env_file":"KEY_FILE","extra_body":{"Model":"x"}}`,
 		},
 	})
 }

@@ -14,7 +14,7 @@ import (
 func modelRegistry(defaultContext string) string {
 	return `{"default_context":"` + defaultContext + `","seats":{` +
 		`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},` +
-		`"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-5.6-luna","auth_mode":"inject","api_key_env_file":"KEY","billing":"metered","max_input_tokens":262144,"max_output_tokens":65536},` +
+		`"luna":{"upstream":"https://openrouter.ai/api","model":"openai/gpt-6-luna","auth_mode":"inject","api_key_env_file":"KEY","billing":"metered","max_input_tokens":262144,"max_output_tokens":65536},` +
 		`"pin":{"upstream":"https://api.anthropic.com","model":"claude-sonnet-5","auth_mode":"forward"},` +
 		`"bedrock":{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MODEL_MAP"},` +
 		`"sub":{"upstream":"https://openrouter.ai/api","model":"openrouter/worker","auth_mode":"inject","api_key_env_file":"KEY","billing":"metered"}},` +
@@ -187,7 +187,7 @@ func TestInjectAndSigV4DefaultSeatModelSemantics(t *testing.T) {
 		decodeList(t, inject.Body.Bytes()),
 	); !reflect.DeepEqual(
 		got,
-		[]string{"public-luna", "openai/gpt-5.6-luna"},
+		[]string{"public-luna", "openai/gpt-6-luna"},
 	) {
 		t.Fatalf("inject ids=%v", got)
 	}
@@ -218,7 +218,7 @@ func TestModelDetailUsesPublicBindingThenDefaultSemantics(t *testing.T) {
 		ctx, id string
 		want    int
 	}{
-		{"inject", "public-luna", http.StatusOK}, {"inject", "openai%2Fgpt-5.6-luna", http.StatusOK}, {"inject", "requested-worker", http.StatusNotFound}, {"inject", "luna", http.StatusNotFound},
+		{"inject", "public-luna", http.StatusOK}, {"inject", "openai%2Fgpt-6-luna", http.StatusOK}, {"inject", "requested-worker", http.StatusNotFound}, {"inject", "luna", http.StatusNotFound},
 	} {
 		rec := serve(
 			t,

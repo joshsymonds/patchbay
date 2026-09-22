@@ -294,8 +294,8 @@ in {
         default = { };
         example = lib.literalExpression ''
           {
-            "chatgpt/sol" = "gpt-5.6-sol";
-            "chatgpt/luna" = "gpt-5.6-luna";
+            "chatgpt/sol" = "gpt-6-sol";
+            "chatgpt/luna" = "gpt-6-luna";
           }
         '';
         description = ''

@@ -46,7 +46,7 @@
     },
     "sol-subscription": {
       "upstream": "http://127.0.0.1:8317",
-      "model": "gpt-5.6-sol",
+      "model": "gpt-6-sol",
       "auth_mode": "inject",
       "api_key_env_file": "PATCHBAY_CHATGPT_KEY_FILE",
       "billing": "subscription",
