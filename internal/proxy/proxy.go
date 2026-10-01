@@ -90,6 +90,19 @@ const (
 	// timeout above: once the headers arrive the body streams with no deadline,
 	// so a long thinking turn is never truncated by it.
 	responseHeaderTimeout = 10 * time.Minute
+
+	// h2PingAfter and h2PingTimeout are the HTTP/2 health check on pooled
+	// connections: after h2PingAfter with no frame from the upstream the client
+	// sends a PING, and closes the connection if no frame answers within
+	// h2PingTimeout. Every request multiplexes onto one connection per host, and
+	// TCP keepalive never probes a socket with unacknowledged data, so without
+	// this a connection whose path died — a VPN tunnel torn down under its source
+	// address, a NAT entry expired — keeps accepting new requests for the
+	// kernel's ~15-minute retransmission budget and every one of them hangs. A
+	// healthy upstream answers a PING mid-stream, so a long thinking turn is
+	// never cut short by it.
+	h2PingAfter   = 15 * time.Second
+	h2PingTimeout = 10 * time.Second
 )
 
 // Recorder persists one ledger record per proxied request. *ledger.Ledger
@@ -870,6 +883,13 @@ func readFailureStatus(err error) int {
 // pipeline owes the caller byte for byte, and following one would replace it
 // with something else's.
 func defaultClient() *http.Client {
+	return newClient(h2PingAfter, h2PingTimeout)
+}
+
+// newClient builds defaultClient with the HTTP/2 health-check timings as
+// parameters, so a test can watch a dead connection get dropped in
+// milliseconds instead of waiting out the production values.
+func newClient(pingAfter, pingTimeout time.Duration) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
@@ -881,6 +901,10 @@ func defaultClient() *http.Client {
 			TLSHandshakeTimeout:   handshakeTimeout,
 			ExpectContinueTimeout: continueTimeout,
 			ResponseHeaderTimeout: responseHeaderTimeout,
+			HTTP2: &http.HTTP2Config{
+				SendPingTimeout: pingAfter,
+				PingTimeout:     pingTimeout,
+			},
 		},
 		CheckRedirect: relayRedirect,
 		Jar:           nil,
