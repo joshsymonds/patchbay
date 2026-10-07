@@ -111,8 +111,14 @@ func BedrockEndpoint(region string) string {
 }
 
 // Subagents is the policy applied only to positively marked subagent requests.
+//
+// AgentTypes binds the agent type Claude Code reports for marked traffic (the
+// built-in Explore, say) to a Seat, ahead of Models: a built-in agent that
+// inherits its session's model names that model on the wire, so the model
+// alone cannot tell it apart from the session it serves.
 type Subagents struct {
 	DefaultSeat string
+	AgentTypes  map[string]string
 	Models      map[string]string
 }
 

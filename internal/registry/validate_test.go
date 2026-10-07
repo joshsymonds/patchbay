@@ -147,6 +147,10 @@ func TestSubagentsStrictFields(t *testing.T) {
 		{name: "missing default_seat", subagents: `{"models":{}}`, wants: []string{"default_seat"}},
 		{name: "null models", subagents: `{"default_seat":"x","models":null}`, wants: []string{"models", "null"}},
 		{name: "unknown field", subagents: `{"default_seat":"x","bogus":true}`, wants: []string{"unknown field", "bogus"}},
+		{name: "null agent_types", subagents: `{"default_seat":"x","agent_types":null}`, wants: []string{"agent_types", "null"}},
+		{name: "agent type unknown seat", subagents: `{"default_seat":"x","agent_types":{"Explore":"missing"}}`, wants: []string{"agent_types", "Explore", "missing"}},
+		{name: "agent type with a space", subagents: `{"default_seat":"x","agent_types":{"Ex plore":"x"}}`, wants: []string{"agent_types", "Ex plore"}},
+		{name: "empty agent type", subagents: `{"default_seat":"x","agent_types":{"":"x"}}`, wants: []string{"agent_types"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

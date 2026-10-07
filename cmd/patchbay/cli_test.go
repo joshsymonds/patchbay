@@ -127,6 +127,7 @@ func sampleDocument() server.Document {
 				Models:      map[string]string{"luna-fast": "luna"},
 				Subagents: &server.SubagentsSummary{
 					DefaultSeat: "worker",
+					AgentTypes:  map[string]string{"Explore": "luna"},
 					Models:      map[string]string{"requested": "worker"},
 				},
 			},
@@ -337,7 +338,7 @@ func TestResolveKeepsOpaqueModelsOnOneLine(t *testing.T) {
 			t.Errorf("resolve %q emitted a blank line, so a value ended one: %q", value, got.stdout)
 		}
 		// One line per field, whatever bytes the selector carries.
-		if want := 20; len(lines(got.stdout)) != want {
+		if want := 21; len(lines(got.stdout)) != want {
 			t.Errorf("resolve %q printed %d lines; want %d\n%s",
 				value, len(lines(got.stdout)), want, got.stdout)
 		}
@@ -361,7 +362,8 @@ func TestCLIHelpUsesSeatsBindingsAndSubagentResolve(t *testing.T) {
 // TestContextsTableCountsBindingsAndSubagentBindings pins the successful
 // listing whole: the columns it has, the order the rows come in, and what each
 // count means. Contexts sort by ID, BINDINGS counts public `models` entries,
-// and SUBAGENT_BINDINGS counts exact marked bindings plus the marked default —
+// and SUBAGENT_BINDINGS counts exact marked bindings (agent types and models)
+// plus the marked default —
 // zero for a Context carrying no marked policy at all.
 //
 // Every cell here is a registry ID or a count, so the whole table is compared
@@ -378,7 +380,8 @@ func TestContextsTableCountsBindingsAndSubagentBindings(t *testing.T) {
 
 	want := [][]string{
 		{"CONTEXT", "DEFAULT_SEAT", "BINDINGS", "SUBAGENT_BINDINGS"},
-		{"personal", "anthropic", "1", "2"},
+		// default + one agent-type binding + one model binding
+		{"personal", "anthropic", "1", "3"},
 		{"work", "luna", "0", "0"},
 	}
 	if rows := tableRows(got.stdout); !reflect.DeepEqual(rows, want) {
@@ -472,6 +475,7 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				"observation: \"none\"\n" +
 				"selection: \"model\"\n" +
 				"selection_model: \"luna-fast\"\n" +
+				"selection_agent_type: null\n" +
 				"seat: \"luna\"\n" +
 				"auth_mode: \"inject\"\n" +
 				"upstream: \"https://openrouter.ai/api\"\n" +
@@ -496,6 +500,7 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				"observation: \"subagent\"\n" +
 				"selection: \"subagent\"\n" +
 				"selection_model: \"requested\"\n" +
+				"selection_agent_type: null\n" +
 				"seat: \"worker\"\n" +
 				"auth_mode: \"inject\"\n" +
 				"upstream: \"https://openrouter.ai/api\"\n" +
@@ -507,6 +512,33 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				"aws_region: null\n" +
 				"model_map_env_file: null\n" +
 				"max_input_tokens: null\n" +
+				"max_output_tokens: null\n" +
+				"insecure: false\n" +
+				"strip_cache_control: false\n" +
+				"capture_bodies: false\n",
+		},
+		{
+			// The reported agent type outranks the exact model binding that
+			// the same request would otherwise match.
+			name: "agent type",
+			args: []string{"resolve", "--agent-type", "Explore", "personal", "requested"},
+			want: "context: \"personal\"\n" +
+				"request_model: \"requested\"\n" +
+				"observation: \"subagent\"\n" +
+				"selection: \"agent_type\"\n" +
+				"selection_model: null\n" +
+				"selection_agent_type: \"Explore\"\n" +
+				"seat: \"luna\"\n" +
+				"auth_mode: \"inject\"\n" +
+				"upstream: \"https://openrouter.ai/api\"\n" +
+				"model: \"openai/gpt-6-luna\"\n" +
+				"speed: null\n" +
+				"config_source: \"OPENROUTER_API_KEY_FILE\"\n" +
+				"api_key_env_file: \"OPENROUTER_API_KEY_FILE\"\n" +
+				"aws_profile: null\n" +
+				"aws_region: null\n" +
+				"model_map_env_file: null\n" +
+				"max_input_tokens: 262144\n" +
 				"max_output_tokens: null\n" +
 				"insecure: false\n" +
 				"strip_cache_control: false\n" +

@@ -130,6 +130,13 @@ func validateContext(id string, ctx *Context, seats map[string]Seat) error {
 	if ctx.Subagents == nil {
 		return nil
 	}
+	return validateSubagents(id, ctx, seats)
+}
+
+// validateSubagents checks a Context's marked-subagent policy: every binding
+// names a known Seat a marked request may be sent to, and every agent-type key
+// is a value the agent-type header could carry.
+func validateSubagents(id string, ctx *Context, seats map[string]Seat) error {
 	if err := requireSeat(
 		id,
 		"subagents default_seat",
@@ -145,6 +152,32 @@ func validateContext(id string, ctx *Context, seats map[string]Seat) error {
 		seats,
 	); err != nil {
 		return err
+	}
+	for _, agentType := range sortedKeys(ctx.Subagents.AgentTypes) {
+		if !ValidObservedID(agentType) {
+			return fmt.Errorf(
+				"context %q subagents agent_types key %q is not a header-observable agent type",
+				id,
+				agentType,
+			)
+		}
+		seatID := ctx.Subagents.AgentTypes[agentType]
+		if err := requireSeat(
+			id,
+			fmt.Sprintf("subagents agent_types agent type %q", agentType),
+			seatID,
+			seats,
+		); err != nil {
+			return err
+		}
+		if err := validateSubagentDestination(
+			id,
+			fmt.Sprintf("subagents agent type %q", agentType),
+			seatID,
+			seats,
+		); err != nil {
+			return err
+		}
 	}
 	for _, selector := range sortedKeys(ctx.Subagents.Models) {
 		if selector == "" {

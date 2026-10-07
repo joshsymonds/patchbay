@@ -368,6 +368,53 @@ func TestMarkedSubagentCallerKeyFailureRecordsSelectedSeat(t *testing.T) {
 	}
 }
 
+// TestMarkedAgentTypeSelectsAndRecordsItsBinding drives the reported agent type
+// through the pipeline: an Explore that inherited claude-opus-5, which the model
+// bindings would send to the Claude path, rides the agent-type binding instead,
+// and the record names that binding and the observed type.
+func TestMarkedAgentTypeSelectsAndRecordsItsBinding(t *testing.T) {
+	writeCallerKeyFile(t)
+	stub := newUpstream(t, jsonHandler(http.StatusOK, jsonTurn))
+	body := []byte(fmt.Sprintf(`{"default_context":"personal","seats":{`+
+		`"anthropic":{"upstream":"https://api.anthropic.com","auth_mode":"forward"},`+
+		`"worker":{"upstream":%q,"model":"vendor/worker","auth_mode":"inject",`+
+		`"api_key_env_file":%q,"billing":"metered"}},`+
+		`"contexts":{"personal":{"default_seat":"anthropic","models":{},`+
+		`"subagents":{"default_seat":"anthropic","agent_types":{"Explore":"worker"},`+
+		`"models":{"claude-opus-5":"anthropic"}}}}}`,
+		stub.url(), keyEnvName))
+	recorder := newRecorder()
+	req := messagesRequest(`{"model":"claude-opus-5"}`)
+	req.Header.Set(proxy.ClaudeCodeAgentIDHeader, "agent/one")
+	req.Header.Set(proxy.ClaudeCodeAgentTypeHeader, "Explore")
+	req.Header.Del(callerKeyHeader)
+
+	rec := serve(
+		t,
+		proxy.Config{Registry: newRegistryDocument(t, body), Recorder: recorder, Host: testHost},
+		req,
+	)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+	got := recorder.wait(t)
+	if got.Selection == nil || got.Selection.Kind != ledger.SelectionAgentType ||
+		got.Selection.Model != nil || got.Selection.AgentType == nil ||
+		*got.Selection.AgentType != "Explore" {
+		t.Fatalf("selection = %+v", got.Selection)
+	}
+	if got.Seat != "worker" || !modelIs(got.Model, "vendor/worker") ||
+		!modelIs(got.RequestModel, "claude-opus-5") {
+		t.Fatalf("selected fields = %+v", got)
+	}
+	if got.Subagent == nil || got.Subagent.AgentID != "agent/one" || got.Subagent.AgentType != "Explore" {
+		t.Fatalf("subagent = %+v", got.Subagent)
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("record does not validate: %v", err)
+	}
+}
+
 func TestCaptureBodiesRecordsBothBodies(t *testing.T) {
 	writeKeyFile(t, testAPIKey)
 

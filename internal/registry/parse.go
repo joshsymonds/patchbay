@@ -19,6 +19,7 @@ const (
 	fieldDefaultSeat       = "default_seat"
 	fieldModels            = "models"
 	fieldSubagents         = "subagents"
+	fieldAgentTypes        = "agent_types"
 	fieldUpstream          = "upstream"
 	fieldModel             = "model"
 	fieldAuthMode          = "auth_mode"
@@ -284,7 +285,7 @@ func parseSubagents(raw json.RawMessage) (Subagents, error) {
 	}
 	if fieldsErr := exactFields(
 		fields,
-		[]string{fieldDefaultSeat, fieldModels},
+		[]string{fieldDefaultSeat, fieldAgentTypes, fieldModels},
 		[]string{fieldDefaultSeat},
 	); fieldsErr != nil {
 		return Subagents{}, fieldsErr
@@ -296,6 +297,14 @@ func parseSubagents(raw json.RawMessage) (Subagents, error) {
 		fields[fieldDefaultSeat],
 	); decodeErr != nil {
 		return Subagents{}, decodeErr
+	}
+	out.AgentTypes = map[string]string{}
+	if rawAgentTypes, ok := fields[fieldAgentTypes]; ok {
+		agentTypes, agentTypesErr := parseBindings(fieldAgentTypes, rawAgentTypes)
+		if agentTypesErr != nil {
+			return Subagents{}, agentTypesErr
+		}
+		out.AgentTypes = agentTypes
 	}
 	out.Models = map[string]string{}
 	if rawModels, ok := fields[fieldModels]; ok {

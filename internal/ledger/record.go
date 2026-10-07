@@ -18,21 +18,25 @@ const maxErrorBodyBytes = 4096
 
 // Selection kinds explain which binding class selected a Seat.
 const (
-	SelectionModel    = "model"
-	SelectionSubagent = "subagent"
-	SelectionDefault  = "default"
+	SelectionModel     = "model"
+	SelectionAgentType = "agent_type"
+	SelectionSubagent  = "subagent"
+	SelectionDefault   = "default"
 )
 
 // Selection is the public resolution reason persisted for a selected request.
+// AgentType is present only on an agent_type selection.
 type Selection struct {
-	Kind  string  `json:"kind"`
-	Model *string `json:"model"`
+	Kind      string  `json:"kind"`
+	Model     *string `json:"model"`
+	AgentType *string `json:"agent_type,omitempty"`
 }
 
 // Subagent carries only positively validated Claude Code observation IDs.
 type Subagent struct {
 	AgentID       string `json:"agent_id"`
 	ParentAgentID string `json:"parent_agent_id,omitempty"`
+	AgentType     string `json:"agent_type,omitempty"`
 }
 
 // Record is one proxied request in the patchbay v2 JSONL schema.
@@ -291,7 +295,7 @@ func checkModelKeys(record Record, keys map[string]json.RawMessage) error {
 // second copy of this grammar: two copies is how a name one of them admits
 // becomes a record the other one drops.
 func SanitizeRequestedContext(value string) string {
-	if value == "" || validObservedID(value) {
+	if value == "" || registry.ValidObservedID(value) {
 		return value
 	}
 	return ""
@@ -329,11 +333,14 @@ func validateSubagent(subagent *Subagent) error {
 	if subagent == nil {
 		return nil
 	}
-	if !validObservedID(subagent.AgentID) {
+	if !registry.ValidObservedID(subagent.AgentID) {
 		return errors.New("ledger record has invalid subagent agent_id")
 	}
-	if subagent.ParentAgentID != "" && !validObservedID(subagent.ParentAgentID) {
+	if subagent.ParentAgentID != "" && !registry.ValidObservedID(subagent.ParentAgentID) {
 		return errors.New("ledger record has invalid subagent parent_agent_id")
+	}
+	if subagent.AgentType != "" && !registry.ValidObservedID(subagent.AgentType) {
+		return errors.New("ledger record has invalid subagent agent_type")
 	}
 	return nil
 }
@@ -364,7 +371,7 @@ func validatePreSelection(record Record) error {
 	if err := validateOptionalModel(record.RequestModel, "request_model"); err != nil {
 		return err
 	}
-	if record.Context != "" && !validObservedID(record.Context) {
+	if record.Context != "" && !registry.ValidObservedID(record.Context) {
 		return fmt.Errorf(
 			"pre-selection ledger record requested context %q is not a bounded printable name",
 			record.Context,
@@ -480,9 +487,21 @@ func validateMetrics(record Record) error {
 // selection names the exact marked binding that matched, or nothing at all when
 // marked traffic fell through to the marked-subagent default — the nil model is
 // the only thing distinguishing the unnamed fallback from an exact hit. An
-// ordinary Context default names no model either, and never may.
+// ordinary Context default names no model either, and never may. An agent_type
+// selection names the agent type its binding matched and no model; no other
+// kind names an agent type.
 func validateSelection(sel Selection) error {
+	if sel.Kind != SelectionAgentType && sel.AgentType != nil {
+		return fmt.Errorf("selection %s must not name an agent type", sel.Kind)
+	}
 	switch sel.Kind {
+	case SelectionAgentType:
+		if sel.AgentType == nil || *sel.AgentType == "" {
+			return errors.New("selection agent_type requires agent_type")
+		}
+		if sel.Model != nil {
+			return errors.New("selection agent_type requires null model")
+		}
 	case SelectionModel:
 		if sel.Model == nil || *sel.Model == "" {
 			return fmt.Errorf("selection %s requires model", sel.Kind)
@@ -538,18 +557,6 @@ func validAWSProfile(value string) bool {
 func isAWSProfileChar(char rune) bool {
 	return char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-' || char == '.' ||
 		char == '_'
-}
-
-func validObservedID(value string) bool {
-	if len(value) < 1 || len(value) > 256 {
-		return false
-	}
-	for _, char := range []byte(value) {
-		if char < 0x21 || char > 0x7e {
-			return false
-		}
-	}
-	return true
 }
 
 func truncateUTF8(text string, limit int) string {

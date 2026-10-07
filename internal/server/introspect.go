@@ -51,6 +51,7 @@ type ContextSummary struct {
 // SubagentsSummary is the optional positively marked traffic policy.
 type SubagentsSummary struct {
 	DefaultSeat string            `json:"default_seat"`
+	AgentTypes  map[string]string `json:"agent_types"`
 	Models      map[string]string `json:"models"`
 }
 
@@ -167,6 +168,7 @@ func (gw *gateway) document(ctx context.Context) Document {
 		if ctx.Subagents != nil {
 			summary.Subagents = &SubagentsSummary{
 				DefaultSeat: ctx.Subagents.DefaultSeat,
+				AgentTypes:  ctx.Subagents.AgentTypes,
 				Models:      ctx.Subagents.Models,
 			}
 		}

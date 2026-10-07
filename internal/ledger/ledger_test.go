@@ -541,6 +541,55 @@ func TestSelectionVocabularyAndModelNullability(t *testing.T) {
 	}
 }
 
+// TestAgentTypeSelectionNamesOnlyItsAgentType pins the agent_type kind: it
+// names the agent type its binding matched and no model, and no other kind may
+// name an agent type. The record also round-trips the observed agent type.
+func TestAgentTypeSelectionNamesOnlyItsAgentType(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		kind      string
+		model     *string
+		agentType *string
+		valid     bool
+	}{
+		{ledger.SelectionAgentType, nil, model("Explore"), true},
+		{ledger.SelectionAgentType, nil, nil, false},
+		{ledger.SelectionAgentType, nil, model(""), false},
+		{ledger.SelectionAgentType, model("claude-opus-5"), model("Explore"), false},
+		{ledger.SelectionSubagent, model("requested"), model("Explore"), false},
+		{ledger.SelectionModel, model("public"), model("Explore"), false},
+		{ledger.SelectionDefault, nil, model("Explore"), false},
+	} {
+		rec := validRecord(t)
+		rec.Selection = &ledger.Selection{Kind: tc.kind, Model: tc.model, AgentType: tc.agentType}
+		if got := rec.Validate() == nil; got != tc.valid {
+			t.Errorf("selection %+v valid=%v", rec.Selection, got)
+		}
+	}
+
+	rec := validRecord(t)
+	rec.Selection = &ledger.Selection{Kind: ledger.SelectionAgentType, AgentType: model("Explore")}
+	rec.Subagent = &ledger.Subagent{AgentID: "agent-1", AgentType: "Explore"}
+	led := openLedger(t, t.TempDir())
+	if err := led.Append(rec); err != nil {
+		t.Fatalf("Append() = %v", err)
+	}
+	got, err := led.Scan(testDay)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Scan() = %+v, %v", got, err)
+	}
+	if got[0].Selection.AgentType == nil || *got[0].Selection.AgentType != "Explore" ||
+		got[0].Selection.Model != nil || got[0].Subagent.AgentType != "Explore" {
+		t.Fatalf("round trip = selection %+v subagent %+v", got[0].Selection, got[0].Subagent)
+	}
+
+	bad := validRecord(t)
+	bad.Subagent = &ledger.Subagent{AgentID: "agent-1", AgentType: "general purpose"}
+	if bad.Validate() == nil {
+		t.Error("subagent agent_type with a space validated")
+	}
+}
+
 // TestSelectedModelsAreOpaqueExactStrings splits the two nonempty rules a
 // selected record carries, which are not the same rule.
 //

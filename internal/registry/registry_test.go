@@ -144,6 +144,95 @@ func TestResolveMarkedSubagentPrecedence(t *testing.T) {
 	}
 }
 
+func TestResolveMarkedAgentTypePrecedence(t *testing.T) {
+	t.Parallel()
+	reg := newRegistry(t, strings.Replace(
+		validRegistry,
+		`"subagents":{"default_seat":"sol","models"`,
+		`"subagents":{"default_seat":"sol","agent_types":{"Explore":"luna"},"models"`,
+		1,
+	))
+	personal := registry.Selection{Name: "personal", Explicit: true}
+
+	tests := []struct {
+		name          string
+		model         string
+		obs           *registry.SubagentObservation
+		wantSeat      string
+		wantKind      registry.SelectionKind
+		wantModel     *string
+		wantAgentType *string
+	}{
+		{
+			name:          "bound agent type outranks an exact model binding",
+			model:         "claude-opus-5",
+			obs:           &registry.SubagentObservation{AgentID: "a", AgentType: "Explore"},
+			wantSeat:      "luna",
+			wantKind:      registry.SelectionAgentType,
+			wantAgentType: ptr("Explore"),
+		},
+		{
+			name:      "public binding still wins over an agent type",
+			model:     "luna-fast",
+			obs:       &registry.SubagentObservation{AgentID: "a", AgentType: "Explore"},
+			wantSeat:  "luna",
+			wantKind:  registry.SelectionModel,
+			wantModel: ptr("luna-fast"),
+		},
+		{
+			name:      "unbound agent type falls to the model bindings",
+			model:     "claude-opus-5",
+			obs:       &registry.SubagentObservation{AgentID: "a", AgentType: "general-purpose"},
+			wantSeat:  "bedrock",
+			wantKind:  registry.SelectionSubagent,
+			wantModel: ptr("claude-opus-5"),
+		},
+		{
+			name:     "no reported agent type falls to the marked default",
+			model:    "unknown",
+			obs:      &registry.SubagentObservation{AgentID: "a"},
+			wantSeat: "sol",
+			wantKind: registry.SelectionSubagent,
+		},
+		{
+			name:     "unmarked traffic ignores agent types",
+			model:    "unknown",
+			wantSeat: "anthropic",
+			wantKind: registry.SelectionDefault,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			res, err := reg.Resolve(personal, tc.model, tc.obs)
+			if err != nil {
+				t.Fatalf("Resolve() = %v", err)
+			}
+			if res.SeatID != tc.wantSeat || res.Match.Kind != tc.wantKind ||
+				!reflect.DeepEqual(res.Match.Model, tc.wantModel) ||
+				!reflect.DeepEqual(res.Match.AgentType, tc.wantAgentType) {
+				t.Fatalf("resolution = seat %q match %+v", res.SeatID, res.Match)
+			}
+		})
+	}
+
+	// The State and a Resolution's policy both carry the binding, isolated.
+	state := reg.State()
+	got := state.Contexts["personal"].Subagents.AgentTypes
+	if !reflect.DeepEqual(got, map[string]string{"Explore": "luna"}) {
+		t.Fatalf("state agent_types = %v", got)
+	}
+	viaState, err := registry.ResolveState(state, personal, "claude-opus-5",
+		&registry.SubagentObservation{AgentID: "a", AgentType: "Explore"})
+	if err != nil || viaState.SeatID != "luna" || viaState.Match.Kind != registry.SelectionAgentType {
+		t.Fatalf("ResolveState() = %+v, %v", viaState, err)
+	}
+	viaState.SubagentPolicy().AgentTypes["Explore"] = "sol"
+	if again := viaState.SubagentPolicy().AgentTypes["Explore"]; again != "luna" {
+		t.Fatalf("SubagentPolicy() aliased its agent_types: %q", again)
+	}
+}
+
 func TestContextWithoutSubagentsUsesOrdinaryPolicyForMarkedTraffic(t *testing.T) {
 	t.Parallel()
 	reg := newRegistry(t, validRegistry)

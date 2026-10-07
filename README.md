@@ -49,19 +49,24 @@ ANTHROPIC_BASE_URL ----------> select Context
 Selection precedence is exact and shared by the gateway and CLI:
 
 1. exact `context.models` binding;
-2. valid marked subagent plus exact `context.subagents.models` binding;
-3. valid marked subagent plus `context.subagents.default_seat`;
-4. refusal of a protected foreign rewrite target;
-5. `context.default_seat`.
+2. valid marked subagent reporting an agent type bound in
+   `context.subagents.agent_types`;
+3. valid marked subagent plus exact `context.subagents.models` binding;
+4. valid marked subagent plus `context.subagents.default_seat`;
+5. refusal of a protected foreign rewrite target;
+6. `context.default_seat`.
 
-Steps 2 and 3 are both recorded as a `subagent` selection; step 3 names no model,
-which is the only thing distinguishing the unnamed marked fallback from an exact
-marked hit. Step 5 is recorded as a `default` selection, also naming no model.
+Step 2 is recorded as an `agent_type` selection naming the agent type. Steps 3
+and 4 are both recorded as a `subagent` selection; step 4 names no model, which
+is the only thing distinguishing the unnamed marked fallback from an exact marked
+hit. Step 6 is recorded as a `default` selection, also naming no model.
 
 Patchbay observes `x-claude-code-agent-id` only when exactly one value is present,
 it is 1–256 bytes, and every byte is printable ASCII `0x21`–`0x7e`. The value is
-used verbatim. `x-claude-code-parent-agent-id` uses the same validation but never
-marks traffic by itself. Both headers continue upstream unchanged. They are
+used verbatim. `x-claude-code-parent-agent-id` and `x-claude-code-agent-type` use
+the same validation but never mark traffic by themselves; Claude Code sends the
+agent type only with `CLAUDE_CODE_GATEWAY_HINT_HEADERS` set. All three headers
+continue upstream unchanged. They are
 observations, not authentication, identity, authorization, or a security
 boundary.
 
@@ -229,7 +234,7 @@ patchbay serve
 patchbay contexts
 patchbay seats
 patchbay bindings --ctx <name>
-patchbay resolve [--subagent] <context> <model>
+patchbay resolve [--subagent] [--agent-type <type>] <context> <model>
 patchbay project [dir]
 patchbay check [--registry <path>]
 patchbay usage snapshot <dest>

@@ -18,21 +18,45 @@ type SelectionKind string
 
 // Selection kinds explain which binding class selected a Seat.
 const (
-	SelectionModel    SelectionKind = "model"
-	SelectionSubagent SelectionKind = "subagent"
-	SelectionDefault  SelectionKind = "default"
+	SelectionModel     SelectionKind = "model"
+	SelectionAgentType SelectionKind = "agent_type"
+	SelectionSubagent  SelectionKind = "subagent"
+	SelectionDefault   SelectionKind = "default"
 )
 
-// Match describes the selector that selected a seat. Model is nil for defaults.
+// Match describes the selector that selected a seat. Model is nil for defaults
+// and agent-type matches; AgentType names the agent type an agent_types
+// binding matched and is nil for every other kind.
 type Match struct {
-	Kind  SelectionKind
-	Model *string
+	Kind      SelectionKind
+	Model     *string
+	AgentType *string
 }
 
 // SubagentObservation is a positively validated marked-subagent observation.
+// AgentType is the agent type Claude Code reported alongside the agent ID, or
+// empty when it reported none.
 type SubagentObservation struct {
 	AgentID       string
 	ParentAgentID string
+	AgentType     string
+}
+
+// maxObservedIDBytes bounds an observed agent ID or agent type.
+const maxObservedIDBytes = 256
+
+// ValidObservedID reports whether value is a header-observable agent ID or
+// agent type: 1 to 256 bytes of printable, non-space ASCII.
+func ValidObservedID(value string) bool {
+	if len(value) < 1 || len(value) > maxObservedIDBytes {
+		return false
+	}
+	for _, char := range []byte(value) {
+		if char < 0x21 || char > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 // Resolution is an immutable Context snapshot and one selected Seat within it.
@@ -66,7 +90,13 @@ func (r Resolution) Select(model string, observation *SubagentObservation) (Reso
 	// marked-subagent policy, not to the Context's ordinary default, so it is
 	// reported as a subagent selection naming no model. The nil model is the
 	// whole distinction between the unnamed fallback and an exact marked hit.
+	// An agent-type binding outranks the model bindings: the reported agent
+	// type identifies a built-in agent whatever model it inherited.
 	if observation != nil && r.subagents != nil {
+		if seatID, ok := r.subagents.AgentTypes[observation.AgentType]; ok && observation.AgentType != "" {
+			matched := observation.AgentType
+			return r.selected(seatID, Match{Kind: SelectionAgentType, AgentType: &matched}), nil
+		}
 		if seatID, ok := r.subagents.Models[model]; ok {
 			matched := model
 			return r.selected(seatID, Match{Kind: SelectionSubagent, Model: &matched}), nil
@@ -205,5 +235,9 @@ func cloneSubagents(in *Subagents) *Subagents {
 	if in == nil {
 		return nil
 	}
-	return &Subagents{DefaultSeat: in.DefaultSeat, Models: cloneBindings(in.Models)}
+	return &Subagents{
+		DefaultSeat: in.DefaultSeat,
+		AgentTypes:  cloneBindings(in.AgentTypes),
+		Models:      cloneBindings(in.Models),
+	}
 }

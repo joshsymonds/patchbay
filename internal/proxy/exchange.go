@@ -200,13 +200,15 @@ func (e *exchange) record(host string, capt *capture) ledger.Record {
 		rec.Subagent = &ledger.Subagent{
 			AgentID:       e.subagent.AgentID,
 			ParentAgentID: e.subagent.ParentAgentID,
+			AgentType:     e.subagent.AgentType,
 		}
 	}
 	if e.resolution != nil {
 		res := e.resolution
 		rec.Selection = &ledger.Selection{
-			Kind:  string(res.Match.Kind),
-			Model: cloneString(res.Match.Model),
+			Kind:      string(res.Match.Kind),
+			Model:     cloneString(res.Match.Model),
+			AgentType: cloneString(res.Match.AgentType),
 		}
 		rec.Seat = res.SeatID
 		rec.Upstream = res.Seat.EffectiveUpstream()

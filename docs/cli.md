@@ -8,7 +8,7 @@ commands:
   contexts                     list every context the running gateway serves
   seats                        list global reusable Seats
   bindings --ctx <name>        list one Context's public model bindings
-  resolve [--subagent] <context> <model>
+  resolve [--subagent] [--agent-type <type>] <context> <model>
                                show the complete non-secret resolution
   project [dir]                show which context a directory's Claude Code settings select
   check [--registry <path>]    validate a registry file without asking the gateway
@@ -119,7 +119,7 @@ work      work-bedrock  2         0
 
 Contexts are sorted by ID. `BINDINGS` counts public `models` entries.
 `SUBAGENT_BINDINGS` is zero when no marked-subagent policy exists; otherwise it
-counts exact model bindings plus the subagent default.
+counts exact agent-type and model bindings plus the subagent default.
 
 ## `seats`
 
@@ -161,7 +161,7 @@ An unknown Context exits 1.
 ## `resolve`
 
 ```text
-patchbay resolve [--subagent] <context> <model>
+patchbay resolve [--subagent] [--agent-type <type>] <context> <model>
 ```
 
 Exactly two positional arguments are required. The Context is explicit; this
@@ -174,6 +174,7 @@ request_model: "openrouter/kimi-k2"
 observation: "none"
 selection: "model"
 selection_model: "openrouter/kimi-k2"
+selection_agent_type: null
 seat: "openrouter-kimi-k2"
 auth_mode: "inject"
 upstream: "https://openrouter.ai/api"
@@ -212,6 +213,7 @@ request_model: "claude-opus-5"
 observation: "subagent"
 selection: "subagent"
 selection_model: "claude-opus-5"
+selection_agent_type: null
 seat: "sol-subscription"
 auth_mode: "inject"
 upstream: "http://127.0.0.1:8317"
@@ -241,9 +243,17 @@ request_model: "some-unbound-model"
 observation: "subagent"
 selection: "subagent"
 selection_model: null
+selection_agent_type: null
 seat: "sol-subscription"
 ...
 ```
+
+`--agent-type <type>` supplies the same synthetic observation reporting that
+agent type, as Claude Code does in `x-claude-code-agent-type`; it implies
+`--subagent`. A type bound in `subagents.agent_types` outranks the model
+bindings and reports `selection: "agent_type"`, `selection_model: null`, and the
+matched type in `selection_agent_type`, which is null for every other kind. An
+unbound type resolves exactly as `--subagent` does.
 
 An ordinary Context default — unmarked traffic naming no public binding —
 reports `selection: "default"` with `selection_model: null`.

@@ -122,13 +122,15 @@ It never contains a credential or resolved file path.
 | Kind | `selection.model` |
 |---|---|
 | `model` | Exact matched public selector. |
+| `agent_type` | JSON `null`; `selection.agent_type` names the agent type matched in `context.subagents.agent_types`. |
 | `subagent` | Exact matched requested model from `context.subagents.models`, or JSON `null` when marked traffic fell to `context.subagents.default_seat` naming no model. |
 | `default` | JSON `null`, for the ordinary Context default. |
 
 `selection.model` is the only thing separating an exact marked hit from the
 unnamed marked fallback, so validation requires a non-empty model for `model`,
 allows either a non-empty model or `null` for `subagent`, and requires `null`
-for `default`.
+for `agent_type` and `default`. `selection.agent_type` is required and non-empty
+for `agent_type` and absent for every other kind.
 
 A marked-subagent exact record may include:
 
@@ -145,8 +147,25 @@ A marked-subagent exact record may include:
 }
 ```
 
+An agent-type record names the binding instead, and the observation carries the
+reported type:
+
+```json
+{
+  "selection": {
+    "kind": "agent_type",
+    "model": null,
+    "agent_type": "Explore"
+  },
+  "subagent": {
+    "agent_id": "agent-aefe5b1a70030c259",
+    "agent_type": "Explore"
+  }
+}
+```
+
 Only positively validated values enter the ledger. Agent ID is required for the
-nested object; parent ID is optional. Each must be 1–256 bytes and contain only
+nested object; parent ID and agent type are optional. Each must be 1–256 bytes and contain only
 printable ASCII bytes `0x21`–`0x7e`. Parent-only or invalid observations are
 omitted.
 

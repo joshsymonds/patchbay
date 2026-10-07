@@ -48,7 +48,7 @@ func (c cli) contexts(ctx context.Context, args []string) int {
 		summary := doc.Contexts[name]
 		sub := 0
 		if summary.Subagents != nil {
-			sub = len(summary.Subagents.Models) + 1
+			sub = len(summary.Subagents.AgentTypes) + len(summary.Subagents.Models) + 1
 		}
 		fmt.Fprintf(table, "%s\t%s\t%d\t%d\n", name, summary.DefaultSeat, len(summary.Models), sub)
 	}
@@ -170,6 +170,7 @@ func registryState(doc server.Document) registry.State {
 		if summary.Subagents != nil {
 			ctx.Subagents = &registry.Subagents{
 				DefaultSeat: summary.Subagents.DefaultSeat,
+				AgentTypes:  summary.Subagents.AgentTypes,
 				Models:      summary.Subagents.Models,
 			}
 		}

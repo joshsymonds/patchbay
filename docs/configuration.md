@@ -86,7 +86,14 @@ A Context has exactly:
 A present `subagents` object has exactly:
 
 - required `default_seat`;
+- optional `agent_types`, defaulting to an empty exact-binding map;
 - optional `models`, defaulting to an empty exact-binding map.
+
+`agent_types` keys are the agent types Claude Code reports in
+`x-claude-code-agent-type` (the built-in `Explore`, for one), so each must pass the
+same 1–256-byte printable-ASCII rule as an observed agent ID. They let a built-in
+agent that inherits its session's model ride a different Seat: on the wire its
+model is the session's, and only the agent type tells it apart.
 
 Every binding value is a Seat ID string. Inline Seat objects are invalid.
 `default_context`, Context IDs, Seat IDs, and all Seat references must resolve.
@@ -98,8 +105,8 @@ trimmed, decoded, or restricted to the ID grammar.
 The registry rejects:
 
 - missing required fields;
-- null root, `seats`, `contexts`, Context, `models`, `subagents`, or
-  `subagents.models` values;
+- null root, `seats`, `contexts`, Context, `models`, `subagents`,
+  `subagents.agent_types`, or `subagents.models` values;
 - null or non-object `extra_body`, or an exact top-level `model` member within it;
 - unknown fields;
 - incompatible types;
@@ -171,8 +178,8 @@ objects carried in arrays, must use unique member names.
 A public `context.models` selector containing `claude`, case-insensitively,
 cannot bind to an inject Seat. Marked-subagent model selectors are observed input
 model names and are exempt from that selector rule. Every inject Seat referenced
-by a marked-subagent exact or default binding must configure a non-empty,
-non-Claude rewrite model.
+by a marked-subagent agent-type, exact, or default binding must configure a
+non-empty, non-Claude rewrite model.
 
 Registry validation is structural and referential only. It does not read
 credential files or model maps, export AWS credentials, validate AWS sessions,
@@ -187,10 +194,12 @@ falling back.
 Selection precedence is:
 
 1. exact public `context.models` binding;
-2. valid marked subagent plus exact `context.subagents.models` binding;
-3. valid marked subagent plus `context.subagents.default_seat`;
-4. refusal of a protected foreign rewrite target;
-5. `context.default_seat`.
+2. valid marked subagent reporting an agent type bound in
+   `context.subagents.agent_types`;
+3. valid marked subagent plus exact `context.subagents.models` binding;
+4. valid marked subagent plus `context.subagents.default_seat`;
+5. refusal of a protected foreign rewrite target;
+6. `context.default_seat`.
 
 ### Marked-subagent observation
 
@@ -208,7 +217,12 @@ non-ASCII values make the request unmarked.
 is valid, a parent value is recorded only if it independently passes the same
 validation. Invalid parent values are omitted and never affect selection.
 
-Both headers continue upstream unchanged under ordinary header forwarding. They
+`x-claude-code-agent-type` follows the parent's rule: it never marks traffic by
+itself, and with a valid agent ID it is recorded and matched against
+`subagents.agent_types` only if it independently passes the same validation.
+Claude Code sends it only when `CLAUDE_CODE_GATEWAY_HINT_HEADERS` is set.
+
+All three headers continue upstream unchanged under ordinary header forwarding. They
 are observations only, never authentication, identity, authorization, permission,
 or a security boundary. Parent-only and unmarked auxiliary traffic uses ordinary
 selection. Patchbay performs no prompt matching or semantic agent inference.
@@ -225,7 +239,8 @@ A protected target is computed only from public `context.models` bindings:
 4. name the lexically first public selector in the error.
 
 Exact public and marked-subagent selection happen before this guard.
-`subagents.models`, `subagents.default_seat`, and unused Seats never contribute
+`subagents.agent_types`, `subagents.models`, `subagents.default_seat`, and
+unused Seats never contribute
 protected targets. Requesting a protected target directly returns 404 and names
 the public selector to use.
 

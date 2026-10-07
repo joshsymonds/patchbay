@@ -117,6 +117,39 @@ func TestObserveSubagentParentNeverMarksAndIsRecordedOnlyWhenValid(t *testing.T)
 	}
 }
 
+func TestObserveSubagentAgentTypeNeverMarksAndIsRecordedOnlyWhenValid(t *testing.T) {
+	t.Parallel()
+	typeOnly := http.Header{ClaudeCodeAgentTypeHeader: []string{"Explore"}}
+	if obs := observeSubagent(typeOnly); obs != nil {
+		t.Fatalf("agent-type-only observation = %+v", obs)
+	}
+
+	tests := []struct {
+		name  string
+		types []string
+		want  string
+	}{
+		{name: "valid", types: []string{"Explore"}, want: "Explore"},
+		{name: "absent"},
+		{name: "empty", types: []string{""}},
+		{name: "duplicate", types: []string{"Explore", "Plan"}},
+		{name: "invalid bytes", types: []string{"general purpose"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			header := http.Header{ClaudeCodeAgentIDHeader: []string{"agent"}}
+			for _, value := range tc.types {
+				header.Add(ClaudeCodeAgentTypeHeader, value)
+			}
+			obs := observeSubagent(header)
+			if obs == nil || obs.AgentID != "agent" || obs.AgentType != tc.want {
+				t.Fatalf("observation = %+v; agent type=%q", obs, tc.want)
+			}
+		})
+	}
+}
+
 func TestMarkedSubagentHeadersAreForwardedUnchanged(t *testing.T) {
 	const keyEnv = "PATCHBAY_SUBAGENT_TEST_KEY_FILE"
 	writeSubagentTestFile(t, keyEnv, "provider-key")

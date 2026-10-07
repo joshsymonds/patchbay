@@ -76,7 +76,7 @@ commands:
   contexts                     list every context the running gateway serves
   seats                        list global reusable Seats
   bindings --ctx <name>        list one Context's public model bindings
-  resolve [--subagent] <context> <model>
+  resolve [--subagent] [--agent-type <type>] <context> <model>
                                show the complete non-secret resolution
   project [dir]                show which context a directory's Claude Code settings select
   check [--registry <path>]    validate a registry file without asking the gateway

@@ -12,6 +12,11 @@ const resolveArgs = 2
 func (c cli) resolve(ctx context.Context, args []string) int {
 	flags := c.flagSet(cmdResolve)
 	subagent := flags.Bool("subagent", false, "resolve as positively marked subagent traffic")
+	agentType := flags.String(
+		"agent-type",
+		"",
+		"resolve as marked subagent traffic reporting this agent type (implies --subagent)",
+	)
 	if err := flags.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -26,9 +31,13 @@ func (c cli) resolve(ctx context.Context, args []string) int {
 	}
 	observationClass := "none"
 	var observation *registry.SubagentObservation
-	if *subagent {
+	if *agentType != "" && !registry.ValidObservedID(*agentType) {
+		c.usage(c.stderr)
+		return exitUsage
+	}
+	if *subagent || *agentType != "" {
 		observationClass = "subagent"
-		observation = &registry.SubagentObservation{AgentID: "patchbay-cli"}
+		observation = &registry.SubagentObservation{AgentID: "patchbay-cli", AgentType: *agentType}
 	}
 	res, err := registry.ResolveState(
 		registryState(doc),
@@ -61,6 +70,7 @@ func (c cli) writeResolution(
 	writeLine(c.stdout, "observation", quoted(observationClass))
 	writeLine(c.stdout, "selection", quoted(string(res.Match.Kind)))
 	writeLine(c.stdout, "selection_model", nullableString(res.Match.Model))
+	writeLine(c.stdout, "selection_agent_type", nullableString(res.Match.AgentType))
 	writeLine(c.stdout, "seat", quoted(res.SeatID))
 	writeLine(c.stdout, "auth_mode", quoted(string(res.Seat.AuthMode)))
 	writeLine(c.stdout, "upstream", quoted(res.Seat.EffectiveUpstream()))
