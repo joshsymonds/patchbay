@@ -21,9 +21,95 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
+// TestMain builds the migrated template every openStore seeds from, runs the
+// package's tests, and removes it.
+//
+// Migrating a fresh database is most of what opening one costs, and under the
+// race detector the transpiled SQLite engine runs that work nearly serially
+// across every parallel test. So the migrations run once per test process, and
+// a test that only needs a current store starts from a copy of their result.
+// Open still validates the copied schema against the canon on the way in.
+func TestMain(m *testing.M) {
+	dir := filepath.Dir(migratedTemplatePath())
+	if err := buildMigratedTemplate(dir); err != nil {
+		fmt.Fprintf(os.Stderr, "build migrated template: %v\n", err)
+		_ = os.RemoveAll(dir)
+		os.Exit(1)
+	}
+	code := m.Run()
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Fprintf(os.Stderr, "remove migrated template: %v\n", err)
+		code = 1
+	}
+	os.Exit(code)
+}
+
+// migratedTemplatePath names this test process's template. The process ID
+// keeps concurrent test binaries apart without any state to share.
+func migratedTemplatePath() string {
+	return filepath.Join(
+		os.TempDir(),
+		fmt.Sprintf("patchbay-usage-template-%d", os.Getpid()),
+		"usage.sqlite",
+	)
+}
+
+// buildMigratedTemplate creates dir under the same private mode Open demands of
+// a database's parent and migrates a database inside it. Creating dir fails if
+// anything already holds the name, so a stale or planted directory is refused
+// rather than trusted.
+func buildMigratedTemplate(dir string) error {
+	if err := os.Mkdir(dir, parentMode); err != nil {
+		return fmt.Errorf("create template directory: %w", err)
+	}
+	path := migratedTemplatePath()
+	store, err := Open(path)
+	if err != nil {
+		return fmt.Errorf("open template: %w", err)
+	}
+	if err := store.Close(); err != nil {
+		return fmt.Errorf("close template: %w", err)
+	}
+	// Closing the last connection checkpoints the write-ahead log into the main
+	// file. A sidecar left behind would hold schema the copied file lacks.
+	for _, suffix := range databaseSidecarSuffixes() {
+		_, statErr := os.Lstat(path + suffix)
+		if statErr == nil {
+			return fmt.Errorf("template left %s behind after close", suffix)
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("inspect template %s: %w", suffix, statErr)
+		}
+	}
+	return nil
+}
+
+// seedMigratedDatabase writes the migrated template to path when nothing is
+// there and its directory already exists. Any other path — an existing
+// database being reopened, or a missing directory Open must create under its
+// own policy — is left for Open to handle exactly as it would in production.
+func seedMigratedDatabase(t *testing.T, path string) {
+	t.Helper()
+
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if _, err := os.Stat(filepath.Dir(path)); err != nil {
+		return
+	}
+	template, err := os.ReadFile(migratedTemplatePath())
+	if err != nil {
+		t.Fatalf("read migrated template: %v", err)
+	}
+	if err := os.WriteFile(path, template, databaseMode); err != nil {
+		t.Fatalf("seed migrated database %q: %v", path, err)
+	}
+}
+
 func openStore(t *testing.T, path string) *Store {
 	t.Helper()
 
+	seedMigratedDatabase(t, path)
 	store, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open(%q) returned error: %v", path, err)
