@@ -189,6 +189,7 @@ max_input_tokens: 262144
 max_output_tokens: 32000
 insecure: false
 strip_cache_control: true
+cache_ttl: null
 capture_bodies: false
 ```
 
@@ -228,6 +229,7 @@ max_input_tokens: 372000
 max_output_tokens: null
 insecure: false
 strip_cache_control: false
+cache_ttl: null
 capture_bodies: false
 ```
 

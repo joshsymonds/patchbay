@@ -338,7 +338,7 @@ func TestResolveKeepsOpaqueModelsOnOneLine(t *testing.T) {
 			t.Errorf("resolve %q emitted a blank line, so a value ended one: %q", value, got.stdout)
 		}
 		// One line per field, whatever bytes the selector carries.
-		if want := 21; len(lines(got.stdout)) != want {
+		if want := 22; len(lines(got.stdout)) != want {
 			t.Errorf("resolve %q printed %d lines; want %d\n%s",
 				value, len(lines(got.stdout)), want, got.stdout)
 		}
@@ -490,6 +490,7 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				"max_output_tokens: null\n" +
 				"insecure: false\n" +
 				"strip_cache_control: false\n" +
+				"cache_ttl: null\n" +
 				"capture_bodies: false\n",
 		},
 		{
@@ -515,6 +516,7 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				"max_output_tokens: null\n" +
 				"insecure: false\n" +
 				"strip_cache_control: false\n" +
+				"cache_ttl: null\n" +
 				"capture_bodies: false\n",
 		},
 		{
@@ -542,6 +544,7 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				"max_output_tokens: null\n" +
 				"insecure: false\n" +
 				"strip_cache_control: false\n" +
+				"cache_ttl: null\n" +
 				"capture_bodies: false\n",
 		},
 	} {
@@ -554,6 +557,51 @@ func TestResolvePrintsObservationClass(t *testing.T) {
 				t.Fatalf("stdout:\n%s\nwant:\n%s", got.stdout, tc.want)
 			}
 		})
+	}
+}
+
+// TestResolvePrintsTheSeatCacheTTL carries a Seat's cache lifetime through the
+// introspection document the CLI resolves from, so a marked subagent bound to
+// a long-lived forward Seat says which lifetime its markers will be given.
+func TestResolvePrintsTheSeatCacheTTL(t *testing.T) {
+	callerKeyFile(t)
+	doc := sampleDocument()
+	doc.Seats["anthropic-1h"] = server.SeatSummary{
+		AuthMode: "forward",
+		Upstream: "https://api.anthropic.com",
+		CacheTTL: "1h",
+	}
+	doc.Contexts["personal"].Subagents.Models["long-lived"] = "anthropic-1h"
+	daemon := newFakeDaemon(t, doc)
+
+	got := invoke(t, daemon.env(), "resolve", "--subagent", "personal", "long-lived")
+	if got.code != exitOK {
+		t.Fatalf("%+v", got)
+	}
+	want := "context: \"personal\"\n" +
+		"request_model: \"long-lived\"\n" +
+		"observation: \"subagent\"\n" +
+		"selection: \"subagent\"\n" +
+		"selection_model: \"long-lived\"\n" +
+		"selection_agent_type: null\n" +
+		"seat: \"anthropic-1h\"\n" +
+		"auth_mode: \"forward\"\n" +
+		"upstream: \"https://api.anthropic.com\"\n" +
+		"model: \"long-lived\"\n" +
+		"speed: null\n" +
+		"config_source: \"caller\"\n" +
+		"api_key_env_file: null\n" +
+		"aws_profile: null\n" +
+		"aws_region: null\n" +
+		"model_map_env_file: null\n" +
+		"max_input_tokens: null\n" +
+		"max_output_tokens: null\n" +
+		"insecure: false\n" +
+		"strip_cache_control: false\n" +
+		"cache_ttl: \"1h\"\n" +
+		"capture_bodies: false\n"
+	if got.stdout != want {
+		t.Fatalf("stdout:\n%s\nwant:\n%s", got.stdout, want)
 	}
 }
 

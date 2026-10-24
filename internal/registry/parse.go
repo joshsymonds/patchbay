@@ -35,6 +35,7 @@ const (
 	fieldStripCacheControl = "strip_cache_control"
 	fieldCaptureBodies     = "capture_bodies"
 	fieldSpeed             = "speed"
+	fieldCacheTTL          = "cache_ttl"
 	fieldStripBetas        = "strip_betas"
 )
 
@@ -121,6 +122,7 @@ func parseSeat(raw json.RawMessage) (Seat, error) {
 		fieldStripCacheControl,
 		fieldCaptureBodies,
 		fieldSpeed,
+		fieldCacheTTL,
 		fieldStripBetas,
 	}
 	if fieldsErr := exactFields(fields, allowed, nil); fieldsErr != nil {
@@ -156,6 +158,7 @@ func seatFieldDecoders(seat *Seat) map[string]func(json.RawMessage) error {
 		},
 		fieldCaptureBodies: func(raw json.RawMessage) error { return decodeField(&seat.CaptureBodies, fieldCaptureBodies, raw) },
 		fieldSpeed:         func(raw json.RawMessage) error { return decodeSpeed(seat, raw) },
+		fieldCacheTTL:      func(raw json.RawMessage) error { return decodeCacheTTL(seat, raw) },
 		fieldStripBetas:    func(raw json.RawMessage) error { return decodeStripBetas(seat, raw) },
 	}
 }
@@ -213,6 +216,22 @@ func decodeSpeed(seat *Seat, raw json.RawMessage) error {
 		return fmt.Errorf("field %q: must be %q or omitted", fieldSpeed, SpeedFast)
 	}
 	seat.Speed = value
+	return nil
+}
+
+// decodeCacheTTL parses the one prompt-cache lifetime a Seat may impose. The
+// five-minute default is what a caller's markers already mean, so the field
+// names only the extended lifetime; anything else — a blank string included —
+// fails the document here, the way speed does.
+func decodeCacheTTL(seat *Seat, raw json.RawMessage) error {
+	var value string
+	if err := decodeField(&value, fieldCacheTTL, raw); err != nil {
+		return err
+	}
+	if value != CacheTTLOneHour {
+		return fmt.Errorf("field %q: must be %q or omitted", fieldCacheTTL, CacheTTLOneHour)
+	}
+	seat.CacheTTL = value
 	return nil
 }
 

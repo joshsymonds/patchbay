@@ -216,3 +216,49 @@ func TestSpeedSeatSetsFastOverTheCaller(t *testing.T) {
 		t.Errorf("forwarded body = %s\nwant %v", call.body, want)
 	}
 }
+
+// TestCacheTTLSeatHoldsEveryMarkerForAnHour checks that a cache_ttl Seat
+// writes its lifetime into every cache_control marker at any depth — the
+// top-level automatic marker, a marker that already asked for five minutes,
+// and one nested in a message — and leaves everything else as the caller sent
+// it: a tool that only mentions the field in prose, and a marker that is not an
+// object, which is the caller's to answer for.
+func TestCacheTTLSeatHoldsEveryMarkerForAnHour(t *testing.T) {
+	stub := newTLSUpstream(t, jsonHandler(http.StatusOK, `{"type":"message","content":[]}`))
+	seat := fmt.Sprintf(`%q:{"upstream":"https://api.anthropic.com","auth_mode":"forward",`+
+		`"cache_ttl":"1h"}`, echoSelector)
+	body := fmt.Sprintf(`{"model":%q,"max_tokens":16,`+
+		`"cache_control":{"type":"ephemeral"},`+
+		`"system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral","ttl":"5m"}}],`+
+		`"tools":[{"name":"t","description":"says cache_control in prose","input_schema":{"type":"object"}}],`+
+		`"metadata":{"cache_control":null},`+
+		`"messages":[{"role":"user","content":[{"type":"text","text":"hi",`+
+		`"cache_control":{"type":"ephemeral"}}]}]}`, echoSelector)
+
+	req := messagesRequest(body)
+	req.Header.Set("Authorization", "Bearer caller-oauth-token")
+
+	rec := serve(t, proxy.Config{
+		Registry: newRegistry(t, seat),
+		Client:   anthropicClient(t, stub),
+		Host:     testHost,
+	}, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body %q)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	call := stub.call(t)
+
+	want := decodeJSON(t, []byte(fmt.Sprintf(`{"model":%q,"max_tokens":16,`+
+		`"cache_control":{"type":"ephemeral","ttl":"1h"},`+
+		`"system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral","ttl":"1h"}}],`+
+		`"tools":[{"name":"t","description":"says cache_control in prose","input_schema":{"type":"object"}}],`+
+		`"metadata":{"cache_control":null},`+
+		`"messages":[{"role":"user","content":[{"type":"text","text":"hi",`+
+		`"cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`, echoSelector)))
+
+	if got := decodeJSON(t, call.body); !reflect.DeepEqual(got, want) {
+		t.Errorf("forwarded body = %s\nwant %v", call.body, want)
+	}
+}

@@ -163,6 +163,7 @@ func registryState(doc server.Document) registry.State {
 			StripCacheControl: summary.StripCacheControl,
 			CaptureBodies:     summary.CaptureBodies,
 			Speed:             summary.Speed,
+			CacheTTL:          summary.CacheTTL,
 		}
 	}
 	for id, summary := range doc.Contexts {

@@ -85,6 +85,7 @@ func (c cli) writeResolution(
 	writeLine(c.stdout, "max_output_tokens", tokenCeiling(res.Seat.MaxOutputTokens))
 	writeLine(c.stdout, "insecure", strconv.FormatBool(res.Seat.Insecure))
 	writeLine(c.stdout, "strip_cache_control", strconv.FormatBool(res.Seat.StripCacheControl))
+	writeLine(c.stdout, "cache_ttl", nullable(res.Seat.CacheTTL))
 	writeLine(c.stdout, "capture_bodies", strconv.FormatBool(res.Seat.CaptureBodies))
 }
 

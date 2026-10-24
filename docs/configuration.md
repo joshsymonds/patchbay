@@ -146,11 +146,12 @@ by ID.
 | `strip_cache_control` | Recursively removes object fields named `cache_control`. |
 | `capture_bodies` | Stores rewritten request and captured response bodies in ledger v2. |
 | `speed` | `fast` requests the upstream's fast tier on every request: Anthropic fast mode on a Claude upstream, the Codex priority tier through CLIProxyAPI, which maps this field. Written after `extra_body`, so the Seat value wins over the caller's and over `extra_body`. Not allowed on `sigv4`. |
+| `cache_ttl` | `1h` writes the one-hour lifetime into every `cache_control` marker the request carries, at any depth and including the top-level automatic marker, replacing whatever lifetime the caller asked for. Every marker gets it because Anthropic refuses a request whose longer-lived entries do not all come before its shorter-lived ones. It suits callers that idle between requests for longer than the five-minute default, such as an agent waiting on the children it dispatched: on the default lifetime each wake rewrites its whole context into the cache. A one-hour write costs twice the base input price instead of 1.25 times, so it pays only where those gaps occur. Only allowed on `forward`, and not with `strip_cache_control`. |
 | `strip_betas` | Beta flags a `sigv4` Seat withholds from Bedrock. The Bedrock translation moves every flag the caller sent, by header or in the body, into the body's `anthropic_beta` list, and Bedrock refuses the whole request over any flag it does not know; this names those. Each entry is an exact flag name with no surrounding whitespace. Only allowed on `sigv4`. |
 
 For `forward` and `inject`, the original request bytes are preserved unless the
-Seat sets `model`, `extra_body`, `strip_cache_control`, `max_output_tokens`, or
-`speed`.
+Seat sets `model`, `extra_body`, `strip_cache_control`, `max_output_tokens`,
+`speed`, or `cache_ttl`.
 When a rewrite is needed, the body must be a JSON object and is re-encoded after
 those operations. SigV4 always performs an additional Bedrock translation. See
 [auth-modes.md](auth-modes.md).
@@ -165,6 +166,7 @@ those operations. SigV4 always performs an additional Bedrock translation. See
 | `insecure` | Forbidden | Non-loopback HTTP only | Forbidden |
 | AWS fields | Forbidden | Forbidden | Profile, region, and model-map variable required |
 | `strip_betas` | Forbidden | Forbidden | Allowed |
+| `cache_ttl` | Allowed | Forbidden | Forbidden |
 | `claude` in Seat rewrite | Allowed | Forbidden, case-insensitive | Allowed |
 
 All token ceilings must be non-negative. `extra_body` must be an object when

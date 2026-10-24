@@ -846,6 +846,50 @@ func TestSeatSpeedIsFastOrNothing(t *testing.T) {
 	})
 }
 
+// TestSeatCacheTTLIsOneHourOnTheAnthropicForward pins cache_ttl to the one
+// extended lifetime, on the one auth mode that reaches Anthropic's prompt
+// cache, and never beside a strip that would leave it nothing to write into.
+func TestSeatCacheTTLIsOneHourOnTheAnthropicForward(t *testing.T) {
+	t.Parallel()
+	runSeatCases(t, []seatCase{
+		{
+			name: "one hour on forward accepted",
+			seat: `{"upstream":"https://api.anthropic.com","auth_mode":"forward","cache_ttl":"1h"}`,
+		},
+		{
+			name:    "other lifetime rejected",
+			seat:    `{"upstream":"https://api.anthropic.com","auth_mode":"forward","cache_ttl":"5m"}`,
+			wants:   []string{"cache_ttl", "1h", "omitted"},
+			forbids: []string{"5m"},
+		},
+		{
+			name:  "empty string rejected",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","cache_ttl":""}`,
+			wants: []string{"cache_ttl", "1h", "omitted"},
+		},
+		{
+			name:  "non-string rejected",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","cache_ttl":3600}`,
+			wants: []string{"cache_ttl"},
+		},
+		{
+			name:  "one hour on inject rejected",
+			seat:  `{"upstream":"http://127.0.0.1:8317","auth_mode":"inject","billing":"subscription","api_key_env_file":"KEY_FILE","cache_ttl":"1h"}`,
+			wants: []string{"cache_ttl", "inject"},
+		},
+		{
+			name:  "one hour on sigv4 rejected",
+			seat:  `{"auth_mode":"sigv4","aws_profile":"work","aws_region":"us-east-2","model_map_env_file":"MAP_FILE","cache_ttl":"1h"}`,
+			wants: []string{"cache_ttl", "sigv4"},
+		},
+		{
+			name:  "one hour beside strip_cache_control rejected",
+			seat:  `{"upstream":"https://api.anthropic.com","auth_mode":"forward","cache_ttl":"1h","strip_cache_control":true}`,
+			wants: []string{"cache_ttl", "strip_cache_control"},
+		},
+	})
+}
+
 // TestSeatStripBetasIsBedrockOnly keeps strip_betas on the one auth mode whose
 // translation rewrites the caller's beta flags, and holds every entry to a
 // name the translation could actually match.

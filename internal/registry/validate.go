@@ -272,6 +272,9 @@ func validateSeat(seat Seat) error {
 	if err := validateStripBetas(seat); err != nil {
 		return err
 	}
+	if err := validateCacheTTL(seat); err != nil {
+		return err
+	}
 	if seat.MaxInputTokens < 0 {
 		return fmt.Errorf("%s must not be negative", fieldMaxInputTokens)
 	}
@@ -450,13 +453,6 @@ func validateUpstream(raw string, insecure bool) error {
 	return nil
 }
 
-// validateExtraBody holds the arbitrary provider document a Seat carries to
-// the rules that make it safe to merge over a request.
-//
-// It must be an object and canonical: a repeated member is two values under one
-// key, and the merge would carry whichever the decoder happened to keep, at the
-// root or anywhere below it. Its top-level model member is reserved because the
-// selected Seat is the sole authority for an upstream model rewrite.
 // validateSpeed keeps speed off the Bedrock path: the vocabulary is held at
 // parse time, but the translation a sigv4 seat performs has no field to carry
 // the tier at all.
@@ -478,6 +474,33 @@ func validateStripBetas(seat Seat) error {
 	return nil
 }
 
+// validateCacheTTL keeps cache_ttl on the Anthropic forward: the extended
+// lifetime is Anthropic's prompt cache, an inject upstream is never Anthropic,
+// and the Bedrock translation is not a path this policy has been verified on.
+// It also refuses the pairing with strip_cache_control, which would remove
+// every marker the lifetime is written into.
+func validateCacheTTL(seat Seat) error {
+	if seat.CacheTTL == "" {
+		return nil
+	}
+	if seat.AuthMode != AuthForward {
+		return fmt.Errorf("%s only applies to Anthropic's prompt cache and cannot be set on a %s seat",
+			fieldCacheTTL, seat.AuthMode)
+	}
+	if seat.StripCacheControl {
+		return fmt.Errorf("%s cannot be set with %s, which removes every marker it would write into",
+			fieldCacheTTL, fieldStripCacheControl)
+	}
+	return nil
+}
+
+// validateExtraBody holds the arbitrary provider document a Seat carries to
+// the rules that make it safe to merge over a request.
+//
+// It must be an object and canonical: a repeated member is two values under one
+// key, and the merge would carry whichever the decoder happened to keep, at the
+// root or anywhere below it. Its top-level model member is reserved because the
+// selected Seat is the sole authority for an upstream model rewrite.
 func validateExtraBody(body json.RawMessage) error {
 	if len(body) == 0 {
 		return nil

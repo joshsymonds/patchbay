@@ -26,6 +26,10 @@ const (
 // translator maps the same field onto its priority service tier.
 const SpeedFast = "fast"
 
+// CacheTTLOneHour is the one lifetime the cache_ttl field carries: Anthropic's
+// extended prompt-cache TTL, written as the cache_control marker spells it.
+const CacheTTLOneHour = "1h"
+
 // Seat is a reusable upstream destination and all policy applied when it is used.
 type Seat struct {
 	Upstream        string
@@ -55,6 +59,15 @@ type Seat struct {
 	// carries: empty for the upstream's default, SpeedFast for its fast tier.
 	// It is seat policy, so it replaces whatever the caller sent.
 	Speed string
+
+	// CacheTTL is the prompt-cache lifetime this seat writes into every
+	// cache_control marker a request carries: empty leaves the caller's markers
+	// alone, CacheTTLOneHour holds each entry for an hour instead of the
+	// default five minutes. A caller that idles between requests longer than
+	// five minutes — an agent waiting on the children it dispatched — otherwise
+	// rewrites its whole context into the cache on every wake. It is seat
+	// policy, so it replaces whatever lifetime the caller asked for.
+	CacheTTL string
 
 	// StripBetas names the beta flags a sigv4 seat withholds from Bedrock. The
 	// Bedrock translation moves every flag the caller sent, by header or in

@@ -18,6 +18,7 @@ const (
 	fieldMaxTokens    = "max_tokens"
 	fieldCacheControl = "cache_control"
 	fieldSpeed        = "speed"
+	fieldTTL          = "ttl"
 )
 
 // extractModel reads the top-level model name from a request body with a
@@ -44,7 +45,8 @@ func isIdentity(seat registry.Seat) bool {
 		len(seat.ExtraBody) == 0 &&
 		!seat.StripCacheControl &&
 		seat.MaxOutputTokens == 0 &&
-		seat.Speed == ""
+		seat.Speed == "" &&
+		seat.CacheTTL == ""
 }
 
 // forwardBody returns the bytes to send upstream. On an identity seat that is
@@ -126,6 +128,20 @@ func forwardBody(body []byte, seat registry.Seat) ([]byte, *gatewayError) {
 		stripCacheControl(document)
 	}
 
+	// Like speed, the lifetime is policy written after extra_body, so it reaches
+	// a marker extra_body carried as well as every marker the caller placed.
+	if seat.CacheTTL != "" {
+		ttl, err := json.Marshal(seat.CacheTTL)
+		if err != nil {
+			return nil, &gatewayError{
+				status: http.StatusInternalServerError,
+				err:    fmt.Errorf("encode seat cache_ttl: %w", err),
+			}
+		}
+
+		setCacheTTL(document, ttl)
+	}
+
 	clampMaxTokens(document, seat.MaxOutputTokens)
 
 	rewritten, err := json.Marshal(document)
@@ -165,21 +181,63 @@ func mergeExtraBody(document map[string]json.RawMessage, extraBody json.RawMessa
 // at any depth. Prompt caching is Anthropic's; a foreign upstream that does not
 // understand the marker may well reject the request over it.
 func stripCacheControl(document map[string]json.RawMessage) {
-	delete(document, fieldCacheControl)
+	rewriteCacheControl(document, func(object map[string]json.RawMessage) {
+		delete(object, fieldCacheControl)
+	})
+}
+
+// setCacheTTL writes ttl, an encoded JSON string, into every cache_control
+// marker in the whole document, at any depth, replacing whatever lifetime the
+// caller asked for.
+// Every marker gets the same lifetime because Anthropic refuses a request whose
+// longer-lived entries do not all come before its shorter-lived ones. A marker
+// that is not an object is left as it arrived; it is the caller's to answer
+// for, not something the lifetime can be written into.
+func setCacheTTL(document map[string]json.RawMessage, ttl json.RawMessage) {
+	rewriteCacheControl(document, func(object map[string]json.RawMessage) {
+		marker := object[fieldCacheControl]
+		if firstToken(marker) != '{' {
+			return
+		}
+
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(marker, &fields); err != nil {
+			return
+		}
+
+		fields[fieldTTL] = ttl
+		object[fieldCacheControl] = remarshal(fields, marker)
+	})
+}
+
+// rewriteCacheControl applies rewrite to every object in the document that
+// carries a cache_control member, the document itself included, at any depth.
+func rewriteCacheControl(
+	document map[string]json.RawMessage,
+	rewrite func(map[string]json.RawMessage),
+) {
+	if _, present := document[fieldCacheControl]; present {
+		rewrite(document)
+	}
 
 	for name, value := range document {
-		document[name] = strippedValue(value)
+		document[name] = rewrittenValue(value, rewrite)
 	}
 }
 
-// strippedValue returns value with every nested cache_control key removed.
-// Anything that is not an object or an array is returned as the exact bytes it
-// arrived as, so numbers keep the precision they were written with.
-func strippedValue(value json.RawMessage) json.RawMessage {
-	// Nothing to strip if the field name appears nowhere in this subtree, so the
-	// whole unmarshal/remarshal of a container that cannot hold it is skipped. A
-	// false-positive substring match — the name inside some string value — simply
-	// falls through to the existing, correct path below and is handled there.
+// rewrittenValue returns value with rewrite applied to every nested object that
+// carries a cache_control member. Anything that is not an object or an array is
+// returned as the exact bytes it arrived as, so numbers keep the precision they
+// were written with.
+func rewrittenValue(
+	value json.RawMessage,
+	rewrite func(map[string]json.RawMessage),
+) json.RawMessage {
+	// Nothing to rewrite if the field name appears nowhere in this subtree, so
+	// the whole unmarshal/remarshal of a container that cannot hold it is
+	// skipped. A false-positive substring match — the name inside some string
+	// value — simply falls through to the existing, correct path below and is
+	// handled there.
 	if !bytes.Contains(value, []byte(fieldCacheControl)) {
 		return value
 	}
@@ -191,7 +249,7 @@ func strippedValue(value json.RawMessage) json.RawMessage {
 			return value
 		}
 
-		stripCacheControl(object)
+		rewriteCacheControl(object, rewrite)
 
 		return remarshal(object, value)
 	case '[':
@@ -201,7 +259,7 @@ func strippedValue(value json.RawMessage) json.RawMessage {
 		}
 
 		for i, element := range array {
-			array[i] = strippedValue(element)
+			array[i] = rewrittenValue(element, rewrite)
 		}
 
 		return remarshal(array, value)
